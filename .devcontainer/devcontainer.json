@@ -1,13 +1,26 @@
 {
   "name": "FaceSwap",
   "image": "mcr.microsoft.com/devcontainers/python:3.11",
-  "features": {
-    "ghcr.io/devcontainers/features/common-utils:2": { "installZsh": false }
+  "hostRequirements": {
+    "cpus": 4,
+    "memory": "8gb",
+    "storage": "32gb"
   },
   "forwardPorts": [7860],
   "portsAttributes": {
-    "7860": { "label": "Gradio", "onAutoForward": "openBrowser" }
+    "7860": {
+      "label": "Gradio FaceSwap UI",
+      "onAutoForward": "openPreview",
+      "visibility": "public"
+    }
   },
-  "postCreateCommand": "sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg && pip install --upgrade pip && pip install numpy 'opencv-python-headless>=4.8' 'onnx>=1.14' onnxruntime 'insightface==0.7.3' ffmpeg-python tqdm pillow 'gradio>=4.40' requests filetype",
-  "postStartCommand": "echo 'Ready. Run:  python run.py ui' "
+  "postCreateCommand": "bash .devcontainer/setup.sh",
+  "postAttachCommand": {
+    "gradio": "python run.py ui"
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": ["ms-python.python"]
+    }
+  }
 }
