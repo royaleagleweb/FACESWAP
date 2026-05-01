@@ -51,10 +51,14 @@ tmp/
 .cache/
 *.log
 
-# Media test artifacts (keep small samples in `examples/` if needed)
+# Media test artifacts
 *.mp4
 *.mov
 *.avi
 *.mkv
 *.webm
-!examples/**/*.mp4
+
+# Local test inputs / swap outputs — never check in deepfaked images of
+# real people. Run scripts in tests/ to regenerate.
+examples/
+preview_screens/
