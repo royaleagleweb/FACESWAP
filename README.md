@@ -1,8 +1,13 @@
 # Multi-Face Video FaceSwap
 
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/royaleagleweb/FACESWAP/blob/claude/video-faceswap-program-Ak3RC/run_in_colab.ipynb)
+
 A FaceFusion-style video face-swap tool. Detects every face in a target image
 or video, lets you map one or more **source identities** onto specific
 people, and re-encodes the result while preserving the original audio.
+
+**Try it now in Google Colab** — click the badge above. Free T4 GPU, public
+Gradio URL printed in the last cell. ~3 minutes to first frame.
 
 Built on top of:
 
