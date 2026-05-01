@@ -1,13 +1,20 @@
 # Multi-Face Video FaceSwap
 
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/royaleagleweb/FACESWAP/blob/claude/video-faceswap-program-Ak3RC/run_in_colab.ipynb)
+[![Open in Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/royaleagleweb/FACESWAP)
 
 A FaceFusion-style video face-swap tool. Detects every face in a target image
 or video, lets you map one or more **source identities** onto specific
 people, and re-encodes the result while preserving the original audio.
 
-**Try it now in Google Colab** — click the badge above. Free T4 GPU, public
-Gradio URL printed in the last cell. ~3 minutes to first frame.
+## Try it live (pick whichever loads for you)
+
+| Option | Cost | What you do |
+|--------|------|-------------|
+| [**Colab**](https://colab.research.google.com/github/royaleagleweb/FACESWAP/blob/claude/video-faceswap-program-Ak3RC/run_in_colab.ipynb) | free | `Runtime ▸ Run all`, then click the `gradio.live` URL the last cell prints |
+| [**GitHub Codespaces**](https://codespaces.new/royaleagleweb/FACESWAP) | free 60 h/mo | wait for the container to build, then in the terminal: `python run.py ui`. Codespaces auto-forwards port 7860 |
+| **Hugging Face Spaces** | free CPU / paid GPU | fork the repo, then *Hugging Face ▸ New Space ▸ Gradio ▸ point at this repo*. The included `app.py` does the rest |
+| **Local** | your machine | `pip install -r requirements.txt && python run.py ui` |
 
 Built on top of:
 
