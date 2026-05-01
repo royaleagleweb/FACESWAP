@@ -32,10 +32,11 @@ for _d in (MODELS_DIR, TEMP_DIR, OUTPUTS_DIR):
 # Public mirrors for the inswapper_128 ONNX model. The model is the same one
 # used by the official InsightFace examples; checksum verifies integrity.
 INSWAPPER_URLS = [
+    "https://github.com/facefusion/facefusion-assets/releases/download/models-3.0.0/inswapper_128.onnx",
     "https://huggingface.co/ezioruan/inswapper_128.onnx/resolve/main/inswapper_128.onnx",
     "https://huggingface.co/deepinsight/inswapper/resolve/main/inswapper_128.onnx",
 ]
-INSWAPPER_SHA256 = "e4a3f08c753cb72d04e10aa0f7dbe3deebbf39567d4ead6dce08e98aa49e16af"
+INSWAPPER_SHA256 = "a290273ed497312095dac48cdef20feec9d5208298223dd01288ab202b54bea7"
 
 
 def _sha256(path: Path, chunk: int = 1 << 20) -> str:
