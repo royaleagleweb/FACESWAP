@@ -1,21 +1,19 @@
-"""Command-line entry point.
+"""Command-line entry point for Videoswa.
 
 Examples
 --------
+Open the desktop window (also the default when no command is given):
+    python -m videoswa
+    python run.py
+
 Single source onto every face in a video:
-    python -m faceswap.cli swap -t input.mp4 -s alice.jpg -o out.mp4
+    python run.py swap -t input.mp4 -s alice.jpg -o out.mp4
 
 Two sources mapped to two specific people (reference snapshots from the video):
-    python -m faceswap.cli swap -t input.mp4 \\
+    python run.py swap -t input.mp4 \\
         --pair alice.jpg=ref_alice.jpg \\
         --pair bob.jpg=ref_bob.jpg \\
         -o out.mp4
-
-Image input:
-    python -m faceswap.cli swap -t group.jpg -s alice.jpg -o group_swapped.png
-
-Launch the web UI:
-    python -m faceswap.cli ui
 """
 
 from __future__ import annotations
@@ -27,11 +25,20 @@ from typing import List, Optional, Tuple
 
 import cv2
 
-from .core import FaceSwapEngine
+from .core import DEFAULT_SIMILARITY, FaceSwapEngine
+from .coverage import COVERAGE_CHOICES, DEFAULT_COVERAGE
 from .face_analyzer import FaceAnalyzer
+from .providers import EXECUTION_CHOICES
 from .swapper import FaceSwapper
 from .utils import logger
-from .video import process_image, process_video
+from .video import (
+    VIDEO_SUFFIXES,
+    VideoDurationUnknownError,
+    VideoTooLongError,
+    assert_duration_allowed,
+    process_image,
+    process_video,
+)
 
 
 def _parse_pairs(pairs: List[str]) -> List[Tuple[Path, Optional[Path]]]:
@@ -65,19 +72,32 @@ def cmd_swap(args: argparse.Namespace) -> int:
     if not pairs:
         raise SystemExit("Provide --source or at least one --pair source=reference")
 
-    analyzer = FaceAnalyzer(use_gpu=not args.cpu, det_thresh=args.det_thresh)
-    swapper = FaceSwapper(use_gpu=not args.cpu, enhance=args.enhance)
+    execution = "cpu" if args.cpu else args.execution
+    if target.suffix.lower() in VIDEO_SUFFIXES:
+        try:
+            assert_duration_allowed(target)
+        except (VideoTooLongError, VideoDurationUnknownError) as exc:
+            raise SystemExit(str(exc)) from exc
+
+    analyzer = FaceAnalyzer(use_gpu=execution != "cpu", det_thresh=args.det_thresh, execution=execution)
+    swapper = FaceSwapper(use_gpu=execution != "cpu", enhance=args.enhance, execution=execution)
     engine = FaceSwapEngine(
         analyzer=analyzer,
         swapper=swapper,
         similarity_threshold=args.similarity,
+        coverage=args.coverage,
         apply_to_all_when_no_reference=args.apply_to_all,
+        detect_stride=1 if args.every_frame else 2,
+        min_face_px=args.min_face,
     )
+    engine.swapper.object_mask = not args.no_object_mask
+    engine.swapper.precise_edges = args.precise_edges
+    engine.swapper.allow_restore = args.enhance
 
     mappings = engine.build_mappings([(_read(s), _read(r) if r else None) for s, r in pairs])
 
     suffix = target.suffix.lower()
-    if suffix in {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"}:
+    if suffix in VIDEO_SUFFIXES:
         out = process_video(
             engine,
             mappings,
@@ -86,6 +106,7 @@ def cmd_swap(args: argparse.Namespace) -> int:
             keep_audio=not args.no_audio,
             crf=args.crf,
             preset=args.preset,
+            scale=args.scale,
         )
     else:
         out = process_image(
@@ -98,47 +119,89 @@ def cmd_swap(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_ui(args: argparse.Namespace) -> int:
-    from ui.app import launch
-    launch(server_name=args.host, server_port=args.port, share=args.share)
-    return 0
+def cmd_desktop(_args: Optional[argparse.Namespace] = None) -> int:
+    from videoswa.desktop import main as desktop_main
+    return desktop_main()
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="faceswap", description="Video multi-face faceswap")
+    p = argparse.ArgumentParser(
+        prog="videoswa",
+        description="Videoswa — multi-face video face swap",
+    )
     sub = p.add_subparsers(dest="cmd", required=True)
 
     s = sub.add_parser("swap", help="Run a faceswap on an image or video")
-    s.add_argument("-t", "--target", required=True, help="Target image/video")
+    s.add_argument("-t", "--target", required=True, help="Target image or video")
     s.add_argument("-s", "--source", help="Single source face image (applied to all faces)")
     s.add_argument(
         "--pair", action="append",
-        help="Source=Reference image pair. Use multiple times for multi-face swaps.",
+        help="Source=Reference image pair. Repeat for multi-face swaps.",
     )
-    s.add_argument("-o", "--output", help="Output path (default: outputs/<name>_swapped.mp4)")
-    s.add_argument("--similarity", type=float, default=0.45, help="Cosine threshold for ref match")
-    s.add_argument("--det-thresh", type=float, default=0.5, help="Face detection threshold")
+    s.add_argument("-o", "--output", help="Output path (default: outputs/<name>_videoswa.mp4)")
+    s.add_argument(
+        "--similarity",
+        type=float,
+        default=DEFAULT_SIMILARITY,
+        help="Cosine threshold for the first lock. A tracked face is kept below this.",
+    )
+    s.add_argument("--every-frame", action="store_true", help="Run the face detector on every frame")
+    s.add_argument("--min-face", type=int, default=0, help="Skip detections smaller than this many pixels")
+    s.add_argument("--no-object-mask", action="store_true", help="Do not preserve objects covering the face")
+    s.add_argument("--precise-edges", action="store_true", help="Use BiSeNet when models/bisenet.onnx is present")
+    s.add_argument(
+        "--coverage",
+        choices=list(COVERAGE_CHOICES),
+        default=DEFAULT_COVERAGE,
+        help="full covers jaw and beard (default); normal is the tight face oval",
+    )
+    s.add_argument(
+        "--det-thresh",
+        type=float,
+        default=0.30,
+        help="Face detection threshold. 0.30 keeps side and profile faces that score under 0.5.",
+    )
+    s.add_argument(
+        "--execution",
+        choices=list(EXECUTION_CHOICES),
+        default="auto",
+        help="ONNX Runtime providers: auto is TensorRT, then CUDA, then DirectML, then CPU",
+    )
     s.add_argument("--cpu", action="store_true", help="Force CPU inference")
-    s.add_argument("--enhance", action="store_true", help="Run GFPGAN on swapped faces")
+    s.add_argument("--enhance", action="store_true", help="Run GFPGAN on swapped faces (optional extra)")
+    s.add_argument(
+        "--scale",
+        type=float,
+        default=1.0,
+        help="Process scale. 1 is full quality. 0.5 is faster and the MP4 stays full size.",
+    )
     s.add_argument("--no-audio", action="store_true", help="Drop original audio track")
     s.add_argument("--crf", type=int, default=18, help="x264 CRF (lower = better quality)")
     s.add_argument("--preset", default="medium", help="x264 preset")
     s.add_argument(
         "--apply-to-all", action="store_true",
-        help="When wildcard mappings exist alongside specific ones, also apply the wildcard to unmatched faces",
+        help="Also apply a wildcard source to faces that miss every reference",
     )
     s.set_defaults(func=cmd_swap)
 
-    u = sub.add_parser("ui", help="Launch the Gradio web UI")
-    u.add_argument("--host", default="0.0.0.0")
-    u.add_argument("--port", type=int, default=7860)
-    u.add_argument("--share", action="store_true")
-    u.set_defaults(func=cmd_ui)
-
+    desktop = sub.add_parser("desktop", help="Open the Videoswa window")
+    desktop.set_defaults(func=cmd_desktop)
     return p
 
 
 def main(argv: Optional[List[str]] = None) -> int:
+    if argv is None:
+        argv = sys.argv[1:]
+    if argv and argv[0] == "ui":
+        print(
+            "The Gradio interface has been removed. Open the desktop app with:\n"
+            "    python -m videoswa",
+            file=sys.stderr,
+        )
+        return 2
+    if not argv:
+        return cmd_desktop()
+
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
@@ -146,6 +209,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     except KeyboardInterrupt:
         logger.warning("Interrupted")
         return 130
+    except (VideoTooLongError, VideoDurationUnknownError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":
