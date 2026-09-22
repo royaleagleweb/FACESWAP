@@ -42,6 +42,10 @@ class Face:
         x1, y1, x2, y2 = self.bbox
         return float(max(0.0, x2 - x1) * max(0.0, y2 - y1))
 
+    @property
+    def gender_label(self) -> str:
+        return format_gender(self.gender)
+
 
 class FaceAnalyzer:
     """Wraps insightface.FaceAnalysis for detection + embedding extraction.
@@ -101,7 +105,7 @@ class FaceAnalyzer:
                     kps=np.asarray(f.kps, dtype=np.float32),
                     embedding=np.asarray(f.normed_embedding * np.linalg.norm(f.embedding), dtype=np.float32),
                     det_score=float(getattr(f, "det_score", 0.0)),
-                    gender=getattr(f, "gender", None),
+                    gender=coerce_gender(getattr(f, "gender", None)),
                     age=getattr(f, "age", None),
                 )
             )
@@ -114,6 +118,37 @@ class FaceAnalyzer:
         if not faces:
             return None
         return max(faces, key=lambda f: f.area)
+
+
+def coerce_gender(value) -> Optional[int]:
+    """InsightFace genderage: 0 is female, 1 is male. Anything else is unknown."""
+    if value is None:
+        return None
+    if isinstance(value, np.ndarray):
+        if value.size == 0:
+            return None
+        value = value.reshape(-1)[0]
+    try:
+        code = int(value)
+    except (TypeError, ValueError):
+        return None
+    if code in (0, 1):
+        return code
+    return None
+
+
+def format_gender(gender) -> str:
+    code = coerce_gender(gender)
+    if code == 1:
+        return "Male"
+    if code == 0:
+        return "Female"
+    return "Unknown"
+
+
+def face_label(index: int, gender) -> str:
+    """UI caption such as ``Face 1 — Male``."""
+    return f"Face {index + 1} — {format_gender(gender)}"
 
 
 def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:

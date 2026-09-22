@@ -1,8 +1,9 @@
 # Videoswa
 
-Videoswa is a Windows desktop app for swapping faces in a video. It detects
-every person in a frame you pick, lets you assign a different source photo to
-each of them, and writes an MP4. Audio is copied back when FFmpeg can read it.
+Videoswa is a Windows desktop app for swapping faces in a video. The simple
+path uses one source photo for the face you select. A Multiple faces mode is
+there when you want a different source for each person. The result is an MP4,
+with the original audio copied back when FFmpeg can read it.
 
 The swap engine is InsightFace: `buffalo_l` for detection and recognition,
 and `inswapper_128` for the identity swap. Inference goes through ONNX Runtime.
@@ -19,11 +20,14 @@ there for scripts (`python run.py swap ...`).
 
 1. Choose a target video. Anything longer than **5 minutes** is rejected
    immediately, with an explanation, and nothing is processed.
-2. Drag the sample-frame slider to a moment where the people you care about
-   are visible, then click **Detect faces**.
-3. For each person, choose the source photo whose identity should replace
-   them. Leave a person empty to keep their face. Or tick **Use one source
-   for every face**.
+2. Drag the sample-frame slider to a moment where the face is visible, then
+   click **Detect faces**. Each thumbnail is labeled from InsightFace
+   gender/age, for example **Face 1 — Male** or **Face 2 — Female**.
+3. **Swap mode** opens on **Single face**. Choose one source image. The
+   largest face is selected; click another thumbnail to replace that person
+   instead. **Apply this source to every face** uses the same source for
+   everyone. Switch to **Multiple faces** to pick a source on each thumbnail
+   and leave a person empty to keep their face.
 4. Click **Run swap**. A progress bar tracks frames. **Cancel** stops between
    frames and does not leave an output file behind.
 
@@ -233,15 +237,22 @@ The desktop control is **Face coverage**. **Full, including beard** is
 selected when the window opens. **Normal (tight face)** is the smaller oval.
 The CLI flag is `--coverage full` (default) or `--coverage normal`.
 
-## How multi-face mapping works
+## Single face and multiple faces
 
-Detection and the 512-d identity embedding come from InsightFace `buffalo_l`.
-For each person you assign a source to, Videoswa keeps that person's embedding
-from the sample frame. On later frames it compares every detection with those
-embeddings and swaps only the closest match that clears the threshold, using
-that person's source photo and `inswapper_128`. Someone with no source photo
-is left alone. One source with no reference (the "every face" checkbox, or
-`--source`) is applied to every detection.
+`buffalo_l` detects faces and reads a gender/age attribute with the embedding.
+InsightFace encodes gender as 0 (female) or 1 (male). The desktop window shows
+that next to the thumbnail (`Face 1 — Male`). A missing or unexpected value
+is labeled **Unknown**.
+
+**Single face** is the default. One source image is mapped to the selected
+face from the sample frame (the largest face until you click another
+thumbnail). **Apply this source to every face** is the wildcard: that source
+replaces every detection. **Multiple faces** keeps the per-person source
+list. On later frames each detection is compared with those reference
+embeddings and swapped only when the closest match clears the threshold,
+using that person's source photo and `inswapper_128`. A person with no source
+photo is left alone. The CLI `--source` flag is the same wildcard as the
+checkbox.
 
 ## Models
 
@@ -282,9 +293,11 @@ pytest
 ```
 
 The suite covers the TensorRT → CUDA → CPU provider order, the 5-minute
-rejection (no frames swapped), cancel, multi-face matching, and that the
-desktop window opens. It does not download the swap models and it does not
-require an NVIDIA GPU. TensorRT execution itself needs the Windows stack above.
+rejection (no frames swapped), cancel, gender labels, single-face versus
+per-face mapping, multi-face matching, and that the desktop window opens on
+Single face with full beard coverage. It does not download the swap models
+and it does not require an NVIDIA GPU. TensorRT execution itself needs the
+Windows stack above.
 
 ## Layout
 

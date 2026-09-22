@@ -15,6 +15,8 @@ from faceswap.face_analyzer import Face
 from faceswap.video import MAX_VIDEO_SECONDS, VIDEO_SUFFIXES, assert_duration_allowed
 
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
+FACE_MODE_SINGLE = "single"
+FACE_MODE_MULTIPLE = "multiple"
 
 
 @dataclass
@@ -37,7 +39,10 @@ class SwapRequest:
     keep_audio: bool = True
     crf: int = 18
     preset: str = "medium"
+    face_mode: str = FACE_MODE_SINGLE
     single_source: Optional[Path] = None
+    selected_face: Optional[Face] = None
+    apply_to_all: bool = False
     face_sources: list[FaceSource] = field(default_factory=list)
 
 
@@ -62,8 +67,12 @@ def validate_request(request: SwapRequest) -> None:
 
     assert_duration_allowed(video, limit_s=MAX_VIDEO_SECONDS)
 
-    if request.single_source is not None:
+    if request.face_mode == FACE_MODE_SINGLE:
+        if request.single_source is None:
+            raise ValueError("Choose one source image.")
         _require_image(Path(request.single_source))
+        if not request.apply_to_all and request.selected_face is None:
+            raise ValueError("Detect faces, then select the face to replace.")
         return
 
     if not request.face_sources:
@@ -83,9 +92,28 @@ def _require_image(path: Path) -> None:
 
 
 def build_mappings(engine: FaceSwapEngine, request: SwapRequest) -> list[FaceMapping]:
-    if request.single_source is not None:
-        source = read_image(Path(request.single_source))
-        return [engine.build_mapping(source, reference_image_bgr=None, label="all")]
+    if request.face_mode == FACE_MODE_SINGLE:
+        if request.single_source is None:
+            raise ValueError("Choose one source image.")
+        if request.apply_to_all:
+            source = read_image(Path(request.single_source))
+            return [engine.build_mapping(source, reference_image_bgr=None, label="all")]
+        if request.selected_face is None:
+            raise ValueError("Detect faces, then select the face to replace.")
+        source_image = read_image(Path(request.single_source))
+        source_face = engine.analyzer.best_face(source_image)
+        if source_face is None:
+            raise ValueError(
+                f"No face found in '{Path(request.single_source).name}'. "
+                "Use a photo with one clear face."
+            )
+        return [
+            FaceMapping(
+                source_face=source_face,
+                reference_face=request.selected_face,
+                label="selected",
+            )
+        ]
 
     mappings: list[FaceMapping] = []
     for item in request.face_sources:

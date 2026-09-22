@@ -32,6 +32,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from faceswap.face_analyzer import face_label
 from faceswap.utils import logger
 from faceswap.video import (
     VIDEO_SUFFIXES,
@@ -43,7 +44,7 @@ from faceswap.video import (
     read_frame_at,
 )
 from videoswa.images import bgr_to_qpixmap
-from videoswa.jobs import FaceSource, SwapRequest, validate_request
+from videoswa.jobs import FACE_MODE_MULTIPLE, FACE_MODE_SINGLE, FaceSource, SwapRequest, validate_request
 from videoswa.worker import DetectRequest, DetectedPerson, EngineWorker
 
 _VIDEO_FILTER = "Videos (*.mp4 *.mov *.avi *.mkv *.webm *.m4v)"
@@ -79,13 +80,18 @@ class _QtLogHandler(logging.Handler):
 
 
 class FaceCard(QFrame):
-    """One detected person plus the source image that should replace them."""
+    """One detected face, its gender label, and an optional per-face source."""
+
+    clicked = Signal(int)
 
     def __init__(self, person: DetectedPerson, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self.person = person
         self.source_path: Optional[Path] = None
+        self._selected = False
+        self._multi = False
         self.setObjectName("FaceCard")
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
@@ -98,26 +104,64 @@ class FaceCard(QFrame):
         layout.addWidget(thumb)
 
         column = QVBoxLayout()
-        title = QLabel(f"Person {person.index + 1}")
-        title.setObjectName("CardTitle")
+        self.title = QLabel(face_label(person.index, person.face.gender))
+        self.title.setObjectName("CardTitle")
+        self.hint = QLabel("Click to select")
+        self.hint.setObjectName("Muted")
         self.source_label = QLabel("No source image — this person stays unchanged")
         self.source_label.setWordWrap(True)
         self.source_label.setObjectName("Muted")
+        self.source_label.setVisible(False)
         buttons = QHBoxLayout()
-        choose = QPushButton("Choose source…")
-        clear = QPushButton("Clear")
-        choose.clicked.connect(self._choose)
-        clear.clicked.connect(self._clear)
-        buttons.addWidget(choose)
-        buttons.addWidget(clear)
+        self.choose_btn = QPushButton("Choose source…")
+        self.clear_btn = QPushButton("Clear")
+        self.choose_btn.clicked.connect(self._choose)
+        self.clear_btn.clicked.connect(self._clear)
+        self.choose_btn.setVisible(False)
+        self.clear_btn.setVisible(False)
+        buttons.addWidget(self.choose_btn)
+        buttons.addWidget(self.clear_btn)
         buttons.addStretch(1)
-        column.addWidget(title)
+        column.addWidget(self.title)
+        column.addWidget(self.hint)
         column.addWidget(self.source_label)
         column.addLayout(buttons)
         layout.addLayout(column, stretch=1)
 
+    def set_multi(self, multi: bool) -> None:
+        self._multi = multi
+        self.source_label.setVisible(multi)
+        self.choose_btn.setVisible(multi)
+        self.clear_btn.setVisible(multi)
+        if multi:
+            self.hint.setVisible(False)
+        else:
+            self.hint.setVisible(True)
+            self._refresh_hint()
+
+    def set_selected(self, selected: bool) -> None:
+        self._selected = selected
+        self.setObjectName("FaceCardSelected" if selected else "FaceCard")
+        self.style().unpolish(self)
+        self.style().polish(self)
+        self._refresh_hint()
+
+    def _refresh_hint(self) -> None:
+        if self._multi:
+            return
+        self.hint.setText("Selected" if self._selected else "Click to select")
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802 - Qt API
+        self.clicked.emit(self.person.index)
+        super().mousePressEvent(event)
+
     def _choose(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(self, f"Source face for person {self.person.index + 1}", "", _IMAGE_FILTER)
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            f"Source face for {face_label(self.person.index, self.person.face.gender)}",
+            "",
+            _IMAGE_FILTER,
+        )
         if not path:
             return
         self.source_path = Path(path)
@@ -138,6 +182,7 @@ class MainWindow(QMainWindow):
         self._cards: list[FaceCard] = []
         self._busy = False
         self._single_source: Optional[Path] = None
+        self._selected_index: Optional[int] = None
 
         self.worker = EngineWorker()
         self.worker.detect_ready.connect(self._on_detected)
@@ -175,7 +220,7 @@ class MainWindow(QMainWindow):
         left.setContentsMargins(0, 0, 8, 0)
         title = QLabel("Videoswa")
         title.setObjectName("Title")
-        subtitle = QLabel("Map source faces onto people in a video, then write an MP4.")
+        subtitle = QLabel("Swap a face in a video, then write an MP4.")
         subtitle.setWordWrap(True)
         subtitle.setObjectName("Muted")
         left.addWidget(title)
@@ -310,21 +355,29 @@ class MainWindow(QMainWindow):
         right.addWidget(self.preview)
 
         header = QHBoxLayout()
-        header.addWidget(QLabel("People in this frame"))
-        header.addStretch(1)
-        self.single_check = QCheckBox("Use one source for every face")
-        self.single_check.toggled.connect(self._toggle_single)
-        header.addWidget(self.single_check)
+        header.addWidget(QLabel("Swap mode"))
+        self.face_mode = QComboBox()
+        self.face_mode.addItem("Single face", FACE_MODE_SINGLE)
+        self.face_mode.addItem("Multiple faces", FACE_MODE_MULTIPLE)
+        self.face_mode.currentIndexChanged.connect(self._on_mode_changed)
+        header.addWidget(self.face_mode, stretch=1)
         right.addLayout(header)
 
-        self.single_btn = QPushButton("Choose source for everyone…")
-        self.single_btn.setVisible(False)
+        self.mode_hint = QLabel("One source image replaces the selected face.")
+        self.mode_hint.setWordWrap(True)
+        self.mode_hint.setObjectName("Muted")
+        right.addWidget(self.mode_hint)
+
+        self.single_btn = QPushButton("Choose source image…")
         self.single_btn.clicked.connect(self._pick_single_source)
-        self.single_label = QLabel("")
+        self.single_label = QLabel("No source image")
         self.single_label.setObjectName("Muted")
-        self.single_label.setVisible(False)
+        self.apply_all = QCheckBox("Apply this source to every face")
+        self.apply_all.setChecked(False)
+        self.apply_all.toggled.connect(self._on_apply_all)
         right.addWidget(self.single_btn)
         right.addWidget(self.single_label)
+        right.addWidget(self.apply_all)
 
         self.face_host = QWidget()
         self.face_layout = QVBoxLayout(self.face_host)
@@ -356,11 +409,12 @@ class MainWindow(QMainWindow):
         self.setStyleSheet(
             """
             QWidget { color: #e6e8eb; background: #16181d; }
-            QFrame#Panel, QFrame#FaceCard {
+            QFrame#Panel, QFrame#FaceCard, QFrame#FaceCardSelected {
                 background: #1f232a;
                 border: 1px solid #31363f;
                 border-radius: 8px;
             }
+            QFrame#FaceCardSelected { border: 2px solid #2f6fed; }
             QLabel#Title { font-size: 22px; font-weight: 600; background: transparent; }
             QLabel#Muted, QLabel#CardTitle { background: transparent; }
             QLabel#Muted { color: #9aa3ad; }
@@ -481,12 +535,48 @@ class MainWindow(QMainWindow):
 
     def _clear_faces(self) -> None:
         self._cards.clear()
+        self._selected_index = None
         while self.face_layout.count():
             item = self.face_layout.takeAt(0)
             widget = item.widget()
             if widget is not None:
                 widget.deleteLater()
         self.face_layout.addStretch(1)
+
+    def _single_mode(self) -> bool:
+        return self.face_mode.currentData() == FACE_MODE_SINGLE
+
+    def _on_mode_changed(self) -> None:
+        single = self._single_mode()
+        self.single_btn.setVisible(single)
+        self.single_label.setVisible(single)
+        self.apply_all.setVisible(single)
+        if single:
+            if self.apply_all.isChecked():
+                self.mode_hint.setText("One source image replaces every face in the video.")
+            else:
+                self.mode_hint.setText("One source image replaces the selected face. Click a thumbnail to change it.")
+        else:
+            self.mode_hint.setText("Choose a source image on each face you want to replace. Leave a face empty to keep it.")
+        for card in self._cards:
+            card.set_multi(not single)
+            card.set_selected(single and not self.apply_all.isChecked() and card.person.index == self._selected_index)
+
+    def _on_apply_all(self, _checked: bool) -> None:
+        self._on_mode_changed()
+
+    def _select_face(self, index: int) -> None:
+        if not self._single_mode():
+            return
+        self._selected_index = index
+        for card in self._cards:
+            card.set_selected(card.person.index == index and not self.apply_all.isChecked())
+
+    def _selected_face(self):
+        for card in self._cards:
+            if card.person.index == self._selected_index:
+                return card.person.face
+        return None
 
     def _detect(self) -> None:
         if self._busy:
@@ -517,16 +607,22 @@ class MainWindow(QMainWindow):
             if not isinstance(person, DetectedPerson):
                 continue
             card = FaceCard(person)
+            card.clicked.connect(self._select_face)
             self._cards.append(card)
             self.face_layout.addWidget(card)
+        if self._cards:
+            primary = max(self._cards, key=lambda card: card.person.face.area)
+            self._selected_index = primary.person.index
+        self._on_mode_changed()
         self.face_layout.addStretch(1)
         self.progress.setRange(0, 100)
         self.progress.setValue(0)
         self.progress.setFormat("Idle")
         self._set_busy(False)
+        labels = ", ".join(face_label(card.person.index, card.person.face.gender) for card in self._cards)
+        detail = f" ({labels})" if labels else ""
         self._set_status(
-            f"Detected {len(self._cards)} face(s) at {format_timestamp(self._timestamp())}. "
-            "Choose a source image for each person you want to replace."
+            f"Detected {len(self._cards)} face(s) at {format_timestamp(self._timestamp())}{detail}."
         )
 
     def _on_detect_failed(self, message: str) -> None:
@@ -536,14 +632,8 @@ class MainWindow(QMainWindow):
         self._set_busy(False)
         QMessageBox.critical(self, "Detection failed", message)
 
-    def _toggle_single(self, checked: bool) -> None:
-        self.single_btn.setVisible(checked)
-        self.single_label.setVisible(checked)
-        for card in self._cards:
-            card.setEnabled(not checked)
-
     def _pick_single_source(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(self, "Source face for every person", "", _IMAGE_FILTER)
+        path, _ = QFileDialog.getOpenFileName(self, "Source face", "", _IMAGE_FILTER)
         if not path:
             return
         self._single_source = Path(path)
@@ -560,11 +650,19 @@ class MainWindow(QMainWindow):
             return
         sources: list[FaceSource] = []
         single: Optional[Path] = None
-        if self.single_check.isChecked():
+        selected = None
+        apply_to_all = False
+        if self._single_mode():
             if self._single_source is None:
-                QMessageBox.warning(self, "No source", "Choose the source image that should replace every face.")
+                QMessageBox.warning(self, "No source", "Choose the source image to swap in.")
                 return
             single = self._single_source
+            apply_to_all = self.apply_all.isChecked()
+            if not apply_to_all:
+                selected = self._selected_face()
+                if selected is None:
+                    QMessageBox.warning(self, "No face selected", "Detect faces, then select the face to replace.")
+                    return
         else:
             for card in self._cards:
                 if card.source_path is None:
@@ -573,7 +671,7 @@ class MainWindow(QMainWindow):
                     FaceSource(
                         face=card.person.face,
                         source_path=card.source_path,
-                        label=f"person_{card.person.index + 1}",
+                        label=face_label(card.person.index, card.person.face.gender),
                     )
                 )
         request = SwapRequest(
@@ -586,7 +684,10 @@ class MainWindow(QMainWindow):
             keep_audio=self.keep_audio.isChecked(),
             crf=self.crf.value(),
             preset=self.preset.currentText(),
+            face_mode=str(self.face_mode.currentData()),
             single_source=single,
+            selected_face=selected,
+            apply_to_all=apply_to_all,
             face_sources=sources,
         )
         try:

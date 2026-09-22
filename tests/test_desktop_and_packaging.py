@@ -92,6 +92,8 @@ def test_window_loads_short_video(tmp_path: Path) -> None:
         assert "TensorRT" in window.execution.itemText(0)
         assert window.coverage.currentData() == "full"
         assert "beard" in window.coverage.currentText().lower()
+        assert window.face_mode.currentData() == "single"
+        assert window.apply_all.isChecked() is False
         assert window.output_edit.text().endswith("_videoswa.mp4")
         assert window.time_slider.isEnabled()
         app.processEvents()
