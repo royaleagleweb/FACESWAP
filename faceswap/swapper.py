@@ -10,8 +10,10 @@ from typing import Optional
 
 import numpy as np
 
-from .coverage import DEFAULT_COVERAGE, normalize_coverage, paste_swapped_face
+from .coverage import DEFAULT_COVERAGE, coverage_alpha, normalize_coverage, paste_swapped_face
 from .face_analyzer import Face
+from .occlusion import _occ_mask
+from .quality import RESTORE_MIN_PX, face_span_px
 from .providers import (
     active_providers_from_sessions,
     provider_attempts,
@@ -36,6 +38,12 @@ class FaceSwapper:
         execution: str = "auto",
     ) -> None:
         self._enhance_requested = bool(enhance)
+        self.object_mask = True
+        self.precise_edges = False
+        self.allow_restore = bool(enhance)
+        self.color_memory: dict[int, np.ndarray] = {}
+        self._color_key: Optional[int] = None
+        self._occlusion = None
         self._load(use_gpu=use_gpu, execution=execution, enhance=enhance)
 
     def _load(self, use_gpu: bool, execution: str, enhance: bool) -> None:
@@ -61,6 +69,7 @@ class FaceSwapper:
         )
         self.swapper, self.active_providers = loaded
         self.providers = providers
+        self.execution = mode
         self._on_cpu = not uses_gpu(providers)
         logger.info("InSwapper active providers: %s", self.active_providers or "(unreported)")
         self._enhancer = None
@@ -108,6 +117,21 @@ class FaceSwapper:
             )
         return None
 
+    def begin_face(self, key: int) -> None:
+        """Remember which tracked person the next ``swap`` call belongs to."""
+        self._color_key = key
+
+    def reset_color_memory(self) -> None:
+        self.color_memory.clear()
+        self._color_key = None
+
+    def occlusion_models(self):
+        if self._occlusion is None or getattr(self._occlusion, "execution", None) != self.execution:
+            from .occlusion import OcclusionModels
+
+            self._occlusion = OcclusionModels(self.execution)
+        return self._occlusion
+
     def swap(
         self,
         frame: np.ndarray,
@@ -133,14 +157,41 @@ class FaceSwapper:
         )
         if not paste_back:
             return swapped
+        mode = normalize_coverage(coverage)
+        alpha = None
+        if self.object_mask:
+            models = self.occlusion_models()
+            face_alpha = coverage_alpha(frame.shape[:2], target_face.kps, mode)
+            neural = models.xseg_keepout(frame, matrix, face_alpha) if models.xseg is not None else None
+            precise = None
+            if self.precise_edges and models.bisenet is not None:
+                precise = models.bisenet_keep(frame, matrix, face_alpha)
+            alpha = _occ_mask(
+                frame,
+                target_face.kps,
+                mode,
+                neural=neural,
+                precise=precise,
+            )
+        previous = self.color_memory.get(self._color_key) if self._color_key is not None else None
+        color_state: dict = {}
         out = paste_swapped_face(
             frame,
             swapped,
             matrix,
             target_face.kps,
-            coverage=normalize_coverage(coverage),
+            coverage=mode,
+            alpha=alpha,
+            previous_delta=previous,
+            color_state=color_state,
         )
-        if self._enhancer is not None:
+        if self._color_key is not None and "delta" in color_state:
+            self.color_memory[self._color_key] = color_state["delta"]
+        if (
+            self._enhancer is not None
+            and self.allow_restore
+            and face_span_px(target_face.bbox) >= RESTORE_MIN_PX
+        ):
             out = _enhance_face_region(
                 out,
                 _enhance_bbox(target_face.bbox, coverage),

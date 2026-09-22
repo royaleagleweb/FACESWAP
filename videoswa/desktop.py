@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import shutil
 import sys
@@ -44,8 +45,9 @@ from faceswap.video import (
     format_timestamp,
     read_frame_at,
 )
-from videoswa.images import bgr_to_qpixmap
+from videoswa.images import bgr_to_qpixmap, wipe_preview
 from videoswa.jobs import FACE_MODE_MULTIPLE, FACE_MODE_SINGLE, FaceSource, SwapRequest, validate_request
+from videoswa.project import PROJECT_SUFFIX, gender_mark, load_project, save_project
 from videoswa.worker import DetectRequest, DetectedPerson, EngineWorker, PreviewRequest
 
 _VIDEO_FILTER = "Videos (*.mp4 *.mov *.avi *.mkv *.webm *.m4v)"
@@ -181,6 +183,9 @@ class MainWindow(QMainWindow):
         self._selected_index: Optional[int] = None
         self._showing_swap = False
         self._preview_bgr: Optional[object] = None
+        self._preview_original = None
+        self._preview_swapped = None
+        self._rotation_paths: list[Path] = []
 
         self.worker = EngineWorker()
         self.worker.detect_ready.connect(self._on_detected)
@@ -253,8 +258,8 @@ class MainWindow(QMainWindow):
         self.preview_btn = QPushButton("Preview swap on this frame")
         self.preview_btn.setEnabled(False)
         self.preview_btn.setToolTip(
-            "Swap only the sample frame and show original and swapped side by side. "
-            "Does not write the video."
+            "Swap only the sample frame. Drag Before / after to wipe between "
+            "the original and the swapped frame. Does not write the video."
         )
         self.preview_btn.clicked.connect(self._preview_swap)
         target_layout.addWidget(self.preview_btn)
@@ -270,6 +275,7 @@ class MainWindow(QMainWindow):
         else:
             auto_label = "Auto (TensorRT → CUDA → CPU)"
         self.execution.addItem(auto_label, "auto")
+        self.execution.addItem("TensorRT", "tensorrt")
         self.execution.addItem("CUDA only", "cuda")
         if sys.platform.startswith("win"):
             self.execution.addItem("DirectML", "directml")
@@ -311,6 +317,69 @@ class MainWindow(QMainWindow):
             "Full replaces the jaw, cheeks, and beard. Normal keeps a tight oval around the inner face."
         )
         form.addWidget(self.coverage)
+
+        self.object_mask = QCheckBox("Object mask (XSeg)")
+        self.object_mask.setChecked(True)
+        self.object_mask.setToolTip(
+            "On for every normal swap. Keeps lollipops, food, and hands when they "
+            "cover the face. Uses models/xseg.onnx when that file is present, and "
+            "the built-in mask otherwise. The mask is warped to the face only."
+        )
+        self.precise_edges = QCheckBox("Precise edges (BiSeNet)")
+        self.precise_edges.setChecked(False)
+        self.precise_edges.setToolTip(
+            "Off by default. Turn on for a tighter hairline when models/bisenet.onnx is installed."
+        )
+        self.fast_draft = QCheckBox("Fast draft in preview")
+        self.fast_draft.setChecked(True)
+        self.fast_draft.setToolTip(
+            "Preview and playback skip GFPGAN and BiSeNet. Object mask stays on. "
+            "Run swap uses the checkboxes above."
+        )
+        self.detect_every = QCheckBox("Detect every 2nd frame")
+        self.detect_every.setChecked(True)
+        self.detect_every.setToolTip(
+            "Full export runs the detector on every other frame and reuses landmarks between them."
+        )
+        form.addWidget(self.object_mask)
+        form.addWidget(self.precise_edges)
+        form.addWidget(self.fast_draft)
+        form.addWidget(self.detect_every)
+        self.fast_draft_btn = QPushButton("⚡ Fast draft")
+        self.fast_draft_btn.setToolTip("Restore off, precise edges off, object mask on.")
+        self.fast_draft_btn.clicked.connect(self._apply_fast_draft)
+        form.addWidget(self.fast_draft_btn)
+
+        min_row = QHBoxLayout()
+        min_row.addWidget(QLabel("Min face size (px)"))
+        self.min_face = QSpinBox()
+        self.min_face.setRange(0, 512)
+        self.min_face.setValue(0)
+        self.min_face.setToolTip("Skip background faces smaller than this. 0 keeps every detection. Try 64 in a crowd.")
+        min_row.addWidget(self.min_face)
+        form.addLayout(min_row)
+
+        form.addWidget(QLabel("Source rotation"))
+        self.rotation = QComboBox()
+        self.rotation.addItem("A different face per person", "per_person")
+        self.rotation.addItem("When the face changes", "scene")
+        self.rotation.addItem("Every N seconds", "interval")
+        form.addWidget(self.rotation)
+        rot_row = QHBoxLayout()
+        rot_row.addWidget(QLabel("Every"))
+        self.rotation_seconds = QSpinBox()
+        self.rotation_seconds.setRange(1, 120)
+        self.rotation_seconds.setValue(5)
+        self.rotation_seconds.setSuffix(" s")
+        rot_row.addWidget(self.rotation_seconds)
+        self.add_rotation_btn = QPushButton("Add rotation source…")
+        self.add_rotation_btn.clicked.connect(self._add_rotation_source)
+        rot_row.addWidget(self.add_rotation_btn)
+        form.addLayout(rot_row)
+        self.rotation_label = QLabel("Rotation uses the source images you add here.")
+        self.rotation_label.setWordWrap(True)
+        self.rotation_label.setObjectName("Muted")
+        form.addWidget(self.rotation_label)
 
         form.addWidget(QLabel("Export speed"))
         self.speed = QComboBox()
@@ -363,6 +432,14 @@ class MainWindow(QMainWindow):
         out_row.addWidget(self.output_edit, stretch=1)
         out_row.addWidget(out_browse)
         output_layout.addLayout(out_row)
+        project_row = QHBoxLayout()
+        save_project_btn = QPushButton("Save project")
+        load_project_btn = QPushButton("Load project")
+        save_project_btn.clicked.connect(self._save_project)
+        load_project_btn.clicked.connect(self._load_project)
+        project_row.addWidget(save_project_btn)
+        project_row.addWidget(load_project_btn)
+        output_layout.addLayout(project_row)
         left.addWidget(output_box)
 
         self.detect_btn = QPushButton("Detect faces")
@@ -399,6 +476,14 @@ class MainWindow(QMainWindow):
         self.preview.setMinimumHeight(280)
         self.preview.setObjectName("Preview")
         right.addWidget(self.preview)
+        self.compare_slider = QSlider(Qt.Orientation.Horizontal)
+        self.compare_slider.setRange(0, 100)
+        self.compare_slider.setValue(50)
+        self.compare_slider.setEnabled(False)
+        self.compare_slider.setToolTip("Drag to wipe between the swapped frame and the original.")
+        self.compare_slider.valueChanged.connect(self._on_compare)
+        right.addWidget(QLabel("Before / after"))
+        right.addWidget(self.compare_slider)
 
         header = QHBoxLayout()
         header.addWidget(QLabel("Swap mode"))
@@ -582,6 +667,7 @@ class MainWindow(QMainWindow):
 
     def _on_slider(self, _value: int) -> None:
         self._showing_swap = False
+        self.compare_slider.setEnabled(False)
         self.time_label.setText(f"Sample frame  {format_timestamp(self._timestamp())}")
         self._preview_timer.start(120)
 
@@ -791,6 +877,14 @@ class MainWindow(QMainWindow):
             selected_face=selected,
             apply_to_all=apply_to_all,
             face_sources=sources,
+            precise_edges=self.precise_edges.isChecked(),
+            object_mask=self.object_mask.isChecked(),
+            fast_draft_preview=self.fast_draft.isChecked(),
+            detect_every_other=self.detect_every.isChecked(),
+            min_face_px=self.min_face.value(),
+            rotation_mode=str(self.rotation.currentData()),
+            rotation_seconds=float(self.rotation_seconds.value()),
+            rotation_paths=list(self._rotation_paths),
         )
 
     def _preview_swap(self) -> None:
@@ -817,10 +911,12 @@ class MainWindow(QMainWindow):
         self._set_status("Swapping the sample frame…")
         self.worker.request_preview(PreviewRequest(timestamp_s=self._timestamp(), swap=request))
 
-    def _on_preview_ready(self, image, note: str, unchanged: bool) -> None:
+    def _on_preview_ready(self, original, swapped, note: str, unchanged: bool) -> None:
         self._showing_swap = True
-        self._preview_bgr = image
-        self._paint_preview(image)
+        self._preview_original = original
+        self._preview_swapped = swapped
+        self.compare_slider.setEnabled(True)
+        self._paint_compare()
         self.progress.setRange(0, 100)
         self.progress.setValue(100 if not unchanged else 0)
         self.progress.setFormat("Preview" if not unchanged else "Idle")
@@ -828,6 +924,174 @@ class MainWindow(QMainWindow):
         self._set_status(note)
         if unchanged:
             QMessageBox.warning(self, "Preview did not swap a face", note)
+
+    def _paint_compare(self) -> None:
+        if self._preview_original is None or self._preview_swapped is None:
+            return
+        image = wipe_preview(
+            self._preview_original,
+            self._preview_swapped,
+            self.compare_slider.value() / 100.0,
+        )
+        self._preview_bgr = image
+        self._paint_preview(image)
+
+    def _on_compare(self, _value: int) -> None:
+        if self._showing_swap:
+            self._paint_compare()
+
+    def _apply_fast_draft(self) -> None:
+        self.enhance.setChecked(False)
+        self.precise_edges.setChecked(False)
+        self.object_mask.setChecked(True)
+        self.fast_draft.setChecked(True)
+        self._set_status("Fast draft: restore off, precise edges off, object mask on.")
+
+    def _add_rotation_source(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "Rotation source", "", _IMAGE_FILTER)
+        if not path:
+            return
+        self._rotation_paths.append(Path(path))
+        names = ", ".join(item.name for item in self._rotation_paths)
+        self.rotation_label.setText(f"Rotation sources: {names}")
+
+    def _project_payload(self) -> dict:
+        sources = []
+        if self._single_source is not None:
+            gender = None
+            face = self._selected_face()
+            if face is not None:
+                gender = face.gender
+            sources.append({
+                "path": str(self._single_source),
+                "role": "single",
+                "gender": gender_mark(gender),
+                "label": self.single_label.text(),
+            })
+        for card in self._cards:
+            if card.source_path is None:
+                continue
+            sources.append({
+                "path": str(card.source_path),
+                "role": "face",
+                "index": card.person.index,
+                "gender": gender_mark(card.person.face.gender),
+                "label": card.title.text(),
+            })
+        for path in self._rotation_paths:
+            sources.append({"path": str(path), "role": "rotation", "gender": "", "label": path.name})
+        return {
+            "video": str(self._video) if self._video else "",
+            "output": self.output_edit.text().strip(),
+            "sources": sources,
+            "settings": {
+                "execution": self.execution.currentData(),
+                "similarity": self.similarity.value(),
+                "coverage": self.coverage.currentData(),
+                "enhance": self.enhance.isChecked(),
+                "object_mask": self.object_mask.isChecked(),
+                "precise_edges": self.precise_edges.isChecked(),
+                "fast_draft_preview": self.fast_draft.isChecked(),
+                "detect_every_other": self.detect_every.isChecked(),
+                "min_face_px": self.min_face.value(),
+                "rotation_mode": self.rotation.currentData(),
+                "rotation_seconds": self.rotation_seconds.value(),
+                "face_mode": self.face_mode.currentData(),
+                "apply_all": self.apply_all.isChecked(),
+                "scale": self.speed.currentData(),
+                "keep_audio": self.keep_audio.isChecked(),
+                "crf": self.crf.value(),
+                "preset": self.preset.currentText(),
+            },
+        }
+
+    def _save_project(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save project", "videoswa.videoswaproj", f"Videoswa project (*{PROJECT_SUFFIX})"
+        )
+        if not path:
+            return
+        saved = save_project(Path(path), self._project_payload())
+        self._set_status(f"Saved project {saved}")
+
+    def _load_project(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Load project", "", f"Videoswa project (*{PROJECT_SUFFIX})"
+        )
+        if not path:
+            return
+        try:
+            data = load_project(Path(path))
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            QMessageBox.warning(self, "Could not load project", str(exc))
+            return
+        self._apply_project(data)
+        self._set_status(f"Loaded project {path}")
+
+    def _apply_project(self, data: dict) -> None:
+        settings = data.get("settings") or {}
+        self._set_combo(self.execution, settings.get("execution"))
+        self._set_combo(self.coverage, settings.get("coverage"))
+        self._set_combo(self.face_mode, settings.get("face_mode"))
+        self._set_combo(self.rotation, settings.get("rotation_mode"))
+        if settings.get("similarity") is not None:
+            self.similarity.setValue(int(settings["similarity"]))
+        if settings.get("min_face_px") is not None:
+            self.min_face.setValue(int(settings["min_face_px"]))
+        if settings.get("rotation_seconds") is not None:
+            self.rotation_seconds.setValue(int(settings["rotation_seconds"]))
+        if settings.get("crf") is not None:
+            self.crf.setValue(int(settings["crf"]))
+        if settings.get("preset"):
+            self.preset.setCurrentText(str(settings["preset"]))
+        self.enhance.setChecked(bool(settings.get("enhance", False)))
+        self.object_mask.setChecked(bool(settings.get("object_mask", True)))
+        self.precise_edges.setChecked(bool(settings.get("precise_edges", False)))
+        self.fast_draft.setChecked(bool(settings.get("fast_draft_preview", True)))
+        self.detect_every.setChecked(bool(settings.get("detect_every_other", True)))
+        self.apply_all.setChecked(bool(settings.get("apply_all", False)))
+        self.keep_audio.setChecked(bool(settings.get("keep_audio", True)))
+        if settings.get("scale") is not None:
+            self._set_combo(self.speed, settings.get("scale"))
+        if data.get("output"):
+            self.output_edit.setText(str(data["output"]))
+        self._rotation_paths = []
+        single = None
+        for item in data.get("sources") or []:
+            if not isinstance(item, dict) or not item.get("path"):
+                continue
+            role = item.get("role")
+            if role == "rotation":
+                self._rotation_paths.append(Path(item["path"]))
+            elif role == "single":
+                single = Path(item["path"])
+        if self._rotation_paths:
+            self.rotation_label.setText(
+                "Rotation sources: " + ", ".join(path.name for path in self._rotation_paths)
+            )
+        if single is not None and single.is_file():
+            self._single_source = single
+            mark = ""
+            for item in data.get("sources") or []:
+                if isinstance(item, dict) and item.get("role") == "single":
+                    mark = item.get("gender") or ""
+            self.single_label.setText(f"{single} {mark}".strip())
+        video = data.get("video") or ""
+        if video and Path(video).is_file():
+            try:
+                self.load_video(Path(video))
+            except Exception as exc:
+                self._set_status(str(exc))
+        self._update_preview_button()
+
+    @staticmethod
+    def _set_combo(box: QComboBox, value) -> None:
+        if value is None:
+            return
+        for index in range(box.count()):
+            if box.itemData(index) == value:
+                box.setCurrentIndex(index)
+                return
 
     def _on_preview_failed(self, message: str) -> None:
         self.progress.setRange(0, 100)

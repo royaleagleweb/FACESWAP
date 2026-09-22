@@ -17,6 +17,7 @@ import numpy as np
 from .coverage import DEFAULT_COVERAGE
 from .face_analyzer import Face, FaceAnalyzer, cosine_similarity
 from .providers import CudaRuntimeGuard
+from .quality import SourceRotation, face_span_px, lock_gender
 from .swapper import FaceSwapper
 from .utils import logger
 
@@ -63,6 +64,7 @@ class SwapStats:
     faces_swapped: int = 0
     faces_unmatched: int = 0
     faces_held: int = 0
+    faces_skipped: int = 0
 
 
 @dataclass
@@ -73,6 +75,8 @@ class _FaceTrack:
     bbox: np.ndarray
     embedding: np.ndarray
     missed: int = 0
+    gender_votes: list = field(default_factory=list)
+    locked_gender: Optional[int] = None
 
 
 @dataclass
@@ -85,10 +89,16 @@ class FaceSwapEngine:
     coverage: str = DEFAULT_COVERAGE
     apply_to_all_when_no_reference: bool = True
     stats: SwapStats = field(default_factory=SwapStats)
+    detect_stride: int = 1
+    min_face_px: int = 0
 
     def __post_init__(self) -> None:
         self.cuda_guard = CudaRuntimeGuard()
         self._tracks: List[_FaceTrack] = []
+        self._cached_faces: List[Face] = []
+        self._detect_tick = 0
+        self._from_detector = True
+        self.rotation = SourceRotation()
         for member in (self.analyzer, self.swapper):
             if hasattr(member, "adopt_cpu"):
                 self.cuda_guard.attach(member)
@@ -100,11 +110,18 @@ class FaceSwapEngine:
     def reset_tracks(self) -> None:
         """Drop cross-frame locks. Call this at the start of each video."""
         self._tracks = []
+        self._cached_faces = []
+        self._detect_tick = 0
+        self.rotation.reset()
+        reset_color = getattr(self.swapper, "reset_color_memory", None)
+        if callable(reset_color):
+            reset_color()
 
     def process_frame(
         self,
         frame_bgr: np.ndarray,
         mappings: Sequence[FaceMapping],
+        time_s: float = 0.0,
     ) -> np.ndarray:
         """Detect faces in `frame_bgr` and apply each mapping that matches.
 
@@ -115,9 +132,17 @@ class FaceSwapEngine:
         if not mappings:
             return frame_bgr
 
-        faces = self.analyzer.analyze(frame_bgr)
+        faces = self._faces_for_frame(frame_bgr)
         self.stats.frames += 1
         self.stats.faces_detected += len(faces)
+        if self.min_face_px > 0:
+            kept = []
+            for face in faces:
+                if face_span_px(face.bbox) < self.min_face_px:
+                    self.stats.faces_skipped += 1
+                    continue
+                kept.append(face)
+            faces = kept
         if not faces:
             self._age_tracks(set())
             return frame_bgr
@@ -136,14 +161,31 @@ class FaceSwapEngine:
             mapping, held = decision
             track = self._touch_track(face, mapping)
             touched.add(id(track))
+            source = self.rotation.choose(mapping.source_face, face, time_s)
+            begin = getattr(self.swapper, "begin_face", None)
+            if callable(begin):
+                begin(id(track))
             out = self.swapper.swap(
-                out, target_face=face, source_face=mapping.source_face, coverage=self.coverage
+                out, target_face=face, source_face=source, coverage=self.coverage
             )
             self.stats.faces_swapped += 1
             if held:
                 self.stats.faces_held += 1
         self._age_tracks(touched)
         return out
+
+    def _faces_for_frame(self, frame_bgr: np.ndarray) -> List[Face]:
+        """Detect on every Nth frame and reuse the last landmarks between them."""
+        self._detect_tick += 1
+        stride = max(1, int(self.detect_stride))
+        use_cache = stride > 1 and self._cached_faces and (self._detect_tick % stride != 1)
+        if use_cache:
+            self._from_detector = False
+            return list(self._cached_faces)
+        self._from_detector = True
+        faces = self.analyzer.analyze(frame_bgr)
+        self._cached_faces = list(faces)
+        return faces
 
     def _assign(
         self,
@@ -275,12 +317,27 @@ class FaceSwapEngine:
                 embedding=embedding.copy(),
             )
             self._tracks.append(best)
-            return best
-        best.bbox = np.asarray(face.bbox, dtype=np.float32).copy()
-        mixed = _EMA_KEEP * best.embedding + (1.0 - _EMA_KEEP) * embedding
-        best.embedding = mixed / (np.linalg.norm(mixed) + 1e-8)
-        best.missed = 0
+        else:
+            best.bbox = np.asarray(face.bbox, dtype=np.float32).copy()
+            mixed = _EMA_KEEP * best.embedding + (1.0 - _EMA_KEEP) * embedding
+            best.embedding = mixed / (np.linalg.norm(mixed) + 1e-8)
+            best.missed = 0
+        self._lock_track_gender(best, face)
         return best
+
+    def _lock_track_gender(self, track: _FaceTrack, face: Face) -> None:
+        """Majority gender from the first detections, then keep it."""
+        if track.locked_gender is not None:
+            face.gender = track.locked_gender
+            return
+        if not self._from_detector or face.gender not in (0, 1):
+            return
+        track.gender_votes.append(int(face.gender))
+        locked = lock_gender(track.gender_votes)
+        if locked is None:
+            return
+        track.locked_gender = locked
+        face.gender = locked
 
     def _age_tracks(self, touched: set[int]) -> None:
         for track in self._tracks:

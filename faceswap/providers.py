@@ -298,7 +298,48 @@ def provider_status_text(providers: Sequence) -> str:
         )
     if name == "DirectML":
         return "Running on DirectML."
+    if name == "TensorRT":
+        return (
+            "Running on TensorRT. The first frames compile engines into models/trt_cache. "
+            "That needs TensorRT 10.9 (nvinfer_10.dll on PATH) beside onnxruntime-gpu 1.22."
+        )
     return f"Running on {name}."
+
+
+def tensorrt_missing_note(active: Sequence) -> str:
+    """Extra banner line when Auto asked for TensorRT and it did not stay on."""
+    if active_device_name(active) == "TensorRT":
+        return ""
+    return (
+        " TensorRT is not active. Install TensorRT 10.9 and put nvinfer_10.dll on PATH. "
+        "CUDA, DirectML, and CPU are still used."
+    )
+
+
+def open_onnx_session(model_path: Path, execution: str, *, what: str):
+    """Open an ONNX file on TensorRT, then CUDA, then DirectML, then CPU.
+
+    Mask models use the same chain as InSwapper. A missing nvinfer library
+    fails this attempt and the next provider is tried. DirectML is unchanged
+    on Windows when TensorRT is not installed.
+    """
+    import onnxruntime as ort
+
+    attempts = provider_attempts(execution)
+
+    def _load(providers):
+        session = ort.InferenceSession(str(model_path), providers=providers)
+        active = list(session.get_providers())
+        if uses_gpu(providers) and active == [CPU]:
+            raise RuntimeError(
+                f"{what} fell back to CPU. TensorRT (nvinfer) or CUDA libraries "
+                "are probably missing from PATH."
+            )
+        return session, active
+
+    loaded, providers = run_with_provider_fallback(attempts, _load, what=what)
+    session, active = loaded
+    return session, providers, active
 
 
 def cuda_provider_options() -> dict:

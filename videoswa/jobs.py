@@ -45,6 +45,14 @@ class SwapRequest:
     selected_face: Optional[Face] = None
     apply_to_all: bool = False
     face_sources: list[FaceSource] = field(default_factory=list)
+    precise_edges: bool = False
+    object_mask: bool = True
+    fast_draft_preview: bool = True
+    detect_every_other: bool = True
+    min_face_px: int = 0
+    rotation_mode: str = "per_person"
+    rotation_seconds: float = 5.0
+    rotation_paths: list[Path] = field(default_factory=list)
 
 
 def read_image(path: Path) -> np.ndarray:

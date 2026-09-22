@@ -87,7 +87,12 @@ def cmd_swap(args: argparse.Namespace) -> int:
         similarity_threshold=args.similarity,
         coverage=args.coverage,
         apply_to_all_when_no_reference=args.apply_to_all,
+        detect_stride=1 if args.every_frame else 2,
+        min_face_px=args.min_face,
     )
+    engine.swapper.object_mask = not args.no_object_mask
+    engine.swapper.precise_edges = args.precise_edges
+    engine.swapper.allow_restore = args.enhance
 
     mappings = engine.build_mappings([(_read(s), _read(r) if r else None) for s, r in pairs])
 
@@ -140,6 +145,10 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_SIMILARITY,
         help="Cosine threshold for the first lock. A tracked face is kept below this.",
     )
+    s.add_argument("--every-frame", action="store_true", help="Run the face detector on every frame")
+    s.add_argument("--min-face", type=int, default=0, help="Skip detections smaller than this many pixels")
+    s.add_argument("--no-object-mask", action="store_true", help="Do not preserve objects covering the face")
+    s.add_argument("--precise-edges", action="store_true", help="Use BiSeNet when models/bisenet.onnx is present")
     s.add_argument(
         "--coverage",
         choices=list(COVERAGE_CHOICES),

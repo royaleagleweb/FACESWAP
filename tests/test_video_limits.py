@@ -36,7 +36,7 @@ class _DummyEngine:
         self.stats = SwapStats()
         self.calls = 0
 
-    def process_frame(self, frame, mappings):
+    def process_frame(self, frame, mappings, time_s=0.0):
         self.calls += 1
         return frame
 
@@ -84,7 +84,7 @@ def test_cancel_writes_nothing(tmp_path: Path) -> None:
     engine = _DummyEngine()
     cancel = threading.Event()
 
-    def _frame(frame, mappings):
+    def _frame(frame, mappings, time_s=0.0):
         engine.calls += 1
         cancel.set()
         return frame
@@ -104,7 +104,7 @@ def test_cancel_writes_nothing(tmp_path: Path) -> None:
 
 def test_half_resolution_swap_returns_the_original_size() -> None:
     class _Engine:
-        def process_frame(self, frame, _mappings):
+        def process_frame(self, frame, _mappings, time_s=0.0):
             self.shape = frame.shape
             return frame
 

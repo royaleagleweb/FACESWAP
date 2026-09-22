@@ -273,7 +273,8 @@ def process_video(
                 ok, frame = cap.read()
                 if not ok:
                     break
-                out = swap_frame(engine, frame, mappings, scale=scale)
+                time_s = (idx / info.fps) if info.fps else 0.0
+                out = swap_frame(engine, frame, mappings, scale=scale, time_s=time_s)
                 if out.shape[1] != info.width or out.shape[0] != info.height:
                     out = cv2.resize(out, (info.width, info.height))
                 writer.write(out)
@@ -302,7 +303,13 @@ def process_video(
     return output_path
 
 
-def swap_frame(engine: FaceSwapEngine, frame: np.ndarray, mappings, scale: float = 1.0) -> np.ndarray:
+def swap_frame(
+    engine: FaceSwapEngine,
+    frame: np.ndarray,
+    mappings,
+    scale: float = 1.0,
+    time_s: float = 0.0,
+) -> np.ndarray:
     """Swap one frame. ``scale`` below 1 runs the model on a smaller image.
 
     The returned frame is always the original size. Half resolution is the
@@ -311,11 +318,11 @@ def swap_frame(engine: FaceSwapEngine, frame: np.ndarray, mappings, scale: float
     scale = float(scale or 1.0)
     height, width = frame.shape[:2]
     if scale >= 0.99 or width < 4 or height < 4:
-        return engine.process_frame(frame, mappings)
+        return engine.process_frame(frame, mappings, time_s=time_s)
     small_w = max(2, int(round(width * scale)))
     small_h = max(2, int(round(height * scale)))
     small = cv2.resize(frame, (small_w, small_h), interpolation=cv2.INTER_AREA)
-    swapped = engine.process_frame(small, mappings)
+    swapped = engine.process_frame(small, mappings, time_s=time_s)
     if swapped.shape[1] != width or swapped.shape[0] != height:
         swapped = cv2.resize(swapped, (width, height), interpolation=cv2.INTER_LINEAR)
     return swapped

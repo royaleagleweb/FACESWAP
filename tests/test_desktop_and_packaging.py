@@ -97,6 +97,14 @@ def test_window_loads_short_video(tmp_path: Path) -> None:
         assert "Running on" in window.provider_banner.text()
         assert window.enhance.isEnabled()
         assert window.speed.currentData() == 1.0
+        assert window.execution.findData("tensorrt") >= 0
+        assert window.object_mask.isChecked() is True
+        assert window.precise_edges.isChecked() is False
+        assert window.fast_draft.isChecked() is True
+        assert window.detect_every.isChecked() is True
+        assert window.min_face.value() == 0
+        assert window.compare_slider.value() == 50
+        assert window.compare_slider.isEnabled() is False
         assert window.output_edit.text().endswith("_videoswa.mp4")
         assert window.time_slider.isEnabled()
         app.processEvents()

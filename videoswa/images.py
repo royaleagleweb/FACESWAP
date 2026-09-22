@@ -37,6 +37,20 @@ def side_by_side(original_bgr: np.ndarray, swapped_bgr: np.ndarray) -> np.ndarra
     return np.concatenate([left, gap, right], axis=1)
 
 
+def wipe_preview(original_bgr: np.ndarray, swapped_bgr: np.ndarray, amount: float) -> np.ndarray:
+    """Left of the cut is the swap, right of the cut is the original frame."""
+    original = np.array(original_bgr, copy=True)
+    swapped = np.array(swapped_bgr, copy=True)
+    if swapped.shape[:2] != original.shape[:2]:
+        swapped = cv2.resize(swapped, (original.shape[1], original.shape[0]), interpolation=cv2.INTER_LINEAR)
+    cut = int(round(float(np.clip(amount, 0.0, 1.0)) * original.shape[1]))
+    if cut > 0:
+        original[:, :cut] = swapped[:, :cut]
+    if 0 < cut < original.shape[1]:
+        original[:, cut:cut + 1] = (255, 255, 255)
+    return original
+
+
 def bgr_to_qpixmap(image: np.ndarray, max_edge: Optional[int] = None) -> QPixmap:
     if image.ndim == 2:
         rgb = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)

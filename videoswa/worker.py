@@ -16,12 +16,13 @@ from PySide6.QtCore import QThread, Signal
 
 from faceswap.core import FaceSwapEngine, SwapStats
 from faceswap.face_analyzer import FaceAnalyzer
-from faceswap.providers import format_providers, provider_status_text
+from faceswap.providers import format_providers, provider_status_text, tensorrt_missing_note
+from faceswap.quality import resolve_quality
 from faceswap.swapper import FaceSwapper
 from faceswap.utils import logger
 from faceswap.video import SwapCancelled, process_video, read_frame_at, reset_stats, swap_frame
-from videoswa.images import crop_face, side_by_side
-from videoswa.jobs import SwapRequest, build_mappings
+from videoswa.images import crop_face
+from videoswa.jobs import SwapRequest, build_mappings, read_image
 
 
 def _quality_note(stats: SwapStats) -> str:
@@ -65,7 +66,7 @@ class DetectedPerson:
 class EngineWorker(QThread):
     detect_ready = Signal(object)
     detect_failed = Signal(str)
-    preview_ready = Signal(object, str, bool)
+    preview_ready = Signal(object, object, str, bool)
     preview_failed = Signal(str)
     swap_progress = Signal(int, int)
     swap_finished = Signal(str, str)
@@ -163,7 +164,13 @@ class EngineWorker(QThread):
             return
         names = getattr(engine.swapper, "active_providers", None) or getattr(engine.swapper, "providers", [])
         text = provider_status_text(names)
+        mode = getattr(engine.swapper, "execution", "auto")
+        if mode in {"auto", "tensorrt"}:
+            text += tensorrt_missing_note(names)
         detail = format_providers(getattr(engine.swapper, "providers", []) or [])
+        occlusion = getattr(engine.swapper, "_occlusion", None)
+        if occlusion is not None and getattr(occlusion, "status", ""):
+            text = f"{text} {occlusion.status}"
         self.provider.emit(text)
         self.status.emit(f"Models ready. {text} ({detail})" if detail else f"Models ready. {text}")
 
@@ -179,16 +186,61 @@ class EngineWorker(QThread):
         self.detect_ready.emit(people)
         self.status.emit(f"Detected {len(people)} face(s).")
 
+    def _configure(self, engine: FaceSwapEngine, job: SwapRequest, *, preview: bool) -> None:
+        enhance, precise, object_mask = resolve_quality(
+            enhance=job.enhance,
+            precise_edges=job.precise_edges,
+            object_mask=job.object_mask,
+            fast_draft=job.fast_draft_preview,
+            preview=preview,
+        )
+        reset_stats(engine)
+        engine.similarity_threshold = job.similarity
+        engine.coverage = job.coverage
+        engine.min_face_px = int(job.min_face_px)
+        engine.detect_stride = 1 if preview else (2 if job.detect_every_other else 1)
+        engine.rotation.mode = job.rotation_mode
+        engine.rotation.seconds = float(job.rotation_seconds)
+        engine.rotation.sources = [] if job.rotation_mode == "per_person" else self._rotation_faces(engine, job)
+        swapper = engine.swapper
+        swapper.object_mask = object_mask
+        swapper.precise_edges = precise
+        swapper.allow_restore = enhance
+        if enhance and hasattr(swapper, "set_enhance"):
+            tip = swapper.set_enhance(True)
+            if tip:
+                self.status.emit(tip)
+
+    def _rotation_faces(self, engine: FaceSwapEngine, job: SwapRequest):
+        faces = []
+        paths = list(job.rotation_paths)
+        if job.single_source is not None:
+            paths.insert(0, Path(job.single_source))
+        paths.extend(item.source_path for item in job.face_sources)
+        seen: set[str] = set()
+        for path in paths:
+            key = str(Path(path))
+            if key in seen:
+                continue
+            seen.add(key)
+            image = read_image(Path(path))
+            face = engine.analyzer.best_face(image)
+            if face is None:
+                raise ValueError(f"No face found in rotation source '{Path(path).name}'.")
+            faces.append(face)
+        return faces
+
     def _preview(self, job: PreviewRequest) -> None:
         """Swap one sample frame and return it. Does not encode a video."""
-        engine = self._engine_for(job.swap.execution, job.swap.enhance)
-        engine.similarity_threshold = job.swap.similarity
-        engine.coverage = job.swap.coverage
-        reset_stats(engine)
+        draft = job.swap.fast_draft_preview
+        engine = self._engine_for(job.swap.execution, enhance=False if draft else job.swap.enhance)
+        self._configure(engine, job.swap, preview=True)
         self.status.emit("Swapping this frame…")
         mappings = build_mappings(engine, job.swap)
         frame = read_frame_at(Path(job.swap.video_path), job.timestamp_s)
-        swapped = swap_frame(engine, frame, mappings, scale=job.swap.scale)
+        swapped = swap_frame(
+            engine, frame, mappings, scale=job.swap.scale, time_s=job.timestamp_s
+        )
         unchanged = engine.stats.faces_swapped == 0
         if unchanged:
             note = (
@@ -196,14 +248,12 @@ class EngineWorker(QThread):
                 "Use a clearer sample, or lower the match threshold."
             )
         else:
-            note = "Preview ready. This is one frame only — Run swap writes the video."
-        self.preview_ready.emit(side_by_side(frame, swapped), note, unchanged)
+            note = "Preview ready. Drag Before / after to compare. Run swap writes the video."
+        self.preview_ready.emit(frame, swapped, note, unchanged)
 
     def _swap(self, job: SwapRequest) -> None:
         engine = self._engine_for(job.execution, job.enhance)
-        engine.similarity_threshold = job.similarity
-        engine.coverage = job.coverage
-        reset_stats(engine)
+        self._configure(engine, job, preview=False)
         self.status.emit("Building face mappings…")
         mappings = build_mappings(engine, job)
         self.status.emit(f"Swapping {len(mappings)} mapping(s)…")

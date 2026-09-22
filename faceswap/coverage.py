@@ -193,6 +193,9 @@ def paste_swapped_face(
     matrix: np.ndarray,
     kps: np.ndarray,
     coverage: str = DEFAULT_COVERAGE,
+    alpha: Optional[np.ndarray] = None,
+    previous_delta: Optional[np.ndarray] = None,
+    color_state: Optional[dict] = None,
 ) -> np.ndarray:
     """Blend ``swapped_bgr`` (the 128px InSwapper output) onto ``frame_bgr``.
 
@@ -202,7 +205,8 @@ def paste_swapped_face(
     if swapped_bgr is None or swapped_bgr.size == 0 or matrix is None:
         return frame_bgr
     matrix = orient_paste_matrix(matrix, kps, size=int(swapped_bgr.shape[0]))
-    alpha = coverage_alpha(frame_bgr.shape[:2], kps, mode)
+    if alpha is None:
+        alpha = coverage_alpha(frame_bgr.shape[:2], kps, mode)
     if float(alpha.max()) <= 0.0:
         return frame_bgr
 
@@ -233,13 +237,21 @@ def paste_swapped_face(
     weight = alpha[y0:y1, x0:x1, None]
     warped_f = warped.astype(np.float32)
     if mode == COVERAGE_FULL:
-        warped_f = match_edge_color(warped_f, roi, weight)
+        warped_f = match_edge_color(
+            warped_f, roi, weight, previous=previous_delta, state=color_state
+        )
     blended = warped_f * weight + roi * (1.0 - weight)
     out[y0:y1, x0:x1] = np.clip(blended, 0, 255).astype(np.uint8)
     return out
 
 
-def match_edge_color(warped: np.ndarray, roi: np.ndarray, weight: np.ndarray) -> np.ndarray:
+def match_edge_color(
+    warped: np.ndarray,
+    roi: np.ndarray,
+    weight: np.ndarray,
+    previous: Optional[np.ndarray] = None,
+    state: Optional[dict] = None,
+) -> np.ndarray:
     """Move the soft rim of the swap toward the original frame color.
 
     The interior (alpha near 1) keeps the swapped color. Only the feather
@@ -250,6 +262,12 @@ def match_edge_color(warped: np.ndarray, roi: np.ndarray, weight: np.ndarray) ->
     if int(np.count_nonzero(rim)) < 16:
         return warped
     delta = roi[rim].mean(axis=0) - warped[rim].mean(axis=0)
+    if previous is not None:
+        from .quality import smooth_delta
+
+        delta = smooth_delta(previous, delta)
+    if state is not None:
+        state["delta"] = np.asarray(delta, dtype=np.float32).copy()
     # A strong shift paints the original skin back onto the rim and the swap
     # reads as the source clip. Keep only a light edge correction.
     strength = np.clip((1.0 - alpha) * 0.35, 0.0, 1.0).astype(np.float32)[..., None]

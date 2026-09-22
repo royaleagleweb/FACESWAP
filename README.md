@@ -28,11 +28,27 @@ there for scripts (`python run.py swap ...`).
    instead. **Apply this source to every face** uses the same source for
    everyone. Switch to **Multiple faces** to pick a source on each thumbnail
    and leave a person empty to keep their face.
-4. Click **Preview swap on this frame** to swap only the sample frame. The
-   preview shows the original and the swapped frame side by side. Nothing is
-   written. Click **Run swap** to export the MP4. A progress bar tracks
-   frames. **Cancel** stops between frames and does not leave an output file
-   behind.
+4. Click **Preview swap on this frame** to swap only the sample frame. Drag
+   **Before / after** to wipe between the original and the swapped frame
+   (0 is the original, 100 is the swap). Nothing is written. Click **Run swap**
+   to export the MP4. A progress bar tracks frames. **Cancel** stops between
+   frames and does not leave an output file behind.
+
+**Object mask (XSeg)** is on for every normal swap, including preview. It
+keeps a lollipop, food, or a hand that covers the face, and it is warped into
+the face polygon only. The built-in color mask always runs. If you place
+`models/xseg.onnx` next to InSwapper, that network is an extra pass on the
+same TensorRT → CUDA → DirectML → CPU chain. Videoswa does not download it.
+**Precise edges (BiSeNet)** stays off unless you turn it on and add
+`models/bisenet.onnx`. **Fast draft in preview** skips GFPGAN and BiSeNet and
+leaves the object mask on. **⚡ Fast draft** sets that same combination.
+**Detect every 2nd frame** is on for a full export and off for the one-frame
+preview. **Min face size** defaults to 0 so small faces still swap; raise it
+(64 is a reasonable crowd cutoff) to ignore background faces.
+
+**Source rotation** can stay on a different face per person, switch when the
+on-screen face changes, or switch every N seconds. **Save project** writes a
+`.videoswaproj` file with the settings, source paths, and ♂/♀ tags.
 
 The window is PySide6. There is no web UI.
 
@@ -185,9 +201,17 @@ after you change ONNX Runtime, TensorRT, or the FP16 switch so engines are
 built again.
 
 If `TensorrtExecutionProvider` is missing, Videoswa still runs: it retries
-with CUDA, then CPU, and the log says which one came up. The usual cause is
-`nvinfer_10.dll` not on PATH, or a TensorRT build that does not match the
-ONNX Runtime wheel.
+with CUDA, then DirectML on Windows, then CPU, and the log says which one
+came up. The usual cause is `nvinfer_10.dll` not on PATH, or a TensorRT build
+that does not match the ONNX Runtime wheel. A machine with only DirectML is
+unchanged: Auto and the TensorRT choice both land on DirectML, then CPU.
+The banner says **TensorRT is not active** and names `nvinfer_10.dll` when
+the session did not stay on TensorRT.
+
+InSwapper and the optional mask models (`models/xseg.onnx`,
+`models/bisenet.onnx`) share that provider order. GFPGAN does not. It is a
+PyTorch network (`GFPGANv1.4.pth`), so TensorRT never runs it. On Linux the
+matching library is `libnvinfer.so.10` on `LD_LIBRARY_PATH`.
 
 Auto mode still requests TensorRT, then CUDA, then CPU. A CUDA session can
 start and then die inside a convolution (`CUDNN_FE` / `GRAPH_EXECUTION_FAILED`
@@ -261,12 +285,18 @@ python run.py swap -t party.mp4 --pair alice.jpg=ref_alice.jpg --pair bob.jpg=re
 | Flag | Meaning |
 | --- | --- |
 | `--execution auto` | TensorRT, then CUDA, then DirectML, then CPU on Windows |
-| `--execution cuda` | CUDA, then CPU. Skips TensorRT |
+| `--execution tensorrt` | Prefer TensorRT. Falls through to CUDA, DirectML, then CPU |
+| `--execution cuda` | CUDA, then DirectML on Windows, then CPU. Skips TensorRT |
+| `--execution directml` | DirectML, then CPU |
 | `--cpu` | CPU only |
 | `--coverage full` | Jaw and beard replacement (default) |
 | `--coverage normal` | Tight inner-face oval |
 | `--similarity 0.32` | First-lock cosine threshold. A tracked face is kept below this |
-| `--enhance` | GFPGAN on each swapped face, if that extra is installed |
+| `--enhance` | GFPGAN on faces at least 96px across, if that extra is installed |
+| `--no-object-mask` | Turn off the built-in object mask (on by default) |
+| `--precise-edges` | BiSeNet when `models/bisenet.onnx` is present |
+| `--every-frame` | Detect every frame. The default detects every second frame |
+| `--min-face 0` | Skip detections smaller than this many pixels |
 | `--no-audio` | Drop the original audio track |
 | `--crf 18 --preset medium` | x264 quality and speed |
 
@@ -304,7 +334,11 @@ frame, including when the head turns a little.
   embedding is still that person, so a brief pose change does not flicker
   back to the original clip. A different person in that box is not swapped.
 - **Sharpen swapped faces (GFPGAN)** stays off. Turn it on when the result
-  looks soft.
+  looks soft. Faces smaller than 96px are left unrestored.
+- **Object mask** stays on. It punches out a lollipop or food that does not
+  match the face color, and it leaves a wide beard under the mouth in place.
+  Gender is locked from the first five detections of each person, so one
+  wrong frame does not flip the ♂/♀ tag.
 
 ## Single face and multiple faces
 
@@ -369,13 +403,14 @@ pip install pytest
 pytest
 ```
 
-The suite covers the TensorRT → CUDA → CPU provider order, Windows DirectML
-before CPU, CUDA conv failures falling back to CPU, the 5-minute
+The suite covers the TensorRT → CUDA → DirectML → CPU provider order,
+Windows DirectML when `nvinfer` is missing, CUDA conv failures falling back
+to CPU, the object mask (`_occ_mask`) on a normal swap, the 5-minute
 rejection (no frames swapped), cancel, gender labels, single-face versus
 per-face mapping, multi-face matching, and that the desktop window opens on
-Single face with full beard coverage. It does not download the swap models
-and it does not require an NVIDIA GPU. TensorRT execution itself needs the
-Windows stack above.
+Single face with full beard coverage and the object mask on. It does not
+download the swap models and it does not require an NVIDIA GPU. TensorRT
+execution itself needs the Windows stack above.
 
 ## Layout
 

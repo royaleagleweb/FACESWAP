@@ -11,7 +11,7 @@ import numpy as np
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from faceswap.face_analyzer import Face
-from videoswa.images import side_by_side
+from videoswa.images import side_by_side, wipe_preview
 from videoswa.jobs import FACE_MODE_MULTIPLE, SwapRequest
 from videoswa.worker import EngineWorker, PreviewRequest
 
@@ -43,6 +43,15 @@ def test_side_by_side_keeps_both_frames() -> None:
     assert int(original[0, 0, 0]) == 0
     assert stacked[10, 5, 0] < 40
     assert stacked[10, -5, 0] > 200
+
+
+def test_wipe_shows_swap_on_the_left_and_original_on_the_right() -> None:
+    original = np.zeros((20, 40, 3), dtype=np.uint8)
+    swapped = np.full((20, 40, 3), 200, dtype=np.uint8)
+    wiped = wipe_preview(original, swapped, 0.5)
+    assert wiped[10, 4, 0] == 200
+    assert wiped[10, 36, 0] == 0
+    assert int(wiped[10, 20, 0]) == 255
 
 
 def test_preview_job_does_not_start_an_export() -> None:
