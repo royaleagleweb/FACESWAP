@@ -18,21 +18,35 @@ python -m videoswa
 `python run.py` opens the same window. The command-line swap tool is still
 there for scripts (`python run.py swap ...`).
 
-1. Choose a target video. Anything longer than **5 minutes** is rejected
-   immediately, with an explanation, and nothing is processed.
-2. Drag the sample-frame slider to a moment where the face is visible, then
-   click **Detect faces**. Each thumbnail is labeled from InsightFace
-   gender/age, for example **Face 1 — Male** or **Face 2 — Female**.
-3. **Swap mode** opens on **Single face**. Choose one source image. The
-   largest face is selected; click another thumbnail to replace that person
-   instead. **Apply this source to every face** uses the same source for
-   everyone. Switch to **Multiple faces** to pick a source on each thumbnail
-   and leave a person empty to keep their face.
-4. Click **Preview swap on this frame** to swap only the sample frame. Drag
-   **Before / after** to wipe between the original and the swapped frame
-   (0 is the original, 100 is the swap). Nothing is written. Click **Run swap**
-   to export the MP4. A progress bar tracks frames. **Cancel** stops between
-   frames and does not leave an output file behind.
+A new clip, in order:
+
+1. **Add face(s)**. JPG, PNG, and HEIC work. A photo with no face is rejected
+   and the window tells you to pick a clearer one.
+2. **Open target video**. Anything longer than **5 minutes** is rejected
+   immediately. Videoswa detects faces on that frame and, if the frame is
+   empty, samples nearby times and parks the slider on the first face it finds.
+3. The face list fills in on its own (or click **Detect faces**). Side and
+   profile faces stay in the list. Thumbnails are labeled **Face 1 — Male**
+   or **Face 2 — Female**.
+4. **Preview frame**. The sample must show an obvious identity change. If
+   nothing moved inside the face, a dialog tells you to move the slider, pick
+   a clearer photo, or lower **Min face size**. Drag **Before / after** to
+   wipe (0 is the original, 100 is the swap). **Play swapped** walks the clip.
+5. **Swap**. The MP4 keeps the original audio when **Keep audio** is on.
+   **Cancel** stops between frames and does not leave an output file behind.
+   If the export never swapped a face, the finished dialog says so and names
+   the next step.
+
+**Swap every detected face with one source** uses one photo for everyone.
+**Per-face mapping** picks a source on each thumbnail. **Match gender** is on,
+so a male source does not replace a known female face. **Set gender** overrides
+a source. **Add multi-photo identity** averages extra photos of the same person.
+
+If the GPU detector (DirectML or TensorRT) returns no faces, detection retries
+on CPU and stays there for the rest of the session. Face detection requires
+`opencv-python==4.10.0.84`. OpenCV 4.11 and 5.x, which GFPGAN used to pull in,
+make InsightFace return zero faces. Do not install `opencv-python-headless`
+next to it.
 
 **Object mask (XSeg)** is on for every normal swap, including preview. It
 keeps a lollipop, food, or a hand that covers the face, and it is warped into
@@ -176,6 +190,10 @@ pip install -r requirements-windows-gpu.txt
 
 `onnxruntime` (CPU) and `onnxruntime-gpu` cannot be installed together. The
 second file replaces the CPU wheel with `onnxruntime-gpu==1.22.0`.
+`requirements.txt` pins `opencv-python==4.10.0.84`. If a later
+`pip install -r requirements-enhance.txt` upgrades OpenCV, install the pin
+again. Detection on DirectML falls back to CPU when the GPU session returns
+no faces.
 
 Optional face sharpening (not required to run the app):
 

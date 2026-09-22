@@ -215,6 +215,7 @@ def paste_swapped_face(
     previous_delta: Optional[np.ndarray] = None,
     color_state: Optional[dict] = None,
     yaw: float = 0.0,
+    color_match: Optional[float] = None,
 ) -> np.ndarray:
     """Blend ``swapped_bgr`` (the 128px InSwapper output) onto ``frame_bgr``.
 
@@ -257,7 +258,12 @@ def paste_swapped_face(
     warped_f = warped.astype(np.float32)
     if mode == COVERAGE_FULL:
         warped_f = match_edge_color(
-            warped_f, roi, weight, previous=previous_delta, state=color_state
+            warped_f,
+            roi,
+            weight,
+            previous=previous_delta,
+            state=color_state,
+            color_match=color_match,
         )
     blended = warped_f * weight + roi * (1.0 - weight)
     out[y0:y1, x0:x1] = np.clip(blended, 0, 255).astype(np.uint8)
@@ -270,6 +276,7 @@ def match_edge_color(
     weight: np.ndarray,
     previous: Optional[np.ndarray] = None,
     state: Optional[dict] = None,
+    color_match: Optional[float] = None,
 ) -> np.ndarray:
     """Move the soft rim of the swap toward the original frame color.
 
@@ -289,7 +296,9 @@ def match_edge_color(
         state["delta"] = np.asarray(delta, dtype=np.float32).copy()
     # A strong shift paints the original skin back onto the rim and the swap
     # reads as the source clip. Keep only a light edge correction.
-    strength = np.clip((1.0 - alpha) * 0.35, 0.0, 1.0).astype(np.float32)[..., None]
+    # color_match 0.60 is the historical 0.35 rim. 0 turns the correction off.
+    gain = 0.35 if color_match is None else 0.35 * (float(color_match) / 0.60)
+    strength = np.clip((1.0 - alpha) * gain, 0.0, 1.0).astype(np.float32)[..., None]
     shifted = warped.astype(np.float32) + delta.astype(np.float32) * strength
     return np.clip(shifted, 0.0, 255.0)
 

@@ -109,6 +109,13 @@ def test_window_loads_short_video(tmp_path: Path) -> None:
         assert window.assignment.text()
         assert window.output_edit.text().endswith("_videoswa.mp4")
         assert window.time_slider.isEnabled()
+        assert window.match_gender.isChecked() is True
+        assert window.beard.isChecked() is True
+        assert window.encoder.currentData() == "auto"
+        assert window.keep_audio.isChecked() is True
+        assert window.detector_size.value() == 640
+        assert window.run_btn.text() == "Swap"
+        assert window.object_mask.text().lower().startswith("ai face mask")
         app.processEvents()
     finally:
         window.close()

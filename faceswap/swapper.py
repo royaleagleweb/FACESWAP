@@ -199,19 +199,31 @@ class FaceSwapper:
             alpha=alpha,
             previous_delta=previous,
             color_state=color_state,
+            color_match=getattr(self, "color_match", None),
         )
         if self._color_key is not None and "delta" in color_state:
             self.color_memory[self._color_key] = color_state["delta"]
+        amount = float(getattr(self, "sharpen", 0.0) or 0.0)
+        if amount > 0.0:
+            out = _sharpen_roi(out, target_face.bbox, amount)
         if (
             self._enhancer is not None
             and self.allow_restore
             and face_span_px(target_face.bbox) >= RESTORE_MIN_PX
         ):
-            out = _enhance_face_region(
+            enhanced = _enhance_face_region(
                 out,
                 _enhance_bbox(target_face.bbox, coverage),
                 self._enhancer,
             )
+            strength = float(getattr(self, "restore_strength", 1.0))
+            strength = max(0.0, min(1.0, strength))
+            if strength >= 0.999:
+                out = enhanced
+            else:
+                import cv2
+
+                out = cv2.addWeighted(enhanced, strength, out, 1.0 - strength, 0.0)
         return out
 
 
@@ -266,6 +278,24 @@ def _ensure_gfpgan_weights() -> Path:
     from .utils import ensure_gfpgan
 
     return ensure_gfpgan()
+
+
+def _sharpen_roi(frame: np.ndarray, bbox: np.ndarray, amount: float) -> np.ndarray:
+    """Light unsharp mask on the face box. ``amount`` 0.12 is the Balanced default."""
+    import cv2
+
+    height, width = frame.shape[:2]
+    x1, y1, x2, y2 = [int(round(float(v))) for v in np.asarray(bbox).reshape(-1)[:4]]
+    x1, y1 = max(0, x1), max(0, y1)
+    x2, y2 = min(width, x2), min(height, y2)
+    if x2 - x1 < 4 or y2 - y1 < 4:
+        return frame
+    roi = frame[y1:y2, x1:x2]
+    blur = cv2.GaussianBlur(roi, (0, 0), 1.2)
+    sharp = cv2.addWeighted(roi, 1.0 + amount, blur, -amount, 0)
+    out = frame.copy()
+    out[y1:y2, x1:x2] = sharp
+    return out
 
 
 def _enhance_bbox(bbox: np.ndarray, coverage: str) -> np.ndarray:

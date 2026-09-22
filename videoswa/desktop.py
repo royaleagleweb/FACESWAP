@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QListWidget,
     QMainWindow,
     QMessageBox,
     QPlainTextEdit,
@@ -33,7 +34,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from faceswap.face_analyzer import face_label
+from faceswap.face_analyzer import face_label, opencv_detection_warning, sensitivity_to_thresh
 from faceswap.pose import face_yaw, pose_name
 from faceswap.utils import optional_model_report
 from faceswap.swapper import gfpgan_install_tip
@@ -50,10 +51,10 @@ from faceswap.video import (
 from videoswa.images import bgr_to_qpixmap, wipe_preview
 from videoswa.jobs import FACE_MODE_MULTIPLE, FACE_MODE_SINGLE, FaceSource, SwapRequest, validate_request
 from videoswa.project import PROJECT_SUFFIX, gender_mark, load_project, save_project
-from videoswa.worker import DetectRequest, DetectedPerson, EngineWorker, PreviewRequest
+from videoswa.worker import DetectRequest, DetectedPerson, EngineWorker, PreviewRequest, SourceCheckRequest
 
 _VIDEO_FILTER = "Videos (*.mp4 *.mov *.avi *.mkv *.webm *.m4v)"
-_IMAGE_FILTER = "Images (*.png *.jpg *.jpeg *.webp *.bmp)"
+_IMAGE_FILTER = "Images (*.png *.jpg *.jpeg *.webp *.bmp *.heic *.heif)"
 _PRESETS = [
     "ultrafast", "superfast", "veryfast", "faster", "fast",
     "medium", "slow", "slower", "veryslow",
@@ -193,10 +194,17 @@ class MainWindow(QMainWindow):
         self._preview_original = None
         self._preview_swapped = None
         self._rotation_paths: list[Path] = []
+        self._parking = False
+        self._slider_live = False
+        self._playing = False
+        self._source_order: list[Path] = []
+        self._source_genders: dict[str, int] = {}
+        self._identity_paths: dict[str, list[Path]] = {}
 
         self.worker = EngineWorker()
         self.worker.detect_ready.connect(self._on_detected)
         self.worker.detect_failed.connect(self._on_detect_failed)
+        self.worker.source_ready.connect(self._on_source_ready)
         self.worker.preview_ready.connect(self._on_preview_ready)
         self.worker.preview_failed.connect(self._on_preview_failed)
         self.worker.swap_progress.connect(self._on_progress)
@@ -212,6 +220,11 @@ class MainWindow(QMainWindow):
         self._preview_timer = QTimer(self)
         self._preview_timer.setSingleShot(True)
         self._preview_timer.timeout.connect(self._refresh_preview)
+        self._redetect_timer = QTimer(self)
+        self._redetect_timer.setSingleShot(True)
+        self._redetect_timer.timeout.connect(self._detect_after_slide)
+        self._play_timer = QTimer(self)
+        self._play_timer.timeout.connect(self._play_tick)
 
         self._build()
         self._apply_style()
@@ -220,41 +233,150 @@ class MainWindow(QMainWindow):
         self.worker.start()
         if not shutil.which("ffmpeg"):
             self._set_status("FFmpeg was not found. Audio cannot be copied into the MP4 until it is installed.")
+        opencv_note = opencv_detection_warning()
+        if opencv_note:
+            self._set_status(opencv_note)
 
     def _build(self) -> None:
         root = QWidget()
         self.setCentralWidget(root)
         outer = QHBoxLayout(root)
-        outer.setContentsMargins(16, 16, 16, 16)
-        outer.setSpacing(16)
+        outer.setContentsMargins(12, 12, 12, 12)
+        outer.setSpacing(12)
 
-        left = QVBoxLayout()
-        left.setSpacing(8)
-        left.setContentsMargins(0, 0, 8, 0)
+        outer.addWidget(self._build_source_column())
+        outer.addLayout(self._build_preview_column(), stretch=1)
+        outer.addWidget(self._build_quality_column())
+
+    def _scroll(self, widget: QWidget, width: int) -> QScrollArea:
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setWidget(widget)
+        scroll.setFixedWidth(width)
+        scroll.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
+        return scroll
+
+    def _build_source_column(self) -> QScrollArea:
+        column = QVBoxLayout()
+        column.setSpacing(8)
         title = QLabel("Videoswa")
         title.setObjectName("Title")
-        subtitle = QLabel("Swap a face in a video, then write an MP4.")
+        subtitle = QLabel("Add a source face, open a video, then Swap.")
         subtitle.setWordWrap(True)
         subtitle.setObjectName("Muted")
-        left.addWidget(title)
-        left.addWidget(subtitle)
+        column.addWidget(title)
+        column.addWidget(subtitle)
 
-        target_box = QFrame()
-        target_box.setObjectName("Panel")
-        target_layout = QVBoxLayout(target_box)
-        target_layout.addWidget(QLabel("Target video"))
+        box = QFrame()
+        box.setObjectName("Panel")
+        form = QVBoxLayout(box)
+        form.addWidget(QLabel("Source faces"))
+        self.source_list = QListWidget()
+        self.source_list.setMinimumHeight(140)
+        self.source_list.currentRowChanged.connect(lambda _row: self._on_source_row())
+        form.addWidget(self.source_list)
+        add_row = QHBoxLayout()
+        self.single_btn = QPushButton("Add face(s)")
+        self.single_btn.clicked.connect(self._pick_single_source)
+        remove_btn = QPushButton("Remove")
+        remove_btn.clicked.connect(self._remove_source)
+        add_row.addWidget(self.single_btn)
+        add_row.addWidget(remove_btn)
+        form.addLayout(add_row)
+        identity_btn = QPushButton("+ Add multi-photo identity")
+        identity_btn.clicked.connect(self._add_identity_photos)
+        form.addWidget(identity_btn)
+        gender_row = QHBoxLayout()
+        male_btn = QPushButton("Set gender Male")
+        female_btn = QPushButton("Set gender Female")
+        male_btn.clicked.connect(lambda: self._set_source_gender(1))
+        female_btn.clicked.connect(lambda: self._set_source_gender(0))
+        gender_row.addWidget(male_btn)
+        gender_row.addWidget(female_btn)
+        form.addLayout(gender_row)
+        self.single_label = QLabel("No source image")
+        self.single_label.setWordWrap(True)
+        self.single_label.setObjectName("Muted")
+        form.addWidget(self.single_label)
+        column.addWidget(box)
+
+        rotate = QFrame()
+        rotate.setObjectName("Panel")
+        rot = QVBoxLayout(rotate)
+        rot.addWidget(QLabel("Rotate sources over time"))
+        self.rotation_enabled = QCheckBox("Enable source rotation")
+        self.rotation_enabled.setChecked(False)
+        rot.addWidget(self.rotation_enabled)
+        rot.addWidget(QLabel("Switch source"))
+        self.rotation = QComboBox()
+        self.rotation.addItem("A different face per person", "per_person")
+        self.rotation.addItem("When the face changes", "scene")
+        self.rotation.addItem("Every N seconds", "interval")
+        rot.addWidget(self.rotation)
+        sec_row = QHBoxLayout()
+        sec_row.addWidget(QLabel("Seconds per person"))
+        self.rotation_seconds = QSpinBox()
+        self.rotation_seconds.setRange(1, 120)
+        self.rotation_seconds.setValue(10)
+        sec_row.addWidget(self.rotation_seconds)
+        rot.addLayout(sec_row)
+        self.add_rotation_btn = QPushButton("Add rotation source…")
+        self.add_rotation_btn.clicked.connect(self._add_rotation_source)
+        rot.addWidget(self.add_rotation_btn)
+        self.rotation_label = QLabel("Rotation uses the source images you add here.")
+        self.rotation_label.setWordWrap(True)
+        self.rotation_label.setObjectName("Muted")
+        rot.addWidget(self.rotation_label)
+        self.match_gender = QCheckBox("Match gender  ♂/♀ never mix")
+        self.match_gender.setChecked(True)
+        self.match_gender.setToolTip(
+            "A male source only replaces a male face, and the same for female. "
+            "Unknown gender still matches anyone."
+        )
+        rot.addWidget(self.match_gender)
+        column.addWidget(rotate)
+
+        project = QFrame()
+        project.setObjectName("Panel")
+        project_layout = QVBoxLayout(project)
+        project_row = QHBoxLayout()
+        save_project_btn = QPushButton("Save project")
+        load_project_btn = QPushButton("Load project")
+        save_project_btn.clicked.connect(self._save_project)
+        load_project_btn.clicked.connect(self._load_project)
+        project_row.addWidget(save_project_btn)
+        project_row.addWidget(load_project_btn)
+        project_layout.addLayout(project_row)
+        self.assignment = QLabel("Side and profile faces are listed with the others when they are detected.")
+        self.assignment.setWordWrap(True)
+        self.assignment.setObjectName("Muted")
+        project_layout.addWidget(self.assignment)
+        column.addWidget(project)
+        column.addStretch(1)
+
+        wrap = QWidget()
+        wrap.setLayout(column)
+        return self._scroll(wrap, 320)
+
+    def _build_preview_column(self) -> QVBoxLayout:
+        column = QVBoxLayout()
+        column.setSpacing(8)
+        target = QFrame()
+        target.setObjectName("Panel")
+        target_layout = QVBoxLayout(target)
         browse_row = QHBoxLayout()
+        browse = QPushButton("Open target video")
+        browse.clicked.connect(self._pick_video)
         self.video_label = QLabel("No video selected")
         self.video_label.setWordWrap(True)
         self.video_label.setObjectName("Muted")
-        browse = QPushButton("Browse…")
-        browse.clicked.connect(self._pick_video)
-        browse_row.addWidget(self.video_label, stretch=1)
         browse_row.addWidget(browse)
+        browse_row.addWidget(self.video_label, stretch=1)
         target_layout.addLayout(browse_row)
         self.duration_label = QLabel("Duration: —")
         target_layout.addWidget(self.duration_label)
-
         self.time_label = QLabel("Sample frame  0:00")
         target_layout.addWidget(self.time_label)
         self.time_slider = QSlider(Qt.Orientation.Horizontal)
@@ -262,19 +384,194 @@ class MainWindow(QMainWindow):
         self.time_slider.setEnabled(False)
         self.time_slider.valueChanged.connect(self._on_slider)
         target_layout.addWidget(self.time_slider)
-        self.preview_btn = QPushButton("Preview swap on this frame")
-        self.preview_btn.setEnabled(False)
-        self.preview_btn.setToolTip(
-            "Swap only the sample frame. Drag Before / after to wipe between "
-            "the original and the swapped frame. Does not write the video."
-        )
-        self.preview_btn.clicked.connect(self._preview_swap)
-        target_layout.addWidget(self.preview_btn)
-        left.addWidget(target_box)
+        column.addWidget(target)
 
-        options = QFrame()
-        options.setObjectName("Panel")
-        form = QVBoxLayout(options)
+        self.preview = QLabel("Open a target to begin")
+        self.preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.preview.setMinimumHeight(280)
+        self.preview.setObjectName("Preview")
+        column.addWidget(self.preview, stretch=1)
+
+        actions = QHBoxLayout()
+        self.preview_btn = QPushButton("Preview frame")
+        self.preview_btn.setEnabled(False)
+        self.preview_btn.setToolTip("Swap the sample frame. Before / after wipes the original and the swap.")
+        self.preview_btn.clicked.connect(self._preview_swap)
+        self.play_btn = QPushButton("Play swapped")
+        self.play_btn.clicked.connect(self._toggle_play)
+        self.compare_btn = QPushButton("Compare")
+        self.compare_btn.clicked.connect(self._toggle_compare)
+        actions.addWidget(self.preview_btn)
+        actions.addWidget(self.play_btn)
+        actions.addWidget(self.compare_btn)
+        column.addLayout(actions)
+
+        flags = QHBoxLayout()
+        self.fast_playback = QCheckBox("Fast playback ½ res")
+        self.fast_playback.setChecked(False)
+        self.fast_playback.toggled.connect(self._on_fast_playback)
+        self.fast_draft = QCheckBox("Fast draft in preview")
+        self.fast_draft.setChecked(True)
+        self.fast_draft.setToolTip(
+            "Preview and playback skip GFPGAN and BiSeNet. Object mask stays on. Swap uses the quality panel."
+        )
+        self.loop = QCheckBox("Loop")
+        self.loop.setChecked(True)
+        flags.addWidget(self.fast_playback)
+        flags.addWidget(self.fast_draft)
+        flags.addWidget(self.loop)
+        column.addLayout(flags)
+
+        column.addWidget(QLabel("Before / after"))
+        self.compare_slider = QSlider(Qt.Orientation.Horizontal)
+        self.compare_slider.setRange(0, 100)
+        self.compare_slider.setValue(50)
+        self.compare_slider.setEnabled(False)
+        self.compare_slider.setToolTip("Drag to wipe between the swapped frame and the original.")
+        self.compare_slider.valueChanged.connect(self._on_compare)
+        column.addWidget(self.compare_slider)
+
+        self.face_host = QWidget()
+        self.face_layout = QVBoxLayout(self.face_host)
+        self.face_layout.setContentsMargins(0, 0, 0, 0)
+        self.face_layout.addStretch(1)
+        faces = QScrollArea()
+        faces.setWidgetResizable(True)
+        faces.setWidget(self.face_host)
+        faces.setMinimumHeight(140)
+        column.addWidget(faces)
+
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
+        self.progress.setFormat("Idle")
+        column.addWidget(self.progress)
+        self.status = QLabel("Ready.")
+        self.status.setWordWrap(True)
+        column.addWidget(self.status)
+        column.addWidget(QLabel("Log"))
+        self.log = QPlainTextEdit()
+        self.log.setReadOnly(True)
+        self.log.setMaximumBlockCount(400)
+        self.log.setFixedHeight(110)
+        column.addWidget(self.log)
+        return column
+
+    def _build_quality_column(self) -> QScrollArea:
+        column = QVBoxLayout()
+        column.setSpacing(8)
+        box = QFrame()
+        box.setObjectName("Panel")
+        form = QVBoxLayout(box)
+
+        self.apply_all = QCheckBox("Swap every detected face with one source")
+        self.apply_all.setChecked(False)
+        self.apply_all.toggled.connect(self._on_apply_all)
+        form.addWidget(self.apply_all)
+        form.addWidget(QLabel("Per-face mapping"))
+        self.face_mode = QComboBox()
+        self.face_mode.addItem("Single face", FACE_MODE_SINGLE)
+        self.face_mode.addItem("Per-face mapping", FACE_MODE_MULTIPLE)
+        self.face_mode.currentIndexChanged.connect(self._on_mode_changed)
+        form.addWidget(self.face_mode)
+        self.mode_hint = QLabel("One source image replaces the selected face.")
+        self.mode_hint.setWordWrap(True)
+        self.mode_hint.setObjectName("Muted")
+        form.addWidget(self.mode_hint)
+
+        form.addWidget(QLabel("Quality preset"))
+        self.quality_preset = QComboBox()
+        self.quality_preset.addItem("Balanced", "balanced")
+        self.quality_preset.addItem("Fast draft", "fast")
+        self.quality_preset.addItem("Quality", "quality")
+        self.quality_preset.currentIndexChanged.connect(self._on_quality_preset)
+        form.addWidget(self.quality_preset)
+
+        self.enhance = QCheckBox("Restore faces (GFPGAN)")
+        self.enhance.setChecked(gfpgan_install_tip() is None)
+        install_tip = gfpgan_install_tip()
+        self.enhance.setToolTip(
+            install_tip
+            or "Optional. Faces under 96px are skipped. The first enhanced swap downloads GFPGANv1.4.pth."
+        )
+        self.enhance.toggled.connect(self._on_enhance_toggled)
+        form.addWidget(self.enhance)
+        form.addWidget(self._percent_row("Restore", "restore_slider", 65))
+        form.addWidget(self._percent_row("Sharpen", "sharpen_slider", 12))
+        form.addWidget(self._percent_row("Color match", "color_slider", 60))
+
+        self.object_mask = QCheckBox("AI face mask + object preservation")
+        self.object_mask.setChecked(True)
+        self.object_mask.setToolTip(
+            "On for every normal swap. Keeps lollipops, food, and hands. "
+            "XSeg downloads into models/xseg.onnx on the first swap."
+        )
+        self.precise_edges = QCheckBox("Precise edges (BiSeNet)")
+        self.precise_edges.setChecked(False)
+        self.beard = QCheckBox("Male has a beard (extend to jaw)")
+        self.beard.setChecked(True)
+        self.beard.toggled.connect(self._on_beard)
+        form.addWidget(self.object_mask)
+        form.addWidget(self.precise_edges)
+        form.addWidget(self.beard)
+
+        form.addWidget(QLabel("Face coverage"))
+        self.coverage = QComboBox()
+        self.coverage.addItem("Full, including beard", "full")
+        self.coverage.addItem("Normal (tight face)", "normal")
+        self.coverage.setToolTip("Full replaces the jaw, cheeks, and beard.")
+        self.coverage.currentIndexChanged.connect(self._sync_beard_from_coverage)
+        form.addWidget(self.coverage)
+
+        sim_row = QHBoxLayout()
+        sim_row.addWidget(QLabel("Match threshold"))
+        self.similarity = QSpinBox()
+        self.similarity.setRange(10, 90)
+        self.similarity.setValue(32)
+        self.similarity.setSuffix(" %")
+        self.similarity.setToolTip(
+            "Forgiving first lock. Profile faces use a lower bar. Raise this if the wrong person is swapped."
+        )
+        sim_row.addWidget(self.similarity)
+        form.addLayout(sim_row)
+
+        self.keep_audio = QCheckBox("Keep audio")
+        self.keep_audio.setChecked(True)
+        form.addWidget(self.keep_audio)
+        form.addWidget(QLabel("Video quality"))
+        self.video_quality = QComboBox()
+        self.video_quality.addItem("High", 18)
+        self.video_quality.addItem("Medium", 23)
+        self.video_quality.addItem("Low", 28)
+        self.video_quality.currentIndexChanged.connect(self._on_video_quality)
+        form.addWidget(self.video_quality)
+        crf_row = QHBoxLayout()
+        crf_row.addWidget(QLabel("CRF"))
+        self.crf = QSpinBox()
+        self.crf.setRange(0, 32)
+        self.crf.setValue(18)
+        crf_row.addWidget(self.crf)
+        form.addLayout(crf_row)
+        form.addWidget(QLabel("Encoder"))
+        self.encoder = QComboBox()
+        self.encoder.addItem("Auto (GPU NVENC)", "auto")
+        self.encoder.addItem("NVENC", "h264_nvenc")
+        self.encoder.addItem("libx264", "libx264")
+        form.addWidget(self.encoder)
+        self.preset = QComboBox()
+        self.preset.addItems(_PRESETS)
+        self.preset.setCurrentText("medium")
+        form.addWidget(QLabel("Encode preset"))
+        form.addWidget(self.preset)
+
+        self.use_gpu = QCheckBox("Use GPU (TensorRT / CUDA / DirectML)")
+        self.use_gpu.setChecked(True)
+        self.use_gpu.setToolTip(
+            "Auto tries TensorRT, then CUDA, then DirectML, then CPU. "
+            "A Windows PC without TensorRT stays on DirectML. Uncheck to force CPU."
+        )
+        self.use_gpu.toggled.connect(self._on_use_gpu)
+        form.addWidget(self.use_gpu)
         form.addWidget(QLabel("Execution"))
         self.execution = QComboBox()
         if sys.platform.startswith("win"):
@@ -293,147 +590,49 @@ class MainWindow(QMainWindow):
         self.provider_banner.setObjectName("ProviderBanner")
         form.addWidget(self.provider_banner)
 
-        sim_row = QHBoxLayout()
-        sim_row.addWidget(QLabel("Match threshold"))
-        self.similarity = QSpinBox()
-        self.similarity.setRange(10, 90)
-        self.similarity.setValue(32)
-        self.similarity.setSuffix(" %")
-        self.similarity.setToolTip(
-            "Similarity required to lock a person the first time. After that, "
-            "Videoswa keeps the same source while the face stays in place. "
-            "Raise this if the wrong person is swapped."
-        )
-        sim_row.addWidget(self.similarity)
-        form.addLayout(sim_row)
-        tips = QLabel(
-            "Quality tips: use a sharp frontal source photo, sample a frame where "
-            "the face is clear, and leave coverage on Full. Raise the match "
-            "threshold only if the wrong person is swapped. If the result looks "
-            "soft, enable GFPGAN below — it stays off until you turn it on."
-        )
-        tips.setWordWrap(True)
-        tips.setObjectName("Muted")
-        form.addWidget(tips)
-
-        form.addWidget(QLabel("Face coverage"))
-        self.coverage = QComboBox()
-        self.coverage.addItem("Full, including beard", "full")
-        self.coverage.addItem("Normal (tight face)", "normal")
-        self.coverage.setToolTip(
-            "Full replaces the jaw, cheeks, and beard. Normal keeps a tight oval around the inner face."
-        )
-        form.addWidget(self.coverage)
-
-        self.object_mask = QCheckBox("Object mask (XSeg)")
-        self.object_mask.setChecked(True)
-        self.object_mask.setToolTip(
-            "On for every normal swap. Keeps lollipops, food, and hands when they "
-            "cover the face. XSeg downloads into models/xseg.onnx on the first swap. "
-            "Until then the built-in mask runs. The mask stays inside the face."
-        )
-        self.precise_edges = QCheckBox("Precise edges (BiSeNet)")
-        self.precise_edges.setChecked(False)
-        self.precise_edges.setToolTip(
-            "Off by default. Turning it on downloads models/bisenet.onnx and tightens the hairline."
-        )
-        self.fast_draft = QCheckBox("Fast draft in preview")
-        self.fast_draft.setChecked(True)
-        self.fast_draft.setToolTip(
-            "Preview and playback skip GFPGAN and BiSeNet. Object mask stays on. "
-            "Run swap uses the checkboxes above."
-        )
-        self.detect_every = QCheckBox("Detect every 2nd frame")
-        self.detect_every.setChecked(True)
-        self.detect_every.setToolTip(
-            "Full export runs the detector on every other frame and reuses landmarks between them."
-        )
-        form.addWidget(self.object_mask)
-        form.addWidget(self.precise_edges)
-        form.addWidget(self.fast_draft)
-        form.addWidget(self.detect_every)
-        self.model_status = QLabel(optional_model_report())
-        self.model_status.setWordWrap(True)
-        self.model_status.setObjectName("Muted")
-        form.addWidget(self.model_status)
-        self.fast_draft_btn = QPushButton("⚡ Fast draft")
-        self.fast_draft_btn.setToolTip("Restore off, precise edges off, object mask on.")
-        self.fast_draft_btn.clicked.connect(self._apply_fast_draft)
-        form.addWidget(self.fast_draft_btn)
-
+        size_row = QHBoxLayout()
+        size_row.addWidget(QLabel("Detector size"))
+        self.detector_size = QSpinBox()
+        self.detector_size.setRange(320, 1280)
+        self.detector_size.setSingleStep(32)
+        self.detector_size.setValue(640)
+        size_row.addWidget(self.detector_size)
+        form.addLayout(size_row)
+        form.addWidget(QLabel("Detect sensitivity"))
+        self.sensitivity = QSlider(Qt.Orientation.Horizontal)
+        self.sensitivity.setRange(0, 100)
+        self.sensitivity.setValue(63)
+        self.sensitivity.setToolTip("Higher finds smaller and side faces. 63 is about a 0.30 detector threshold.")
+        form.addWidget(self.sensitivity)
         min_row = QHBoxLayout()
-        min_row.addWidget(QLabel("Min face size (px)"))
+        min_row.addWidget(QLabel("Min face size"))
         self.min_face = QSpinBox()
         self.min_face.setRange(0, 512)
         self.min_face.setValue(0)
-        self.min_face.setToolTip("Skip background faces smaller than this. 0 keeps every detection. Try 64 in a crowd.")
+        self.min_face.setToolTip("0 keeps every detection, including side faces. Try 64 in a crowd.")
         min_row.addWidget(self.min_face)
         form.addLayout(min_row)
-
-        form.addWidget(QLabel("Source rotation"))
-        self.rotation = QComboBox()
-        self.rotation.addItem("A different face per person", "per_person")
-        self.rotation.addItem("When the face changes", "scene")
-        self.rotation.addItem("Every N seconds", "interval")
-        form.addWidget(self.rotation)
-        rot_row = QHBoxLayout()
-        rot_row.addWidget(QLabel("Every"))
-        self.rotation_seconds = QSpinBox()
-        self.rotation_seconds.setRange(1, 120)
-        self.rotation_seconds.setValue(5)
-        self.rotation_seconds.setSuffix(" s")
-        rot_row.addWidget(self.rotation_seconds)
-        self.add_rotation_btn = QPushButton("Add rotation source…")
-        self.add_rotation_btn.clicked.connect(self._add_rotation_source)
-        rot_row.addWidget(self.add_rotation_btn)
-        form.addLayout(rot_row)
-        self.rotation_label = QLabel("Rotation uses the source images you add here.")
-        self.rotation_label.setWordWrap(True)
-        self.rotation_label.setObjectName("Muted")
-        form.addWidget(self.rotation_label)
-
+        self.detect_every = QCheckBox("Detect every 2nd frame")
+        self.detect_every.setChecked(True)
+        self.detect_every.setToolTip("Full export detects every other frame. Preview always detects the one frame.")
+        form.addWidget(self.detect_every)
         form.addWidget(QLabel("Export speed"))
         self.speed = QComboBox()
         self.speed.addItem("Full quality", 1.0)
         self.speed.addItem("Half resolution (faster)", 0.5)
-        self.speed.setToolTip(
-            "Full quality is the default export. Half resolution is faster on CPU "
-            "and DirectML. The MP4 is still the original size."
-        )
         form.addWidget(self.speed)
+        self.fast_draft_btn = QPushButton("⚡ Fast draft")
+        self.fast_draft_btn.clicked.connect(self._apply_fast_draft)
+        form.addWidget(self.fast_draft_btn)
+        self.model_status = QLabel(optional_model_report())
+        self.model_status.setWordWrap(True)
+        self.model_status.setObjectName("Muted")
+        form.addWidget(self.model_status)
+        column.addWidget(box)
 
-        self.keep_audio = QCheckBox("Keep original audio")
-        self.keep_audio.setChecked(True)
-        self.enhance = QCheckBox("Sharpen swapped faces (GFPGAN)")
-        self.enhance.setChecked(False)
-        install_tip = gfpgan_install_tip()
-        self.enhance.setToolTip(
-            install_tip
-            or "Optional, and off by default. Turn this on when the swap looks soft. "
-            "Faces under 96px are skipped. The first enhanced swap downloads GFPGANv1.4.pth."
-        )
-        self.enhance.toggled.connect(self._on_enhance_toggled)
-        form.addWidget(self.keep_audio)
-        form.addWidget(self.enhance)
-
-        crf_row = QHBoxLayout()
-        crf_row.addWidget(QLabel("Quality (CRF)"))
-        self.crf = QSpinBox()
-        self.crf.setRange(0, 32)
-        self.crf.setValue(18)
-        crf_row.addWidget(self.crf)
-        form.addLayout(crf_row)
-
-        self.preset = QComboBox()
-        self.preset.addItems(_PRESETS)
-        self.preset.setCurrentText("medium")
-        form.addWidget(QLabel("Encode preset"))
-        form.addWidget(self.preset)
-        left.addWidget(options)
-
-        output_box = QFrame()
-        output_box.setObjectName("Panel")
-        output_layout = QVBoxLayout(output_box)
+        output = QFrame()
+        output.setObjectName("Panel")
+        output_layout = QVBoxLayout(output)
         output_layout.addWidget(QLabel("Output MP4"))
         out_row = QHBoxLayout()
         self.output_edit = QLineEdit()
@@ -443,112 +642,40 @@ class MainWindow(QMainWindow):
         out_row.addWidget(self.output_edit, stretch=1)
         out_row.addWidget(out_browse)
         output_layout.addLayout(out_row)
-        project_row = QHBoxLayout()
-        save_project_btn = QPushButton("Save project")
-        load_project_btn = QPushButton("Load project")
-        save_project_btn.clicked.connect(self._save_project)
-        load_project_btn.clicked.connect(self._load_project)
-        project_row.addWidget(save_project_btn)
-        project_row.addWidget(load_project_btn)
-        output_layout.addLayout(project_row)
-        left.addWidget(output_box)
+        column.addWidget(output)
 
         self.detect_btn = QPushButton("Detect faces")
         self.detect_btn.clicked.connect(self._detect)
-        self.run_btn = QPushButton("Run swap")
+        self.run_btn = QPushButton("Swap")
         self.run_btn.setObjectName("Primary")
+        self.run_btn.setMinimumHeight(48)
         self.run_btn.clicked.connect(self._run)
         self.cancel_btn = QPushButton("Cancel")
         self.cancel_btn.setEnabled(False)
         self.cancel_btn.clicked.connect(self._cancel)
-        left.addWidget(self.detect_btn)
-        left.addWidget(self.run_btn)
-        left.addWidget(self.cancel_btn)
+        column.addWidget(self.detect_btn)
+        column.addWidget(self.run_btn)
+        column.addWidget(self.cancel_btn)
         ethics = QLabel("Swap only people you have consent to depict. Label synthetic media when you publish it.")
         ethics.setWordWrap(True)
         ethics.setObjectName("Muted")
-        left.addWidget(ethics)
-        left.addStretch(1)
+        column.addWidget(ethics)
+        column.addStretch(1)
+        wrap = QWidget()
+        wrap.setLayout(column)
+        return self._scroll(wrap, 340)
 
-        left_wrap = QWidget()
-        left_wrap.setLayout(left)
-        left_scroll = QScrollArea()
-        left_scroll.setWidgetResizable(True)
-        left_scroll.setFrameShape(QFrame.Shape.NoFrame)
-        left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        left_scroll.setWidget(left_wrap)
-        left_scroll.setFixedWidth(376)
-        left_scroll.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
-        outer.addWidget(left_scroll)
-
-        right = QVBoxLayout()
-        self.preview = QLabel("Choose a video to preview a frame.")
-        self.preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.preview.setMinimumHeight(280)
-        self.preview.setObjectName("Preview")
-        right.addWidget(self.preview)
-        self.compare_slider = QSlider(Qt.Orientation.Horizontal)
-        self.compare_slider.setRange(0, 100)
-        self.compare_slider.setValue(50)
-        self.compare_slider.setEnabled(False)
-        self.compare_slider.setToolTip("Drag to wipe between the swapped frame and the original.")
-        self.compare_slider.valueChanged.connect(self._on_compare)
-        right.addWidget(QLabel("Before / after"))
-        right.addWidget(self.compare_slider)
-
-        header = QHBoxLayout()
-        header.addWidget(QLabel("Swap mode"))
-        self.face_mode = QComboBox()
-        self.face_mode.addItem("Single face", FACE_MODE_SINGLE)
-        self.face_mode.addItem("Multiple faces", FACE_MODE_MULTIPLE)
-        self.face_mode.currentIndexChanged.connect(self._on_mode_changed)
-        header.addWidget(self.face_mode, stretch=1)
-        right.addLayout(header)
-
-        self.mode_hint = QLabel("One source image replaces the selected face.")
-        self.mode_hint.setWordWrap(True)
-        self.mode_hint.setObjectName("Muted")
-        right.addWidget(self.mode_hint)
-
-        self.single_btn = QPushButton("Choose source image…")
-        self.single_btn.clicked.connect(self._pick_single_source)
-        self.single_label = QLabel("No source image")
-        self.single_label.setObjectName("Muted")
-        self.apply_all = QCheckBox("Apply this source to every face")
-        self.apply_all.setChecked(False)
-        self.apply_all.toggled.connect(self._on_apply_all)
-        right.addWidget(self.single_btn)
-        right.addWidget(self.single_label)
-        right.addWidget(self.apply_all)
-        self.assignment = QLabel("Side and profile faces are listed with the others when they are detected.")
-        self.assignment.setWordWrap(True)
-        self.assignment.setObjectName("Muted")
-        right.addWidget(self.assignment)
-
-        self.face_host = QWidget()
-        self.face_layout = QVBoxLayout(self.face_host)
-        self.face_layout.setContentsMargins(0, 0, 0, 0)
-        self.face_layout.addStretch(1)
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setWidget(self.face_host)
-        scroll.setMinimumHeight(180)
-        right.addWidget(scroll, stretch=1)
-
-        self.progress = QProgressBar()
-        self.progress.setRange(0, 100)
-        self.progress.setValue(0)
-        self.progress.setFormat("Idle")
-        right.addWidget(self.progress)
-        self.status = QLabel("Ready.")
-        self.status.setWordWrap(True)
-        right.addWidget(self.status)
-        self.log = QPlainTextEdit()
-        self.log.setReadOnly(True)
-        self.log.setMaximumBlockCount(400)
-        self.log.setFixedHeight(120)
-        right.addWidget(self.log)
-        outer.addLayout(right, stretch=1)
+    def _percent_row(self, label: str, attr: str, value: int) -> QWidget:
+        row = QWidget()
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(QLabel(label))
+        slider = QSlider(Qt.Orientation.Horizontal)
+        slider.setRange(0, 100)
+        slider.setValue(value)
+        layout.addWidget(slider, stretch=1)
+        setattr(self, attr, slider)
+        return row
 
     def _apply_style(self) -> None:
         self.setFont(QFont("Segoe UI", 10))
@@ -651,6 +778,8 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Duration unknown", str(exc))
         except Exception as exc:
             QMessageBox.critical(self, "Could not open video", str(exc))
+            return
+        QTimer.singleShot(0, self._auto_detect)
 
     def load_video(self, video: Path) -> VideoInfo:
         """Probe a video and keep it only when it is within the 5-minute limit."""
@@ -663,14 +792,16 @@ class MainWindow(QMainWindow):
             f"{info.width}×{info.height}  ·  {info.fps:.2f} fps"
         )
         steps = max(0, int(info.duration_s * 10))
+        self._slider_live = False
         self.time_slider.setEnabled(True)
         self.time_slider.setRange(0, steps)
         self.time_slider.setValue(0)
+        self._slider_live = True
         self.output_edit.setText(str(video.with_name(f"{video.stem}_videoswa.mp4")))
         self._clear_faces()
         self._refresh_preview()
         self._showing_swap = False
-        self._set_status(f"Loaded {video.name}. Sample a frame, then detect faces.")
+        self._set_status(f"Loaded {video.name}. Faces are detected from the open button, or click Detect faces.")
         self._update_preview_button()
         return info
 
@@ -683,10 +814,14 @@ class MainWindow(QMainWindow):
             self.output_edit.setText(path)
 
     def _on_slider(self, _value: int) -> None:
+        self.time_label.setText(f"Sample frame  {format_timestamp(self._timestamp())}")
+        if self._parking or not self._slider_live:
+            return
         self._showing_swap = False
         self.compare_slider.setEnabled(False)
-        self.time_label.setText(f"Sample frame  {format_timestamp(self._timestamp())}")
         self._preview_timer.start(120)
+        if not self._playing:
+            self._redetect_timer.start(450)
 
     def _paint_preview(self, frame) -> None:
         pix = bgr_to_qpixmap(frame, max_edge=960)
@@ -797,6 +932,20 @@ class MainWindow(QMainWindow):
                 return card.person.face
         return None
 
+    def _auto_detect(self) -> None:
+        """Run after Open target video. load_video itself stays silent for tests."""
+        if self._video is None or self._info is None or self._busy:
+            return
+        self._detect()
+
+    def _detect_after_slide(self) -> None:
+        if self._video is None or self._busy or self._playing:
+            return
+        self._detect()
+
+    def _det_thresh(self) -> float:
+        return sensitivity_to_thresh(self.sensitivity.value())
+
     def _detect(self) -> None:
         if self._busy:
             return
@@ -810,11 +959,31 @@ class MainWindow(QMainWindow):
             DetectRequest(
                 video_path=self._video,
                 timestamp_s=self._timestamp(),
-                execution=self.execution.currentData(),
+                execution=str(self.execution.currentData()),
+                duration_s=float(self._info.duration_s),
+                det_size=int(self.detector_size.value()),
+                det_thresh=self._det_thresh(),
+                auto_seek=True,
             )
         )
 
-    def _on_detected(self, people: list) -> None:
+    def _on_detected(self, payload) -> None:
+        if isinstance(payload, dict):
+            people = list(payload.get("people") or [])
+            found_time = payload.get("time_s")
+            note = str(payload.get("note") or "")
+            found = bool(payload.get("found"))
+        else:
+            people = list(payload or [])
+            found_time = None
+            note = ""
+            found = bool(people)
+        if found and found_time is not None and abs(float(found_time) - self._timestamp()) > 0.05:
+            self._parking = True
+            self.time_slider.setValue(int(round(float(found_time) * 10)))
+            self._parking = False
+            self._slider_live = True
+            self._refresh_preview()
         self._clear_faces()
         stretch = self.face_layout.takeAt(self.face_layout.count() - 1)
         del stretch
@@ -843,8 +1012,19 @@ class MainWindow(QMainWindow):
         labels = ", ".join(face_label(card.person.index, card.person.face.gender) for card in self._cards)
         detail = f" ({labels})" if labels else ""
         self._set_status(
-            f"Detected {len(self._cards)} face(s) at {format_timestamp(self._timestamp())}{detail}."
+            note
+            or f"Detected {len(self._cards)} face(s) at {format_timestamp(self._timestamp())}{detail}."
         )
+        if not found:
+            QMessageBox.warning(
+                self,
+                "No faces found",
+                note
+                or (
+                    "No faces at this frame. Move the slider, use a clearer shot, "
+                    "or lower Min face size and Detect sensitivity."
+                ),
+            )
 
     def _on_detect_failed(self, message: str) -> None:
         self.progress.setRange(0, 100)
@@ -854,12 +1034,128 @@ class MainWindow(QMainWindow):
         QMessageBox.critical(self, "Detection failed", message)
 
     def _pick_single_source(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(self, "Source face", "", _IMAGE_FILTER)
-        if not path:
+        paths, _ = QFileDialog.getOpenFileNames(self, "Source faces", "", _IMAGE_FILTER)
+        for path in paths:
+            self._queue_source(Path(path), "library")
+
+    def _add_identity_photos(self) -> None:
+        anchor = self._selected_source_path()
+        if anchor is None:
+            QMessageBox.information(self, "No source", "Add a source face first, then add more photos of that person.")
             return
-        self._single_source = Path(path)
-        self.single_label.setText(self._single_source.name)
+        paths, _ = QFileDialog.getOpenFileNames(self, "More photos of this person", "", _IMAGE_FILTER)
+        for path in paths:
+            self._queue_source(Path(path), "identity")
+
+    def _queue_source(self, path: Path, role: str) -> None:
+        self._set_status(f"Checking {path.name} for a face…")
+        self.worker.request_source(
+            SourceCheckRequest(
+                path=path,
+                execution=str(self.execution.currentData()),
+                det_size=int(self.detector_size.value()),
+                det_thresh=self._det_thresh(),
+                role=role,
+            )
+        )
+
+    def _on_source_ready(self, path: str, ok: bool, message: str, role: str) -> None:
+        if not ok:
+            self._set_status(message)
+            QMessageBox.warning(self, "Source photo has no face", message)
+            return
+        photo = Path(path)
+        if role == "identity":
+            anchor = self._selected_source_path()
+            if anchor is None:
+                return
+            extras = self._identity_paths.setdefault(str(anchor), [])
+            if photo not in extras and photo != anchor:
+                extras.append(photo)
+            self._refresh_source_list()
+            self._set_status(f"{message} Added to this identity.")
+            return
+        self._remember_source(photo)
+        self._set_status(message)
+
+    def _remember_source(self, path: Path) -> None:
+        if path not in self._source_order:
+            self._source_order.append(path)
+        self._single_source = path
+        self._refresh_source_list()
+        self._select_source_row(path)
+        self.single_label.setText(self._source_caption(path))
         self._update_preview_button()
+        self._refresh_assignment()
+
+    def _source_caption(self, path: Path) -> str:
+        mark = {1: "♂", 0: "♀"}.get(self._source_genders.get(str(path)))
+        extras = self._identity_paths.get(str(path)) or []
+        bits = [path.name]
+        if mark:
+            bits.append(mark)
+        if extras:
+            bits.append(f"+{len(extras)} photo(s)")
+        return " ".join(bits)
+
+    def _refresh_source_list(self) -> None:
+        current = str(self._single_source) if self._single_source else ""
+        self.source_list.blockSignals(True)
+        self.source_list.clear()
+        for path in self._source_order:
+            self.source_list.addItem(self._source_caption(path))
+            self.source_list.item(self.source_list.count() - 1).setData(Qt.ItemDataRole.UserRole, str(path))
+        self.source_list.blockSignals(False)
+        if current:
+            self._select_source_row(Path(current))
+
+    def _select_source_row(self, path: Path) -> None:
+        target = str(path)
+        for row in range(self.source_list.count()):
+            if self.source_list.item(row).data(Qt.ItemDataRole.UserRole) == target:
+                self.source_list.blockSignals(True)
+                self.source_list.setCurrentRow(row)
+                self.source_list.blockSignals(False)
+                return
+
+    def _selected_source_path(self) -> Optional[Path]:
+        item = self.source_list.currentItem()
+        if item is not None:
+            stored = item.data(Qt.ItemDataRole.UserRole)
+            if stored:
+                return Path(stored)
+        return self._single_source
+
+    def _on_source_row(self) -> None:
+        path = self._selected_source_path()
+        if path is None:
+            return
+        self._single_source = path
+        self.single_label.setText(self._source_caption(path))
+        self._update_preview_button()
+        self._refresh_assignment()
+
+    def _remove_source(self) -> None:
+        path = self._selected_source_path()
+        if path is None:
+            return
+        self._source_order = [item for item in self._source_order if item != path]
+        self._source_genders.pop(str(path), None)
+        self._identity_paths.pop(str(path), None)
+        self._single_source = self._source_order[0] if self._source_order else None
+        self._refresh_source_list()
+        self.single_label.setText(self._source_caption(self._single_source) if self._single_source else "No source image")
+        self._update_preview_button()
+        self._refresh_assignment()
+
+    def _set_source_gender(self, gender: int) -> None:
+        path = self._selected_source_path()
+        if path is None:
+            QMessageBox.information(self, "No source", "Add a source face first, then set Male or Female.")
+            return
+        self._source_genders[str(path)] = gender
+        self._refresh_source_list()
+        self.single_label.setText(self._source_caption(path))
         self._refresh_assignment()
 
     def _preview_inputs_ready(self) -> bool:
@@ -908,6 +1204,8 @@ class MainWindow(QMainWindow):
                         face=card.person.face,
                         source_path=card.source_path,
                         label=face_label(card.person.index, card.person.face.gender),
+                        gender=self._source_genders.get(str(card.source_path)),
+                        identity_paths=list(self._identity_paths.get(str(card.source_path), [])),
                     )
                 )
             if not sources:
@@ -934,9 +1232,18 @@ class MainWindow(QMainWindow):
             fast_draft_preview=self.fast_draft.isChecked(),
             detect_every_other=self.detect_every.isChecked(),
             min_face_px=self.min_face.value(),
-            rotation_mode=str(self.rotation.currentData()),
+            rotation_mode=str(self.rotation.currentData()) if self.rotation_enabled.isChecked() else "per_person",
             rotation_seconds=float(self.rotation_seconds.value()),
-            rotation_paths=list(self._rotation_paths),
+            rotation_paths=list(self._rotation_paths) if self.rotation_enabled.isChecked() else [],
+            identity_paths=list(self._identity_paths.get(str(single), [])) if single else [],
+            source_gender=self._source_genders.get(str(single)) if single else None,
+            match_gender=self.match_gender.isChecked(),
+            det_size=int(self.detector_size.value()),
+            det_thresh=self._det_thresh(),
+            encoder=str(self.encoder.currentData()),
+            color_match=self.color_slider.value() / 100.0,
+            sharpen=self.sharpen_slider.value() / 100.0,
+            restore_strength=self.restore_slider.value() / 100.0,
         )
 
     def _preview_swap(self) -> None:
@@ -975,6 +1282,7 @@ class MainWindow(QMainWindow):
         self._set_busy(False)
         self._set_status(note)
         if unchanged:
+            self._stop_play()
             QMessageBox.warning(self, "Preview did not swap a face", note)
 
     def _paint_compare(self) -> None:
@@ -991,6 +1299,98 @@ class MainWindow(QMainWindow):
     def _on_compare(self, _value: int) -> None:
         if self._showing_swap:
             self._paint_compare()
+
+    def _on_beard(self, checked: bool) -> None:
+        self.coverage.blockSignals(True)
+        self._set_combo(self.coverage, "full" if checked else "normal")
+        self.coverage.blockSignals(False)
+
+    def _sync_beard_from_coverage(self) -> None:
+        self.beard.blockSignals(True)
+        self.beard.setChecked(self.coverage.currentData() == "full")
+        self.beard.blockSignals(False)
+
+    def _on_fast_playback(self, checked: bool) -> None:
+        self._set_combo(self.speed, 0.5 if checked else 1.0)
+
+    def _on_video_quality(self) -> None:
+        data = self.video_quality.currentData()
+        if data is not None:
+            self.crf.setValue(int(data))
+
+    def _on_use_gpu(self, checked: bool) -> None:
+        if checked:
+            if self.execution.currentData() == "cpu":
+                self._set_combo(self.execution, "auto")
+            return
+        self._set_combo(self.execution, "cpu")
+
+    def _on_quality_preset(self) -> None:
+        name = self.quality_preset.currentData()
+        if name == "fast":
+            self._apply_fast_draft()
+            return
+        self.object_mask.setChecked(True)
+        self._set_combo(self.coverage, "full")
+        self.min_face.setValue(0)
+        self.color_slider.setValue(60)
+        self.sharpen_slider.setValue(12)
+        self.restore_slider.setValue(65)
+        if name == "quality":
+            self.precise_edges.setChecked(True)
+            self.fast_draft.setChecked(False)
+            self.detect_every.setChecked(False)
+        else:
+            self.precise_edges.setChecked(False)
+            self.fast_draft.setChecked(True)
+            self.detect_every.setChecked(True)
+        if gfpgan_install_tip() is None:
+            self.enhance.setChecked(True)
+        else:
+            self.enhance.blockSignals(True)
+            self.enhance.setChecked(False)
+            self.enhance.blockSignals(False)
+
+    def _toggle_play(self) -> None:
+        if self._playing:
+            self._stop_play()
+            return
+        if self._video is None:
+            QMessageBox.information(self, "No video", "Open a target video first.")
+            return
+        self._playing = True
+        self.play_btn.setText("Pause")
+        self._play_timer.start(280)
+
+    def _stop_play(self) -> None:
+        self._playing = False
+        self._play_timer.stop()
+        if hasattr(self, "play_btn"):
+            self.play_btn.setText("Play swapped")
+
+    def _play_tick(self) -> None:
+        if self._video is None or self._info is None:
+            self._stop_play()
+            return
+        if self._busy:
+            return
+        step = 4 if self.fast_playback.isChecked() else 2
+        nxt = self.time_slider.value() + step
+        if nxt > self.time_slider.maximum():
+            if self.loop.isChecked():
+                nxt = 0
+            else:
+                self._stop_play()
+                return
+        self.time_slider.setValue(nxt)
+        if self._preview_inputs_ready():
+            self._preview_swap()
+
+    def _toggle_compare(self) -> None:
+        if not self.compare_slider.isEnabled():
+            QMessageBox.information(self, "Nothing to compare", "Preview a frame first. Before / after appears after a visible swap.")
+            return
+        self.compare_slider.setValue(0 if self.compare_slider.value() >= 50 else 100)
 
     def _apply_fast_draft(self) -> None:
         self.enhance.setChecked(False)
@@ -1054,6 +1454,17 @@ class MainWindow(QMainWindow):
                 "keep_audio": self.keep_audio.isChecked(),
                 "crf": self.crf.value(),
                 "preset": self.preset.currentText(),
+                "match_gender": self.match_gender.isChecked(),
+                "rotation_enabled": self.rotation_enabled.isChecked(),
+                "encoder": self.encoder.currentData(),
+                "det_size": self.detector_size.value(),
+                "sensitivity": self.sensitivity.value(),
+                "color_match": self.color_slider.value(),
+                "sharpen": self.sharpen_slider.value(),
+                "restore_strength": self.restore_slider.value(),
+                "video_quality": self.video_quality.currentData(),
+                "fast_playback": self.fast_playback.isChecked(),
+                "source_genders": {key: value for key, value in self._source_genders.items()},
             },
         }
 
@@ -1103,6 +1514,27 @@ class MainWindow(QMainWindow):
         self.detect_every.setChecked(bool(settings.get("detect_every_other", True)))
         self.apply_all.setChecked(bool(settings.get("apply_all", False)))
         self.keep_audio.setChecked(bool(settings.get("keep_audio", True)))
+        if hasattr(self, "match_gender"):
+            self.match_gender.setChecked(bool(settings.get("match_gender", True)))
+        if hasattr(self, "rotation_enabled"):
+            self.rotation_enabled.setChecked(bool(settings.get("rotation_enabled", False)))
+        self._set_combo(self.encoder, settings.get("encoder"))
+        if settings.get("det_size") is not None:
+            self.detector_size.setValue(int(settings["det_size"]))
+        if settings.get("sensitivity") is not None:
+            self.sensitivity.setValue(int(settings["sensitivity"]))
+        if settings.get("color_match") is not None:
+            self.color_slider.setValue(int(settings["color_match"]))
+        if settings.get("sharpen") is not None:
+            self.sharpen_slider.setValue(int(settings["sharpen"]))
+        if settings.get("restore_strength") is not None:
+            self.restore_slider.setValue(int(settings["restore_strength"]))
+        if settings.get("video_quality") is not None:
+            self._set_combo(self.video_quality, settings.get("video_quality"))
+        self.fast_playback.setChecked(bool(settings.get("fast_playback", False)))
+        genders = settings.get("source_genders") or {}
+        if isinstance(genders, dict):
+            self._source_genders = {str(key): int(value) for key, value in genders.items() if value in (0, 1)}
         if settings.get("scale") is not None:
             self._set_combo(self.speed, settings.get("scale"))
         if data.get("output"):
@@ -1212,7 +1644,11 @@ class MainWindow(QMainWindow):
         self.progress.setFormat("Done")
         self._set_busy(False)
         self._set_status(f"Wrote {path}. {summary}")
-        QMessageBox.information(self, "Swap finished", f"Saved\n{path}\n\n{summary}")
+        self._stop_play()
+        if "still looks like the original" in summary or "No faces were swapped" in summary:
+            QMessageBox.warning(self, "Swap did not change the video", f"Saved\n{path}\n\n{summary}")
+        else:
+            QMessageBox.information(self, "Swap finished", f"Saved\n{path}\n\n{summary}")
 
     def _on_swap_failed(self, message: str) -> None:
         self.progress.setRange(0, 100)

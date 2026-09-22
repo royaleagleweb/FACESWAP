@@ -93,7 +93,7 @@ def test_preview_button_follows_video_and_source(tmp_path: Path, monkeypatch) ->
     window.worker.request_preview = lambda job: captured.setdefault("job", job)  # type: ignore[method-assign]
     monkeypatch.setattr(QMessageBox, "warning", lambda *args, **kwargs: QMessageBox.StandardButton.Ok)
     try:
-        assert window.preview_btn.text() == "Preview swap on this frame"
+        assert window.preview_btn.text() == "Preview frame"
         assert window.preview_btn.isEnabled() is False
         window.load_video(video)
         assert window.preview_btn.isEnabled() is False

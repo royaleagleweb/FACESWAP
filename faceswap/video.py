@@ -206,6 +206,30 @@ def grab_first_frame(path: Path) -> Optional[np.ndarray]:
         return None
 
 
+def resolve_encoder(choice: str = "auto") -> str:
+    """Prefer NVENC when ffmpeg lists it. Anything else stays on libx264."""
+    name = (choice or "auto").strip().lower()
+    if name in {"auto", "h264_nvenc", "nvenc"} and _ffmpeg_has_encoder("h264_nvenc"):
+        return "h264_nvenc"
+    return "libx264"
+
+
+def _ffmpeg_has_encoder(name: str) -> bool:
+    if not shutil.which("ffmpeg"):
+        return False
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-encoders"],
+            capture_output=True,
+            text=True,
+            timeout=8,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return name in (result.stdout or "")
+
+
 def process_video(
     engine: FaceSwapEngine,
     mappings: Sequence[FaceMapping],
@@ -218,6 +242,7 @@ def process_video(
     cancel_event: Optional[threading.Event] = None,
     limit_s: Optional[float] = None,
     scale: float = 1.0,
+    encoder: str = "auto",
 ) -> Path:
     """Apply face swaps frame-by-frame and re-mux original audio.
 
@@ -290,10 +315,11 @@ def process_video(
         if cancelled:
             raise SwapCancelled("Swap cancelled. No output file was written.")
 
+        chosen = resolve_encoder(encoder)
         if keep_audio and info.has_audio and shutil.which("ffmpeg"):
-            _mux_audio(tmp_video, input_path, output_path, crf=crf, preset=preset)
+            _mux_audio(tmp_video, input_path, output_path, crf=crf, preset=preset, encoder=chosen)
         elif shutil.which("ffmpeg"):
-            _reencode(tmp_video, output_path, crf=crf, preset=preset)
+            _reencode(tmp_video, output_path, crf=crf, preset=preset, encoder=chosen)
         else:
             shutil.copy2(tmp_video, output_path)
             logger.warning("ffmpeg not found; output will not contain audio and may be mpeg4.")
@@ -328,26 +354,59 @@ def swap_frame(
     return swapped
 
 
-def _mux_audio(silent_video: Path, original: Path, dest: Path, crf: int, preset: str) -> None:
-    cmd = [
-        "ffmpeg", "-y", "-loglevel", "error",
-        "-i", str(silent_video), "-i", str(original),
-        "-map", "0:v:0", "-map", "1:a:0?",
-        "-c:v", "libx264", "-crf", str(crf), "-preset", preset, "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-b:a", "192k", "-shortest",
-        str(dest),
-    ]
+def _video_encode_args(encoder: str, crf: int, preset: str) -> list[str]:
+    if encoder == "h264_nvenc":
+        return ["-c:v", "h264_nvenc", "-cq", str(crf), "-preset", "p4", "-pix_fmt", "yuv420p"]
+    return ["-c:v", "libx264", "-crf", str(crf), "-preset", preset, "-pix_fmt", "yuv420p"]
+
+
+def _run_ffmpeg(cmd: list[str]) -> None:
     subprocess.run(cmd, check=True)
 
 
-def _reencode(src: Path, dest: Path, crf: int, preset: str) -> None:
-    cmd = [
-        "ffmpeg", "-y", "-loglevel", "error",
-        "-i", str(src),
-        "-c:v", "libx264", "-crf", str(crf), "-preset", preset, "-pix_fmt", "yuv420p",
-        str(dest),
-    ]
-    subprocess.run(cmd, check=True)
+def _mux_audio(
+    silent_video: Path,
+    original: Path,
+    dest: Path,
+    crf: int,
+    preset: str,
+    encoder: str = "libx264",
+) -> None:
+    def _cmd(enc: str) -> list[str]:
+        return [
+            "ffmpeg", "-y", "-loglevel", "error",
+            "-i", str(silent_video), "-i", str(original),
+            "-map", "0:v:0", "-map", "1:a:0?",
+            *_video_encode_args(enc, crf, preset),
+            "-c:a", "aac", "-b:a", "192k", "-shortest",
+            str(dest),
+        ]
+
+    try:
+        _run_ffmpeg(_cmd(encoder))
+    except subprocess.CalledProcessError:
+        if encoder == "libx264":
+            raise
+        logger.warning("Encoder %s failed. Falling back to libx264.", encoder)
+        _run_ffmpeg(_cmd("libx264"))
+
+
+def _reencode(src: Path, dest: Path, crf: int, preset: str, encoder: str = "libx264") -> None:
+    def _cmd(enc: str) -> list[str]:
+        return [
+            "ffmpeg", "-y", "-loglevel", "error",
+            "-i", str(src),
+            *_video_encode_args(enc, crf, preset),
+            str(dest),
+        ]
+
+    try:
+        _run_ffmpeg(_cmd(encoder))
+    except subprocess.CalledProcessError:
+        if encoder == "libx264":
+            raise
+        logger.warning("Encoder %s failed. Falling back to libx264.", encoder)
+        _run_ffmpeg(_cmd("libx264"))
 
 
 def process_image(

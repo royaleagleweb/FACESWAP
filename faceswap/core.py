@@ -15,7 +15,7 @@ from typing import Iterable, List, Optional, Sequence
 import numpy as np
 
 from .coverage import DEFAULT_COVERAGE
-from .face_analyzer import Face, FaceAnalyzer, cosine_similarity
+from .face_analyzer import Face, FaceAnalyzer, coerce_gender, cosine_similarity
 from .providers import CudaRuntimeGuard
 from .pose import PROFILE_YAW, face_yaw
 from .quality import SourceRotation, face_span_px, lock_gender
@@ -104,9 +104,21 @@ class FaceSwapEngine:
         self._detect_tick = 0
         self._from_detector = True
         self.rotation = SourceRotation()
+        self.match_gender = False
+        self.last_boxes: List[np.ndarray] = []
         for member in (self.analyzer, self.swapper):
             if hasattr(member, "adopt_cpu"):
                 self.cuda_guard.attach(member)
+
+    def _gender_blocks(self, source: Face, target: Face) -> bool:
+        """Block only when Match gender is on and both genders are known and different."""
+        if not self.match_gender:
+            return False
+        source_gender = coerce_gender(source.gender)
+        target_gender = coerce_gender(target.gender)
+        if source_gender is None or target_gender is None:
+            return False
+        return source_gender != target_gender
 
     def _lock_threshold(self, face: Face) -> float:
         """First-lock cosine. Profile faces clear a lower bar than frontal ones."""
@@ -146,6 +158,7 @@ class FaceSwapEngine:
         still overlaps and the embedding is still the same person. A stranger
         in that box is left as the original.
         """
+        self.last_boxes = []
         if not mappings:
             return frame_bgr
 
@@ -179,12 +192,16 @@ class FaceSwapEngine:
             track = self._touch_track(face, mapping)
             touched.add(id(track))
             source = self.rotation.choose(mapping.source_face, face, time_s)
+            if self._gender_blocks(source, face):
+                self.stats.faces_unmatched += 1
+                continue
             begin = getattr(self.swapper, "begin_face", None)
             if callable(begin):
                 begin(id(track))
             out = self.swapper.swap(
                 out, target_face=face, source_face=source, coverage=self.coverage
             )
+            self.last_boxes.append(np.asarray(face.bbox, dtype=np.float32).copy())
             self.stats.faces_swapped += 1
             if held:
                 self.stats.faces_held += 1

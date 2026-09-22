@@ -22,23 +22,48 @@ from faceswap.swapper import FaceSwapper
 from faceswap.utils import logger
 from faceswap.video import SwapCancelled, process_video, read_frame_at, reset_stats, swap_frame
 from videoswa.images import crop_face
-from videoswa.jobs import SwapRequest, build_mappings, read_image
+from videoswa.jobs import MIN_ROI_CHANGE, SwapRequest, build_mappings, read_image, roi_mean_change
 
 
 def _quality_note(stats: SwapStats) -> str:
     """Tell the user why a swap still looks like the original, or looks soft."""
+    if stats.faces_swapped <= 0:
+        return (
+            "No faces were swapped, so the video still looks like the original. "
+            "Move the sample slider until a face is listed, use a clearer source photo, "
+            "or lower Min face size and the match threshold."
+        )
     if stats.faces_detected <= 0:
         return (
-            "No faces were detected. Sample a frame where the face is clear and frontal."
+            "No faces were detected. Move the slider, or lower Min face size and Detect sensitivity."
         )
     if stats.faces_swapped < 0.7 * stats.faces_detected and stats.faces_unmatched > stats.faces_swapped:
         return (
-            "Many frames kept the original face. Use a clear frontal sample, "
-            "or lower the match threshold. Raise it if the wrong person is swapped."
+            "Many frames kept the original face. Lower the match threshold, "
+            "or turn off Match gender if the wrong gender tag is blocking the swap. "
+            "Raise the threshold if the wrong person is swapped."
         )
-    return (
-        "If the swap looks soft, enable Sharpen swapped faces (GFPGAN). It stays off until you turn it on."
-    )
+    return "Audio is kept when Keep audio is on and FFmpeg can read the file."
+
+
+def seek_times(current_s: float, duration_s: float, limit: int = 8) -> list[float]:
+    """Nearby timestamps to try when the current frame has no face."""
+    duration = max(0.0, float(duration_s))
+    current = min(max(0.0, float(current_s)), duration)
+    offsets = (0.0, 0.4, -0.4, 0.8, -0.8, 1.5, -1.5, 2.5, -2.5, 4.0, -4.0, 8.0, -8.0)
+    raw = [current + offset for offset in offsets]
+    raw.append(duration * 0.5)
+    raw.append(max(0.0, duration - 0.2))
+    times: list[float] = []
+    for value in raw:
+        if value < -1e-3 or value > duration + 1e-3:
+            continue
+        stamped = round(min(max(0.0, value), duration), 3)
+        if stamped not in times:
+            times.append(stamped)
+        if len(times) >= limit:
+            break
+    return times or [current]
 
 
 @dataclass
@@ -46,6 +71,19 @@ class DetectRequest:
     video_path: Path
     timestamp_s: float
     execution: str
+    duration_s: float = 0.0
+    det_size: int = 640
+    det_thresh: float = 0.30
+    auto_seek: bool = True
+
+
+@dataclass
+class SourceCheckRequest:
+    path: Path
+    execution: str
+    det_size: int = 640
+    det_thresh: float = 0.30
+    role: str = "library"
 
 
 @dataclass
@@ -68,6 +106,7 @@ class EngineWorker(QThread):
     detect_failed = Signal(str)
     preview_ready = Signal(object, object, str, bool)
     preview_failed = Signal(str)
+    source_ready = Signal(str, bool, str, str)
     swap_progress = Signal(int, int)
     swap_finished = Signal(str, str)
     swap_failed = Signal(str)
@@ -87,6 +126,9 @@ class EngineWorker(QThread):
 
     def request_preview(self, job: PreviewRequest) -> None:
         self._queue.put(("preview", job))
+
+    def request_source(self, job: SourceCheckRequest) -> None:
+        self._queue.put(("source", job))
 
     def request_swap(self, job: SwapRequest) -> None:
         self._cancel.clear()
@@ -110,6 +152,8 @@ class EngineWorker(QThread):
                     self._detect(job)
                 elif kind == "preview":
                     self._preview(job)
+                elif kind == "source":
+                    self._check_source(job)
                 else:
                     self._swap(job)
             except SwapCancelled:
@@ -121,6 +165,8 @@ class EngineWorker(QThread):
                     self.detect_failed.emit(message)
                 elif kind == "preview":
                     self.preview_failed.emit(message)
+                elif kind == "source":
+                    self.source_ready.emit(str(getattr(job, "path", "")), False, message, getattr(job, "role", "library"))
                 else:
                     self.swap_failed.emit(message)
 
@@ -174,17 +220,73 @@ class EngineWorker(QThread):
         self.provider.emit(text)
         self.status.emit(f"Models ready. {text} ({detail})" if detail else f"Models ready. {text}")
 
+    def _apply_detector(self, engine: FaceSwapEngine, det_size: int, det_thresh: float) -> None:
+        setter = getattr(engine.analyzer, "set_detection", None)
+        if callable(setter):
+            setter((int(det_size), int(det_size)), float(det_thresh))
+
     def _detect(self, job: DetectRequest) -> None:
         engine = self._engine_for(job.execution, enhance=False)
+        self._apply_detector(engine, job.det_size, job.det_thresh)
         self.status.emit("Detecting faces…")
-        frame = read_frame_at(Path(job.video_path), job.timestamp_s)
-        faces = engine.analyzer.analyze(frame)
-        people = [
-            DetectedPerson(crop_bgr=crop_face(frame, face), face=face, index=index)
-            for index, face in enumerate(faces)
-        ]
-        self.detect_ready.emit(people)
-        self.status.emit(f"Detected {len(people)} face(s).")
+        times = seek_times(job.timestamp_s, job.duration_s) if job.auto_seek else [float(job.timestamp_s)]
+        found_time = float(job.timestamp_s)
+        frame = None
+        faces = []
+        for timestamp in times:
+            try:
+                candidate = read_frame_at(Path(job.video_path), timestamp)
+            except Exception:
+                continue
+            faces = engine.analyzer.analyze(candidate)
+            frame = candidate
+            if faces:
+                found_time = timestamp
+                break
+        people = []
+        if frame is not None:
+            people = [
+                DetectedPerson(crop_bgr=crop_face(frame, face), face=face, index=index)
+                for index, face in enumerate(faces)
+            ]
+        note = getattr(engine.analyzer, "last_detect_note", "") or ""
+        if not people:
+            note = (
+                "No faces in this part of the video. Move the slider to a clearer shot, "
+                "pick a frame where the face is larger, or lower Min face size and Detect sensitivity."
+            )
+            if "OpenCV" in (getattr(engine.analyzer, "last_detect_note", "") or ""):
+                note = f"{note}\n\n{engine.analyzer.last_detect_note}"
+        elif abs(found_time - float(job.timestamp_s)) > 0.05:
+            parked = f"Moved the slider to {found_time:.1f}s because the current frame had no face."
+            note = f"{note} {parked}".strip()
+        self.detect_ready.emit({
+            "people": people,
+            "time_s": found_time,
+            "note": note,
+            "found": bool(people),
+        })
+        self.status.emit(note or f"Detected {len(people)} face(s).")
+
+    def _check_source(self, job: SourceCheckRequest) -> None:
+        engine = self._engine_for(job.execution, enhance=False)
+        self._apply_detector(engine, job.det_size, job.det_thresh)
+        path = Path(job.path)
+        image = read_image(path)
+        face = engine.analyzer.best_face(image)
+        if face is None:
+            self.source_ready.emit(
+                str(path),
+                False,
+                (
+                    f"No face found in {path.name}. Use a clear photo of one person "
+                    "(JPG, PNG, or HEIC). If the face is small or turned, lower Min face size "
+                    "and Detect sensitivity, then add the photo again."
+                ),
+                job.role,
+            )
+            return
+        self.source_ready.emit(str(path), True, f"Source ready: {path.name}", job.role)
 
     def _configure(self, engine: FaceSwapEngine, job: SwapRequest, *, preview: bool) -> None:
         enhance, precise, object_mask = resolve_quality(
@@ -202,10 +304,15 @@ class EngineWorker(QThread):
         engine.rotation.mode = job.rotation_mode
         engine.rotation.seconds = float(job.rotation_seconds)
         engine.rotation.sources = [] if job.rotation_mode == "per_person" else self._rotation_faces(engine, job)
+        engine.match_gender = bool(getattr(job, "match_gender", False))
         swapper = engine.swapper
         swapper.object_mask = object_mask
         swapper.precise_edges = precise
         swapper.allow_restore = enhance
+        swapper.color_match = float(getattr(job, "color_match", 0.60))
+        swapper.sharpen = float(getattr(job, "sharpen", 0.0))
+        swapper.restore_strength = float(getattr(job, "restore_strength", 1.0))
+        self._apply_detector(engine, int(getattr(job, "det_size", 640)), float(getattr(job, "det_thresh", 0.30)))
         if enhance and hasattr(swapper, "set_enhance"):
             tip = swapper.set_enhance(True)
             if tip:
@@ -241,14 +348,25 @@ class EngineWorker(QThread):
         swapped = swap_frame(
             engine, frame, mappings, scale=job.swap.scale, time_s=job.timestamp_s
         )
-        unchanged = engine.stats.faces_swapped == 0
-        if unchanged:
+        change = roi_mean_change(frame, swapped, getattr(engine, "last_boxes", []))
+        unchanged = engine.stats.faces_swapped == 0 or change < MIN_ROI_CHANGE
+        if engine.stats.faces_swapped == 0:
             note = (
                 "No face was swapped on this frame, so the preview still looks like the original. "
-                "Use a clearer sample, or lower the match threshold."
+                "Move the slider until a face is listed, use a clearer source photo, "
+                "or lower the match threshold and Min face size."
+            )
+        elif change < MIN_ROI_CHANGE:
+            note = (
+                "The preview barely changed inside the face, so this is not a usable swap. "
+                "Move the slider to a clearer face, pick a clearer source photo, "
+                "or lower Min face size and the match threshold."
             )
         else:
-            note = "Preview ready. Drag Before / after to compare. Run swap writes the video."
+            note = (
+                "Preview ready. The face identity changed. Drag Before / after, "
+                "then press Swap to export the video with audio."
+            )
         self.preview_ready.emit(frame, swapped, note, unchanged)
 
     def _swap(self, job: SwapRequest) -> None:
@@ -272,6 +390,7 @@ class EngineWorker(QThread):
             preset=job.preset,
             cancel_event=self._cancel,
             scale=job.scale,
+            encoder=getattr(job, "encoder", "auto"),
         )
         stats = engine.stats
         summary = (
