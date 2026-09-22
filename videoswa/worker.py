@@ -19,8 +19,8 @@ from faceswap.face_analyzer import FaceAnalyzer
 from faceswap.providers import format_providers, provider_status_text
 from faceswap.swapper import FaceSwapper
 from faceswap.utils import logger
-from faceswap.video import SwapCancelled, process_video, read_frame_at, reset_stats
-from videoswa.images import crop_face
+from faceswap.video import SwapCancelled, process_video, read_frame_at, reset_stats, swap_frame
+from videoswa.images import crop_face, side_by_side
 from videoswa.jobs import SwapRequest, build_mappings
 
 
@@ -48,6 +48,14 @@ class DetectRequest:
 
 
 @dataclass
+class PreviewRequest:
+    """One sample frame, using the same mapping settings as a full export."""
+
+    timestamp_s: float
+    swap: SwapRequest
+
+
+@dataclass
 class DetectedPerson:
     crop_bgr: object
     face: object
@@ -57,6 +65,8 @@ class DetectedPerson:
 class EngineWorker(QThread):
     detect_ready = Signal(object)
     detect_failed = Signal(str)
+    preview_ready = Signal(object, str, bool)
+    preview_failed = Signal(str)
     swap_progress = Signal(int, int)
     swap_finished = Signal(str, str)
     swap_failed = Signal(str)
@@ -73,6 +83,9 @@ class EngineWorker(QThread):
 
     def request_detect(self, job: DetectRequest) -> None:
         self._queue.put(("detect", job))
+
+    def request_preview(self, job: PreviewRequest) -> None:
+        self._queue.put(("preview", job))
 
     def request_swap(self, job: SwapRequest) -> None:
         self._cancel.clear()
@@ -94,6 +107,8 @@ class EngineWorker(QThread):
             try:
                 if kind == "detect":
                     self._detect(job)
+                elif kind == "preview":
+                    self._preview(job)
                 else:
                     self._swap(job)
             except SwapCancelled:
@@ -103,6 +118,8 @@ class EngineWorker(QThread):
                 message = str(exc) or exc.__class__.__name__
                 if kind == "detect":
                     self.detect_failed.emit(message)
+                elif kind == "preview":
+                    self.preview_failed.emit(message)
                 else:
                     self.swap_failed.emit(message)
 
@@ -161,6 +178,26 @@ class EngineWorker(QThread):
         ]
         self.detect_ready.emit(people)
         self.status.emit(f"Detected {len(people)} face(s).")
+
+    def _preview(self, job: PreviewRequest) -> None:
+        """Swap one sample frame and return it. Does not encode a video."""
+        engine = self._engine_for(job.swap.execution, job.swap.enhance)
+        engine.similarity_threshold = job.swap.similarity
+        engine.coverage = job.swap.coverage
+        reset_stats(engine)
+        self.status.emit("Swapping this frame…")
+        mappings = build_mappings(engine, job.swap)
+        frame = read_frame_at(Path(job.swap.video_path), job.timestamp_s)
+        swapped = swap_frame(engine, frame, mappings, scale=job.swap.scale)
+        unchanged = engine.stats.faces_swapped == 0
+        if unchanged:
+            note = (
+                "No face was swapped on this frame, so the preview still looks like the original. "
+                "Use a clearer sample, or lower the match threshold."
+            )
+        else:
+            note = "Preview ready. This is one frame only — Run swap writes the video."
+        self.preview_ready.emit(side_by_side(frame, swapped), note, unchanged)
 
     def _swap(self, job: SwapRequest) -> None:
         engine = self._engine_for(job.execution, job.enhance)

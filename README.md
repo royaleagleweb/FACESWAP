@@ -28,8 +28,11 @@ there for scripts (`python run.py swap ...`).
    instead. **Apply this source to every face** uses the same source for
    everyone. Switch to **Multiple faces** to pick a source on each thumbnail
    and leave a person empty to keep their face.
-4. Click **Run swap**. A progress bar tracks frames. **Cancel** stops between
-   frames and does not leave an output file behind.
+4. Click **Preview swap on this frame** to swap only the sample frame. The
+   preview shows the original and the swapped frame side by side. Nothing is
+   written. Click **Run swap** to export the MP4. A progress bar tracks
+   frames. **Cancel** stops between frames and does not leave an output file
+   behind.
 
 The window is PySide6. There is no web UI.
 

@@ -42,6 +42,14 @@ def _engine(threshold: float = 0.45) -> tuple[FaceSwapEngine, _Analyzer, _Swappe
     return engine, analyzer, swapper
 
 
+def test_build_mapping_stays_on_the_engine() -> None:
+    """Tracking must not leave these nested under a module helper."""
+    assert hasattr(FaceSwapEngine, "build_mapping")
+    assert hasattr(FaceSwapEngine, "build_mappings")
+    assert FaceSwapEngine.build_mapping.__qualname__ == "FaceSwapEngine.build_mapping"
+    assert FaceSwapEngine.build_mappings.__qualname__ == "FaceSwapEngine.build_mappings"
+
+
 def test_default_similarity_locks_sooner_than_the_old_cutoff() -> None:
     assert DEFAULT_SIMILARITY == 0.32
     assert DEFAULT_SIMILARITY < 0.45

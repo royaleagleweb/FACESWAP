@@ -46,7 +46,7 @@ from faceswap.video import (
 )
 from videoswa.images import bgr_to_qpixmap
 from videoswa.jobs import FACE_MODE_MULTIPLE, FACE_MODE_SINGLE, FaceSource, SwapRequest, validate_request
-from videoswa.worker import DetectRequest, DetectedPerson, EngineWorker
+from videoswa.worker import DetectRequest, DetectedPerson, EngineWorker, PreviewRequest
 
 _VIDEO_FILTER = "Videos (*.mp4 *.mov *.avi *.mkv *.webm *.m4v)"
 _IMAGE_FILTER = "Images (*.png *.jpg *.jpeg *.webp *.bmp)"
@@ -76,6 +76,7 @@ class FaceCard(QFrame):
     """One detected face, its gender label, and an optional per-face source."""
 
     clicked = Signal(int)
+    source_changed = Signal()
 
     def __init__(self, person: DetectedPerson, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -159,10 +160,12 @@ class FaceCard(QFrame):
             return
         self.source_path = Path(path)
         self.source_label.setText(self.source_path.name)
+        self.source_changed.emit()
 
     def _clear(self) -> None:
         self.source_path = None
         self.source_label.setText("No source image — this person stays unchanged")
+        self.source_changed.emit()
 
 
 class MainWindow(QMainWindow):
@@ -176,10 +179,14 @@ class MainWindow(QMainWindow):
         self._busy = False
         self._single_source: Optional[Path] = None
         self._selected_index: Optional[int] = None
+        self._showing_swap = False
+        self._preview_bgr: Optional[object] = None
 
         self.worker = EngineWorker()
         self.worker.detect_ready.connect(self._on_detected)
         self.worker.detect_failed.connect(self._on_detect_failed)
+        self.worker.preview_ready.connect(self._on_preview_ready)
+        self.worker.preview_failed.connect(self._on_preview_failed)
         self.worker.swap_progress.connect(self._on_progress)
         self.worker.swap_finished.connect(self._on_swap_finished)
         self.worker.swap_failed.connect(self._on_swap_failed)
@@ -243,6 +250,14 @@ class MainWindow(QMainWindow):
         self.time_slider.setEnabled(False)
         self.time_slider.valueChanged.connect(self._on_slider)
         target_layout.addWidget(self.time_slider)
+        self.preview_btn = QPushButton("Preview swap on this frame")
+        self.preview_btn.setEnabled(False)
+        self.preview_btn.setToolTip(
+            "Swap only the sample frame and show original and swapped side by side. "
+            "Does not write the video."
+        )
+        self.preview_btn.clicked.connect(self._preview_swap)
+        target_layout.addWidget(self.preview_btn)
         left.addWidget(target_box)
 
         options = QFrame()
@@ -552,7 +567,9 @@ class MainWindow(QMainWindow):
         self.output_edit.setText(str(video.with_name(f"{video.stem}_videoswa.mp4")))
         self._clear_faces()
         self._refresh_preview()
+        self._showing_swap = False
         self._set_status(f"Loaded {video.name}. Sample a frame, then detect faces.")
+        self._update_preview_button()
         return info
 
     def _pick_output(self) -> None:
@@ -564,17 +581,11 @@ class MainWindow(QMainWindow):
             self.output_edit.setText(path)
 
     def _on_slider(self, _value: int) -> None:
+        self._showing_swap = False
         self.time_label.setText(f"Sample frame  {format_timestamp(self._timestamp())}")
         self._preview_timer.start(120)
 
-    def _refresh_preview(self) -> None:
-        if self._video is None:
-            return
-        try:
-            frame = read_frame_at(self._video, self._timestamp())
-        except Exception as exc:
-            self.preview.setText(str(exc))
-            return
+    def _paint_preview(self, frame) -> None:
         pix = bgr_to_qpixmap(frame, max_edge=960)
         self.preview.setPixmap(
             pix.scaled(
@@ -583,6 +594,19 @@ class MainWindow(QMainWindow):
                 Qt.TransformationMode.SmoothTransformation,
             )
         )
+
+    def _refresh_preview(self) -> None:
+        if self._showing_swap and self._preview_bgr is not None:
+            self._paint_preview(self._preview_bgr)
+            return
+        if self._video is None:
+            return
+        try:
+            frame = read_frame_at(self._video, self._timestamp())
+        except Exception as exc:
+            self.preview.setText(str(exc))
+            return
+        self._paint_preview(frame)
 
     def resizeEvent(self, event) -> None:  # noqa: N802 - Qt API
         super().resizeEvent(event)
@@ -598,6 +622,7 @@ class MainWindow(QMainWindow):
             if widget is not None:
                 widget.deleteLater()
         self.face_layout.addStretch(1)
+        self._update_preview_button()
 
     def _single_mode(self) -> bool:
         return self.face_mode.currentData() == FACE_MODE_SINGLE
@@ -617,6 +642,7 @@ class MainWindow(QMainWindow):
         for card in self._cards:
             card.set_multi(not single)
             card.set_selected(single and not self.apply_all.isChecked() and card.person.index == self._selected_index)
+        self._update_preview_button()
 
     def _on_apply_all(self, _checked: bool) -> None:
         self._on_mode_changed()
@@ -627,6 +653,7 @@ class MainWindow(QMainWindow):
         self._selected_index = index
         for card in self._cards:
             card.set_selected(card.person.index == index and not self.apply_all.isChecked())
+        self._update_preview_button()
 
     def _selected_face(self):
         for card in self._cards:
@@ -664,6 +691,7 @@ class MainWindow(QMainWindow):
                 continue
             card = FaceCard(person)
             card.clicked.connect(self._select_face)
+            card.source_changed.connect(self._update_preview_button)
             self._cards.append(card)
             self.face_layout.addWidget(card)
         if self._cards:
@@ -694,16 +722,30 @@ class MainWindow(QMainWindow):
             return
         self._single_source = Path(path)
         self.single_label.setText(self._single_source.name)
+        self._update_preview_button()
 
-    def _run(self) -> None:
+    def _preview_inputs_ready(self) -> bool:
+        """True when this frame can be swapped without starting an export."""
         if self._busy or self._video is None:
-            if self._video is None:
-                QMessageBox.information(self, "No video", "Choose a target video first.")
-            return
-        output_text = self.output_edit.text().strip()
-        if not output_text:
-            QMessageBox.warning(self, "No output", "Choose where to save the MP4.")
-            return
+            return False
+        if self._single_mode():
+            if self._single_source is None:
+                return False
+            if self.apply_all.isChecked():
+                return True
+            return self._selected_face() is not None
+        return any(card.source_path is not None for card in self._cards)
+
+    def _update_preview_button(self) -> None:
+        self.preview_btn.setEnabled(self._preview_inputs_ready())
+
+    def _compose_request(self, output_path: Optional[Path] = None) -> Optional[SwapRequest]:
+        """Build the mapping request shared by preview and full export."""
+        if self._video is None:
+            QMessageBox.information(self, "No video", "Choose a target video first.")
+            return None
+        if output_path is None:
+            output_path = Path(self.output_edit.text().strip())
         sources: list[FaceSource] = []
         single: Optional[Path] = None
         selected = None
@@ -711,14 +753,14 @@ class MainWindow(QMainWindow):
         if self._single_mode():
             if self._single_source is None:
                 QMessageBox.warning(self, "No source", "Choose the source image to swap in.")
-                return
+                return None
             single = self._single_source
             apply_to_all = self.apply_all.isChecked()
             if not apply_to_all:
                 selected = self._selected_face()
                 if selected is None:
                     QMessageBox.warning(self, "No face selected", "Detect faces, then select the face to replace.")
-                    return
+                    return None
         else:
             for card in self._cards:
                 if card.source_path is None:
@@ -730,9 +772,12 @@ class MainWindow(QMainWindow):
                         label=face_label(card.person.index, card.person.face.gender),
                     )
                 )
-        request = SwapRequest(
+            if not sources:
+                QMessageBox.warning(self, "No source", "Choose a source image for at least one face.")
+                return None
+        return SwapRequest(
             video_path=self._video,
-            output_path=Path(output_text),
+            output_path=output_path,
             execution=str(self.execution.currentData()),
             enhance=self.enhance.isChecked(),
             similarity=self.similarity.value() / 100.0,
@@ -747,6 +792,63 @@ class MainWindow(QMainWindow):
             apply_to_all=apply_to_all,
             face_sources=sources,
         )
+
+    def _preview_swap(self) -> None:
+        if self._busy:
+            return
+        request = self._compose_request(Path("preview-only.mp4"))
+        if request is None:
+            return
+        try:
+            validate_request(request)
+        except VideoTooLongError as exc:
+            QMessageBox.critical(self, "Video is too long", str(exc))
+            return
+        except VideoDurationUnknownError as exc:
+            QMessageBox.critical(self, "Duration unknown", str(exc))
+            return
+        except ValueError as exc:
+            QMessageBox.warning(self, "Cannot preview", str(exc))
+            self._set_status(str(exc))
+            return
+        self._set_busy(True, cancellable=False)
+        self.progress.setRange(0, 0)
+        self.progress.setFormat("Previewing this frame…")
+        self._set_status("Swapping the sample frame…")
+        self.worker.request_preview(PreviewRequest(timestamp_s=self._timestamp(), swap=request))
+
+    def _on_preview_ready(self, image, note: str, unchanged: bool) -> None:
+        self._showing_swap = True
+        self._preview_bgr = image
+        self._paint_preview(image)
+        self.progress.setRange(0, 100)
+        self.progress.setValue(100 if not unchanged else 0)
+        self.progress.setFormat("Preview" if not unchanged else "Idle")
+        self._set_busy(False)
+        self._set_status(note)
+        if unchanged:
+            QMessageBox.warning(self, "Preview did not swap a face", note)
+
+    def _on_preview_failed(self, message: str) -> None:
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
+        self.progress.setFormat("Idle")
+        self._set_busy(False)
+        self._set_status(message)
+        QMessageBox.warning(self, "Preview failed", message)
+
+    def _run(self) -> None:
+        if self._busy or self._video is None:
+            if self._video is None:
+                QMessageBox.information(self, "No video", "Choose a target video first.")
+            return
+        output_text = self.output_edit.text().strip()
+        if not output_text:
+            QMessageBox.warning(self, "No output", "Choose where to save the MP4.")
+            return
+        request = self._compose_request()
+        if request is None:
+            return
         try:
             validate_request(request)
         except VideoTooLongError as exc:
@@ -816,6 +918,7 @@ class MainWindow(QMainWindow):
         self.run_btn.setEnabled(not busy)
         self.cancel_btn.setEnabled(busy and cancellable)
         self.execution.setEnabled(not busy)
+        self._update_preview_button()
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt API
         logger.removeHandler(self._log_handler)
