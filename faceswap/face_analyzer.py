@@ -60,7 +60,7 @@ class FaceAnalyzer:
         self,
         det_size: tuple[int, int] = (640, 640),
         use_gpu: bool = True,
-        det_thresh: float = 0.5,
+        det_thresh: float = 0.30,
         execution: str = "auto",
     ) -> None:
         self.det_size = det_size
@@ -113,7 +113,12 @@ class FaceAnalyzer:
         self._load(use_gpu=True, execution=execution)
 
     def analyze(self, image_bgr: np.ndarray) -> List[Face]:
-        """Detect every face in an image and return them sorted left-to-right."""
+        """Detect every face, including side and profile views, left to right.
+
+        Nothing is dropped for yaw. Profile detections often score under 0.5,
+        so the detector threshold defaults to 0.30 and every returned face is
+        kept for the face list and for swapping.
+        """
         if image_bgr is None or image_bgr.size == 0:
             return []
         return run_with_cuda_fallback(getattr(self, "cuda_guard", None), lambda: self._analyze_impl(image_bgr))

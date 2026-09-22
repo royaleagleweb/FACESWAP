@@ -48,6 +48,30 @@ INSWAPPER_SHA256_ALLOWLIST = (
     "a290273ed497312095dac48cdef20feec9d5208298223dd01288ab202b54bea7",
 )
 
+# DeepFaceLab XSeg, exported to ONNX. 1 means face, so the occluder is the inverse.
+# Mirrors are checked against this digest. A bad download is discarded.
+XSEG_SHA256 = "0b57328efcb839d85973164b617ceee9dfe6cfcb2c82e8a033bba9f4f09b27e5"
+XSEG_URLS = [
+    "https://github.com/yakhyo/face-segmentation/releases/download/weights/xseg.onnx",
+    "https://huggingface.co/yakhyo/uniface-weights/resolve/main/xseg.onnx",
+    "https://huggingface.co/richiebailey/faceswap/resolve/main/xseg.onnx",
+]
+
+# BiSeNet ResNet-18 face parsing, 19 CelebAMask-HQ classes, 512 input.
+BISENET_SHA256 = "0d9bd318e46987c3bdbfacae9e2c0f461cae1c6ac6ea6d43bbe541a91727e33f"
+BISENET_URLS = [
+    "https://github.com/yakhyo/face-parsing/releases/download/weights/resnet18.onnx",
+    "https://huggingface.co/yakhyo/uniface-weights/resolve/main/resnet18.onnx",
+]
+
+# Official GFPGAN v1.4 weights. PyTorch, not an ONNX / TensorRT model.
+GFPGAN_SHA256 = "e2cd4703ab14f4d01fd1383a8a8b266f9a5833dacee8e6a79d3bf21a1b6be5ad"
+GFPGAN_URLS = [
+    "https://github.com/TencentARC/GFPGAN/releases/download/v1.3.4/GFPGANv1.4.pth",
+    "https://huggingface.co/gmk123/GFPGAN/resolve/main/GFPGANv1.4.pth",
+    "https://huggingface.co/nlightcho/gfpgan_v14/resolve/main/GFPGANv1.4.pth",
+]
+
 
 def _sha256(path: Path, chunk: int = 1 << 20) -> str:
     h = hashlib.sha256()
@@ -135,6 +159,41 @@ def ensure_inswapper() -> Path:
     """Make sure inswapper_128.onnx is present locally and return its path."""
     target = MODELS_DIR / "inswapper_128.onnx"
     return download_file(INSWAPPER_URLS, target, INSWAPPER_SHA256_ALLOWLIST)
+
+
+def ensure_model(
+    urls: list[str],
+    filename: str,
+    expected_sha256: str,
+    what: str,
+) -> Optional[Path]:
+    """Download an optional weight into ``models/``. Failure leaves the swap running."""
+    target = MODELS_DIR / filename
+    try:
+        return download_file(urls, target, expected_sha256)
+    except Exception as exc:
+        logger.warning("%s was not downloaded (%s). The swap continues without it.", what, exc)
+        return None
+
+
+def ensure_gfpgan() -> Path:
+    """Download GFPGANv1.4.pth when sharpening is turned on."""
+    target = MODELS_DIR / "GFPGANv1.4.pth"
+    return download_file(GFPGAN_URLS, target, GFPGAN_SHA256)
+
+
+def optional_model_report() -> str:
+    """Which extra weights are already on disk. Does not download anything."""
+    rows = (
+        ("XSeg", MODELS_DIR / "xseg.onnx", "downloads on the first swap"),
+        ("BiSeNet", MODELS_DIR / "bisenet.onnx", "downloads when Precise edges is on"),
+        ("GFPGAN", MODELS_DIR / "GFPGANv1.4.pth", "downloads when sharpening is on"),
+    )
+    parts = []
+    for name, path, pending in rows:
+        ready = path.is_file() and path.stat().st_size > 0
+        parts.append(f"{name} ready" if ready else f"{name} {pending}")
+    return " · ".join(parts)
 
 
 def select_providers(use_gpu: bool = True, execution: str = "auto"):

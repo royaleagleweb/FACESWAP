@@ -155,7 +155,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_COVERAGE,
         help="full covers jaw and beard (default); normal is the tight face oval",
     )
-    s.add_argument("--det-thresh", type=float, default=0.5, help="Face detection threshold")
+    s.add_argument(
+        "--det-thresh",
+        type=float,
+        default=0.30,
+        help="Face detection threshold. 0.30 keeps side and profile faces that score under 0.5.",
+    )
     s.add_argument(
         "--execution",
         choices=list(EXECUTION_CHOICES),

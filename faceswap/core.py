@@ -17,6 +17,7 @@ import numpy as np
 from .coverage import DEFAULT_COVERAGE
 from .face_analyzer import Face, FaceAnalyzer, cosine_similarity
 from .providers import CudaRuntimeGuard
+from .pose import PROFILE_YAW, face_yaw
 from .quality import SourceRotation, face_span_px, lock_gender
 from .swapper import FaceSwapper
 from .utils import logger
@@ -34,6 +35,10 @@ _TRACK_MISS_LIMIT = 6
 # Similarity to the running embedding. Independent of the original reference,
 # so a turned head stays locked without accepting an orthogonal stranger.
 _TRACK_EMBED_HOLD = 0.55
+# A turned head drops both scores. Keep the lock when the landmarks are a profile.
+_PROFILE_LOCK = 0.22
+_PROFILE_REF_HOLD = 0.16
+_PROFILE_EMBED_HOLD = 0.34
 _SWITCH_MARGIN = 0.08
 _EMA_KEEP = 0.65
 
@@ -102,6 +107,18 @@ class FaceSwapEngine:
         for member in (self.analyzer, self.swapper):
             if hasattr(member, "adopt_cpu"):
                 self.cuda_guard.attach(member)
+
+    def _lock_threshold(self, face: Face) -> float:
+        """First-lock cosine. Profile faces clear a lower bar than frontal ones."""
+        if abs(face_yaw(face.kps)) >= PROFILE_YAW:
+            return min(float(self.similarity_threshold), _PROFILE_LOCK)
+        return float(self.similarity_threshold)
+
+    def _hold_limits(self, face: Face) -> tuple[float, float]:
+        """Reference floor and running-embedding floor for a face already locked."""
+        if abs(face_yaw(face.kps)) >= PROFILE_YAW:
+            return min(self.hold_similarity(), _PROFILE_REF_HOLD), _PROFILE_EMBED_HOLD
+        return self.hold_similarity(), _TRACK_EMBED_HOLD
 
     def hold_similarity(self) -> float:
         """Similarity that keeps an already locked person from reverting."""
@@ -201,7 +218,7 @@ class FaceSwapEngine:
         fresh: list[tuple[float, float, Face, FaceMapping]] = []
         for face in faces:
             scores = ranked[id(face)]
-            if not scores or scores[0][0] < self.similarity_threshold:
+            if not scores or scores[0][0] < self._lock_threshold(face):
                 continue
             fresh.append((scores[0][0], face.area, face, scores[0][1]))
         fresh.sort(key=lambda item: (item[0], item[1]), reverse=True)
@@ -263,7 +280,7 @@ class FaceSwapEngine:
                 return track.mapping
         if id(best) in claimed:
             for sim, mapping in scores:
-                if sim < self.similarity_threshold:
+                if sim < self._lock_threshold(face):
                     break
                 if id(mapping) not in claimed:
                     return mapping
@@ -278,12 +295,13 @@ class FaceSwapEngine:
         if mapping.reference_face is not None and id(mapping) in claimed:
             return None
         emb_sim = cosine_similarity(track.embedding, face.normed_embedding)
+        ref_need, emb_need = self._hold_limits(face)
         if mapping.reference_face is None:
-            return mapping if emb_sim >= _TRACK_EMBED_HOLD else None
+            return mapping if emb_sim >= emb_need else None
         ref_sim = cosine_similarity(mapping.reference_face.normed_embedding, face.normed_embedding)
         # Pose change: the reference score dips, but the running embedding still
-        # matches. An orthogonal stranger fails both tests and stays original.
-        if ref_sim >= self.hold_similarity() or emb_sim >= _TRACK_EMBED_HOLD:
+        # matches. A profile lowers both floors. An orthogonal stranger still fails.
+        if ref_sim >= ref_need or emb_sim >= emb_need:
             return mapping
         return None
 

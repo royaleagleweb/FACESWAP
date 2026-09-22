@@ -4,10 +4,8 @@
 punches out objects that do not match the face color (a lollipop, food, a
 hand that is not the same color as the cheek). When ``models/xseg.onnx`` is
 present it is an extra XSeg pass, warped back into that face region only.
-``models/bisenet.onnx`` is optional and stays off unless precise edges are on.
-
-Neither file is downloaded from FaceFusion. Drop a compatible ONNX model in
-``models/`` or leave the built-in mask, which still runs.
+The file is downloaded into ``models/xseg.onnx`` on the first swap.
+``models/bisenet.onnx`` downloads only when precise edges are on.
 """
 
 from __future__ import annotations
@@ -19,7 +17,7 @@ import cv2
 import numpy as np
 
 from .coverage import coverage_alpha, face_axes
-from .utils import MODELS_DIR, logger
+from .utils import logger
 
 XSEG_FILENAME = "xseg.onnx"
 BISENET_FILENAME = "bisenet.onnx"
@@ -34,6 +32,7 @@ def _occ_mask(
     *,
     neural: Optional[np.ndarray] = None,
     precise: Optional[np.ndarray] = None,
+    yaw: float = 0.0,
 ) -> np.ndarray:
     """Swap weight for one face. 1 replaces, 0 keeps the original.
 
@@ -41,7 +40,7 @@ def _occ_mask(
     ``neural`` and ``precise`` are optional face-sized maps (1 = occluder for
     neural, 1 = keep for precise) already warped into the frame.
     """
-    alpha = coverage_alpha(frame_bgr.shape[:2], kps, coverage)
+    alpha = coverage_alpha(frame_bgr.shape[:2], kps, coverage, yaw=yaw)
     if float(alpha.max()) <= 0.0:
         return alpha
     keepout = _color_objects(frame_bgr, alpha, kps)
@@ -133,8 +132,9 @@ def warp_into_face(
 class OcclusionModels:
     """Optional XSeg and BiSeNet sessions on the same provider chain as InSwapper."""
 
-    def __init__(self, execution: str = "auto") -> None:
+    def __init__(self, execution: str = "auto", *, precise: bool = False) -> None:
         self.execution = execution
+        self.precise = bool(precise)
         self.xseg = None
         self.bisenet = None
         self.xseg_note = ""
@@ -142,10 +142,16 @@ class OcclusionModels:
         self._load()
 
     def _load(self) -> None:
-        self.xseg, self.xseg_note = _optional_session(MODELS_DIR / XSEG_FILENAME, self.execution, "XSeg")
-        self.bisenet, self.bisenet_note = _optional_session(
-            MODELS_DIR / BISENET_FILENAME, self.execution, "BiSeNet"
-        )
+        from .utils import BISENET_SHA256, BISENET_URLS, XSEG_SHA256, XSEG_URLS, ensure_model
+
+        xseg_path = ensure_model(XSEG_URLS, XSEG_FILENAME, XSEG_SHA256, "XSeg")
+        self.xseg, self.xseg_note = _optional_session(xseg_path, self.execution, "XSeg")
+        if not self.precise:
+            self.bisenet = None
+            self.bisenet_note = ""
+            return
+        bisenet_path = ensure_model(BISENET_URLS, BISENET_FILENAME, BISENET_SHA256, "BiSeNet")
+        self.bisenet, self.bisenet_note = _optional_session(bisenet_path, self.execution, "BiSeNet")
 
     @property
     def status(self) -> str:
@@ -183,14 +189,14 @@ class OcclusionModels:
         return warp_into_face(mask, matrix, frame_bgr.shape[:2], face_alpha)
 
 
-def _optional_session(path: Path, execution: str, label: str):
-    if not path.is_file():
+def _optional_session(path: Optional[Path], execution: str, label: str):
+    if path is None or not path.is_file():
         note = (
-            f"{label} file not in {path.name}. "
+            f"{label} is not on disk yet. "
             + (
                 "Built-in object mask is on."
                 if label == "XSeg"
-                else "Precise edges stay off until that file is added."
+                else "Precise edges stay off until the download succeeds."
             )
         )
         logger.info(note)
@@ -209,6 +215,10 @@ def _optional_session(path: Path, execution: str, label: str):
 
 def _input_hw(session) -> tuple[int, int]:
     shape = session.get_inputs()[0].shape
+    if len(shape) == 4 and shape[-1] == 3:
+        height = shape[1] if isinstance(shape[1], int) else 256
+        width = shape[2] if isinstance(shape[2], int) else 256
+        return int(height), int(width)
     height = shape[2] if len(shape) > 2 and isinstance(shape[2], int) else 256
     width = shape[3] if len(shape) > 3 and isinstance(shape[3], int) else 256
     return int(height), int(width)
@@ -226,30 +236,54 @@ def _warp_crop(frame_bgr: np.ndarray, matrix: np.ndarray, hw: tuple[int, int]) -
     return crop
 
 
+# CelebAMask-HQ labels that belong on the swapped face, including ears and hair
+# so a side view is not cut off at the cheek.
+_BISE_KEEP = {1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 17}
+_IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+_IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
+
 def _session_mask(session, crop_bgr: np.ndarray, *, occluder: bool) -> Optional[np.ndarray]:
     try:
-        blob = cv2.dnn.blobFromImage(
-            crop_bgr, scalefactor=1 / 255.0, size=(crop_bgr.shape[1], crop_bgr.shape[0]), swapRB=True
-        )
+        blob = _model_input(session, crop_bgr, imagenet=not occluder)
         name = session.get_inputs()[0].name
         output = session.run(None, {name: blob})[0]
     except Exception as exc:
         logger.warning("Occlusion model failed: %s", exc)
         return None
     array = np.asarray(output)
+    if not occluder and array.ndim == 4 and array.shape[1] >= 19:
+        classes = np.argmax(array[0], axis=0).astype(np.int32)
+        keep = np.isin(classes, list(_BISE_KEEP)).astype(np.float32)
+        return keep
     if array.ndim == 4:
         array = array[0]
     if array.ndim == 3 and array.shape[0] <= 32:
-        # NCHW class map. Channel 0 is the occluder when that is how the net was trained.
-        if occluder:
-            mask = array[0]
-        else:
-            mask = array[1:].max(axis=0) if array.shape[0] > 1 else array[0]
+        mask = array[0] if occluder else (array[1:].max(axis=0) if array.shape[0] > 1 else array[0])
     elif array.ndim == 3:
         mask = array[:, :, 0]
     else:
         mask = array
     mask = mask.astype(np.float32)
-    if float(mask.max()) > 1.5:
+    if float(np.nanmax(mask)) > 1.5:
         mask = mask / 255.0
-    return np.clip(mask, 0.0, 1.0)
+    mask = np.clip(mask, 0.0, 1.0)
+    # The shipped XSeg file is a face mask (1 = face). Punch out the rest.
+    if occluder:
+        mask = 1.0 - mask
+    return mask
+
+
+def _model_input(session, crop_bgr: np.ndarray, *, imagenet: bool) -> np.ndarray:
+    """NHWC BGR for XSeg, NCHW RGB for BiSeNet."""
+    shape = session.get_inputs()[0].shape
+    height, width = _input_hw(session)
+    if len(shape) == 4 and shape[-1] == 3:
+        image = cv2.resize(crop_bgr, (width, height), interpolation=cv2.INTER_LINEAR)
+        return (image.astype(np.float32) / 255.0)[None, ...]
+    rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
+    image = cv2.resize(rgb, (width, height), interpolation=cv2.INTER_LINEAR).astype(np.float32) / 255.0
+    if imagenet:
+        image = (image - _IMAGENET_MEAN) / _IMAGENET_STD
+    chw = np.transpose(image, (2, 0, 1))
+    return chw[None, ...].astype(np.float32)

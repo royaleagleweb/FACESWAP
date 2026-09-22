@@ -34,6 +34,8 @@ from PySide6.QtWidgets import (
 )
 
 from faceswap.face_analyzer import face_label
+from faceswap.pose import face_yaw, pose_name
+from faceswap.utils import optional_model_report
 from faceswap.swapper import gfpgan_install_tip
 from faceswap.utils import logger
 from faceswap.video import (
@@ -102,6 +104,10 @@ class FaceCard(QFrame):
         column = QVBoxLayout()
         self.title = QLabel(face_label(person.index, person.face.gender))
         self.title.setObjectName("CardTitle")
+        self._pose = pose_name(face_yaw(person.face.kps))
+        self.pose_label = QLabel("" if self._pose == "Front" else f"{self._pose} — included")
+        self.pose_label.setObjectName("Muted")
+        self.pose_label.setVisible(self._pose != "Front")
         self.hint = QLabel("Click to select")
         self.hint.setObjectName("Muted")
         self.source_label = QLabel("No source image — this person stays unchanged")
@@ -119,6 +125,7 @@ class FaceCard(QFrame):
         buttons.addWidget(self.clear_btn)
         buttons.addStretch(1)
         column.addWidget(self.title)
+        column.addWidget(self.pose_label)
         column.addWidget(self.hint)
         column.addWidget(self.source_label)
         column.addLayout(buttons)
@@ -322,13 +329,13 @@ class MainWindow(QMainWindow):
         self.object_mask.setChecked(True)
         self.object_mask.setToolTip(
             "On for every normal swap. Keeps lollipops, food, and hands when they "
-            "cover the face. Uses models/xseg.onnx when that file is present, and "
-            "the built-in mask otherwise. The mask is warped to the face only."
+            "cover the face. XSeg downloads into models/xseg.onnx on the first swap. "
+            "Until then the built-in mask runs. The mask stays inside the face."
         )
         self.precise_edges = QCheckBox("Precise edges (BiSeNet)")
         self.precise_edges.setChecked(False)
         self.precise_edges.setToolTip(
-            "Off by default. Turn on for a tighter hairline when models/bisenet.onnx is installed."
+            "Off by default. Turning it on downloads models/bisenet.onnx and tightens the hairline."
         )
         self.fast_draft = QCheckBox("Fast draft in preview")
         self.fast_draft.setChecked(True)
@@ -345,6 +352,10 @@ class MainWindow(QMainWindow):
         form.addWidget(self.precise_edges)
         form.addWidget(self.fast_draft)
         form.addWidget(self.detect_every)
+        self.model_status = QLabel(optional_model_report())
+        self.model_status.setWordWrap(True)
+        self.model_status.setObjectName("Muted")
+        form.addWidget(self.model_status)
         self.fast_draft_btn = QPushButton("⚡ Fast draft")
         self.fast_draft_btn.setToolTip("Restore off, precise edges off, object mask on.")
         self.fast_draft_btn.clicked.connect(self._apply_fast_draft)
@@ -399,7 +410,7 @@ class MainWindow(QMainWindow):
         self.enhance.setToolTip(
             install_tip
             or "Optional, and off by default. Turn this on when the swap looks soft. "
-            "The first enhanced swap downloads GFPGANv1.4.pth into models/."
+            "Faces under 96px are skipped. The first enhanced swap downloads GFPGANv1.4.pth."
         )
         self.enhance.toggled.connect(self._on_enhance_toggled)
         form.addWidget(self.keep_audio)
@@ -509,6 +520,10 @@ class MainWindow(QMainWindow):
         right.addWidget(self.single_btn)
         right.addWidget(self.single_label)
         right.addWidget(self.apply_all)
+        self.assignment = QLabel("Side and profile faces are listed with the others when they are detected.")
+        self.assignment.setWordWrap(True)
+        self.assignment.setObjectName("Muted")
+        right.addWidget(self.assignment)
 
         self.face_host = QWidget()
         self.face_layout = QVBoxLayout(self.face_host)
@@ -611,6 +626,8 @@ class MainWindow(QMainWindow):
     def _set_status(self, text: str) -> None:
         self.status.setText(text)
         self._append_log(text)
+        if hasattr(self, "model_status"):
+            self.model_status.setText(optional_model_report())
 
     def _append_log(self, text: str) -> None:
         self.log.appendPlainText(text)
@@ -709,6 +726,7 @@ class MainWindow(QMainWindow):
                 widget.deleteLater()
         self.face_layout.addStretch(1)
         self._update_preview_button()
+        self._refresh_assignment()
 
     def _single_mode(self) -> bool:
         return self.face_mode.currentData() == FACE_MODE_SINGLE
@@ -729,6 +747,7 @@ class MainWindow(QMainWindow):
             card.set_multi(not single)
             card.set_selected(single and not self.apply_all.isChecked() and card.person.index == self._selected_index)
         self._update_preview_button()
+        self._refresh_assignment()
 
     def _on_apply_all(self, _checked: bool) -> None:
         self._on_mode_changed()
@@ -740,6 +759,37 @@ class MainWindow(QMainWindow):
         for card in self._cards:
             card.set_selected(card.person.index == index and not self.apply_all.isChecked())
         self._update_preview_button()
+        self._refresh_assignment()
+
+    def _refresh_assignment(self) -> None:
+        """Person readout such as ``Face 1 ♂ → alice.jpg``. Side faces stay in the list."""
+        if not hasattr(self, "assignment"):
+            return
+        if not self._cards:
+            self.assignment.setText("Side and profile faces are listed with the others when they are detected.")
+            return
+        parts = []
+        if self._single_mode():
+            card = next((item for item in self._cards if item.person.index == self._selected_index), None)
+            if card is None:
+                self.assignment.setText("")
+                return
+            mark = gender_mark(card.person.face.gender)
+            pose = "" if card._pose == "Front" else f" {card._pose}"
+            who = f"Face {card.person.index + 1}{pose} {mark}".strip()
+            if self._single_source is None:
+                self.assignment.setText(f"{who} → choose a source")
+                return
+            target = "every face" if self.apply_all.isChecked() else who
+            self.assignment.setText(f"{target} → {self._single_source.name}")
+            return
+        for card in self._cards:
+            if card.source_path is None:
+                continue
+            mark = gender_mark(card.person.face.gender)
+            pose = "" if card._pose == "Front" else f" {card._pose}"
+            parts.append(f"Face {card.person.index + 1}{pose} {mark} → {card.source_path.name}".replace("  ", " "))
+        self.assignment.setText(" · ".join(parts) if parts else "Choose a source on each face you want to replace.")
 
     def _selected_face(self):
         for card in self._cards:
@@ -778,6 +828,7 @@ class MainWindow(QMainWindow):
             card = FaceCard(person)
             card.clicked.connect(self._select_face)
             card.source_changed.connect(self._update_preview_button)
+            card.source_changed.connect(self._refresh_assignment)
             self._cards.append(card)
             self.face_layout.addWidget(card)
         if self._cards:
@@ -809,6 +860,7 @@ class MainWindow(QMainWindow):
         self._single_source = Path(path)
         self.single_label.setText(self._single_source.name)
         self._update_preview_button()
+        self._refresh_assignment()
 
     def _preview_inputs_ready(self) -> bool:
         """True when this frame can be swapped without starting an export."""

@@ -105,6 +105,8 @@ def test_window_loads_short_video(tmp_path: Path) -> None:
         assert window.min_face.value() == 0
         assert window.compare_slider.value() == 50
         assert window.compare_slider.isEnabled() is False
+        assert "XSeg" in window.model_status.text()
+        assert window.assignment.text()
         assert window.output_edit.text().endswith("_videoswa.mp4")
         assert window.time_slider.isEnabled()
         app.processEvents()

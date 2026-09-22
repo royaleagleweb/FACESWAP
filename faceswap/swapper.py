@@ -13,6 +13,7 @@ import numpy as np
 from .coverage import DEFAULT_COVERAGE, coverage_alpha, normalize_coverage, paste_swapped_face
 from .face_analyzer import Face
 from .occlusion import _occ_mask
+from .pose import face_yaw, repair_landmarks
 from .quality import RESTORE_MIN_PX, face_span_px
 from .providers import (
     active_providers_from_sessions,
@@ -126,10 +127,16 @@ class FaceSwapper:
         self._color_key = None
 
     def occlusion_models(self):
-        if self._occlusion is None or getattr(self._occlusion, "execution", None) != self.execution:
+        precise = bool(self.precise_edges)
+        current = self._occlusion
+        if (
+            current is None
+            or getattr(current, "execution", None) != self.execution
+            or getattr(current, "precise", False) != precise
+        ):
             from .occlusion import OcclusionModels
 
-            self._occlusion = OcclusionModels(self.execution)
+            self._occlusion = OcclusionModels(self.execution, precise=precise)
         return self._occlusion
 
     def swap(
@@ -149,6 +156,12 @@ class FaceSwapper:
         # uses .kps and .normed_embedding. We pass a small shim.
         src_shim = _FaceShim(source_face)
         tgt_shim = _FaceShim(target_face)
+        # Profile landmarks collapse the far eye. Repair them before InSwapper
+        # builds the frontal crop, and keep that same set for the paste.
+        raw_kps = np.asarray(target_face.kps, dtype=np.float32)
+        yaw = float(face_yaw(raw_kps))
+        align_kps = repair_landmarks(raw_kps)
+        tgt_shim.kps = align_kps
         # paste_back=False returns the 128px swap plus the frame→crop matrix.
         # Videoswa composites that itself so the beard is not cropped off.
         swapped, matrix = run_with_cuda_fallback(
@@ -161,17 +174,18 @@ class FaceSwapper:
         alpha = None
         if self.object_mask:
             models = self.occlusion_models()
-            face_alpha = coverage_alpha(frame.shape[:2], target_face.kps, mode)
+            face_alpha = coverage_alpha(frame.shape[:2], align_kps, mode, yaw=yaw)
             neural = models.xseg_keepout(frame, matrix, face_alpha) if models.xseg is not None else None
             precise = None
             if self.precise_edges and models.bisenet is not None:
                 precise = models.bisenet_keep(frame, matrix, face_alpha)
             alpha = _occ_mask(
                 frame,
-                target_face.kps,
+                align_kps,
                 mode,
                 neural=neural,
                 precise=precise,
+                yaw=yaw,
             )
         previous = self.color_memory.get(self._color_key) if self._color_key is not None else None
         color_state: dict = {}
@@ -179,8 +193,9 @@ class FaceSwapper:
             frame,
             swapped,
             matrix,
-            target_face.kps,
+            align_kps,
             coverage=mode,
+            yaw=yaw,
             alpha=alpha,
             previous_delta=previous,
             color_state=color_state,
@@ -248,12 +263,9 @@ def _try_load_gfpgan(use_gpu: bool):
 
 
 def _ensure_gfpgan_weights() -> Path:
-    from .utils import MODELS_DIR, download_file
-    target = MODELS_DIR / "GFPGANv1.4.pth"
-    urls = [
-        "https://github.com/TencentARC/GFPGAN/releases/download/v1.3.4/GFPGANv1.4.pth",
-    ]
-    return download_file(urls, target, expected_sha256=None)
+    from .utils import ensure_gfpgan
+
+    return ensure_gfpgan()
 
 
 def _enhance_bbox(bbox: np.ndarray, coverage: str) -> np.ndarray:

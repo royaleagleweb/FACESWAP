@@ -36,12 +36,15 @@ there for scripts (`python run.py swap ...`).
 
 **Object mask (XSeg)** is on for every normal swap, including preview. It
 keeps a lollipop, food, or a hand that covers the face, and it is warped into
-the face polygon only. The built-in color mask always runs. If you place
-`models/xseg.onnx` next to InSwapper, that network is an extra pass on the
-same TensorRT → CUDA → DirectML → CPU chain. Videoswa does not download it.
-**Precise edges (BiSeNet)** stays off unless you turn it on and add
-`models/bisenet.onnx`. **Fast draft in preview** skips GFPGAN and BiSeNet and
-leaves the object mask on. **⚡ Fast draft** sets that same combination.
+the face polygon only. The built-in color mask always runs. The first swap
+downloads `models/xseg.onnx` (SHA256
+`0b57328efcb839d85973164b617ceee9dfe6cfcb2c82e8a033bba9f4f09b27e5`) and runs
+it on the same TensorRT → CUDA → DirectML → CPU chain. If that download
+fails, the built-in mask still runs. **Precise edges (BiSeNet)** stays off
+until you turn it on, which downloads `models/bisenet.onnx` (SHA256
+`0d9bd318e46987c3bdbfacae9e2c0f461cae1c6ac6ea6d43bbe541a91727e33f`).
+**Fast draft in preview** skips GFPGAN and BiSeNet and leaves the object
+mask on. **⚡ Fast draft** sets that same combination.
 **Detect every 2nd frame** is on for a full export and off for the one-frame
 preview. **Min face size** defaults to 0 so small faces still swap; raise it
 (64 is a reasonable crowd cutoff) to ignore background faces.
@@ -334,7 +337,14 @@ frame, including when the head turns a little.
   embedding is still that person, so a brief pose change does not flicker
   back to the original clip. A different person in that box is not swapped.
 - **Sharpen swapped faces (GFPGAN)** stays off. Turn it on when the result
-  looks soft. Faces smaller than 96px are left unrestored.
+  looks soft. Faces smaller than 96px are left unrestored. The weights are
+  `models/GFPGANv1.4.pth` (SHA256
+  `e2cd4703ab14f4d01fd1383a8a8b266f9a5833dacee8e6a79d3bf21a1b6be5ad`),
+  downloaded the first time sharpening runs. GFPGAN is PyTorch, not TensorRT.
+- **Side and profile faces are swapped.** Detection uses a 0.30 score so a
+  high-yaw face is not dropped, the face list still shows it, and the paste
+  widens the cheek and jaw on that side. A person who turns their head keeps
+  the same source.
 - **Object mask** stays on. It punches out a lollipop or food that does not
   match the face color, and it leaves a wide beard under the mouth in place.
   Gender is locked from the first five detections of each person, so one
@@ -373,7 +383,18 @@ accepted. If every mirror fails, the error lists each URL, the hash it
 produced, and the hashes Videoswa will accept.
 
 You can place `inswapper_128.onnx` in `models/` yourself when it matches one
-of those hashes and the download is skipped. Override directories with
+of those hashes and the download is skipped. The same folder receives the
+optional weights on first use:
+
+| File | When | SHA256 |
+| --- | --- | --- |
+| `models/xseg.onnx` | First swap (object mask) | `0b57328efcb839d85973164b617ceee9dfe6cfcb2c82e8a033bba9f4f09b27e5` |
+| `models/bisenet.onnx` | Precise edges is on | `0d9bd318e46987c3bdbfacae9e2c0f461cae1c6ac6ea6d43bbe541a91727e33f` |
+| `models/GFPGANv1.4.pth` | Sharpening is on | `e2cd4703ab14f4d01fd1383a8a8b266f9a5833dacee8e6a79d3bf21a1b6be5ad` |
+
+The window lists each one as ready or waiting to download. A failed download
+does not stop the swap: the built-in object mask still runs, and sharpening
+stays off if GFPGAN cannot be fetched. Override directories with
 `FACESWAP_MODELS_DIR`, `FACESWAP_TEMP_DIR`, and `FACESWAP_OUTPUTS_DIR`.
 
 ## Programmatic use

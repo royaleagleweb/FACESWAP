@@ -94,20 +94,30 @@ def _pt(origin: np.ndarray, down_u: np.ndarray, side_u: np.ndarray, along: float
     return origin + down_u * along + side_u * lateral
 
 
-def coverage_polygon(kps: np.ndarray, coverage: str = DEFAULT_COVERAGE) -> Optional[np.ndarray]:
-    """Landmark polygon covering forehead, cheeks, jaw, and beard or a tight oval."""
+def coverage_polygon(
+    kps: np.ndarray,
+    coverage: str = DEFAULT_COVERAGE,
+    yaw: float = 0.0,
+) -> Optional[np.ndarray]:
+    """Landmark polygon covering forehead, cheeks, jaw, and beard or a tight oval.
+
+    ``yaw`` is the signed profile amount from ``face_yaw``. A side view extends
+    the cheek and jaw, and shifts the polygon toward the nose so the leading
+    cheek is inside the swap.
+    """
     axes = face_axes(kps)
     if axes is None:
         return None
     eye_c, mouth_c, down_u, side_u, em, eye_dist = axes
     mode = normalize_coverage(coverage)
+    profile = float(np.clip(abs(float(yaw)) / 0.75, 0.0, 1.0))
     if mode == COVERAGE_FULL:
-        depth = FULL_BEARD_DEPTH_EM * em
-        jaw = FULL_JAW_WIDTH * eye_dist
-        cheek = 0.90 * eye_dist
-        temple = 0.72 * eye_dist
+        depth = FULL_BEARD_DEPTH_EM * em * (1.0 + 0.35 * profile)
+        jaw = FULL_JAW_WIDTH * eye_dist * (1.0 + 0.65 * profile)
+        cheek = 0.90 * eye_dist * (1.0 + 0.45 * profile)
+        temple = 0.72 * eye_dist * (1.0 + 0.25 * profile)
         forehead = 1.05 * em
-        beard_w = 0.72 * eye_dist
+        beard_w = 0.72 * eye_dist * (1.0 + 0.50 * profile)
     else:
         depth = NORMAL_BEARD_DEPTH_EM * em
         jaw = NORMAL_JAW_WIDTH * eye_dist
@@ -132,14 +142,22 @@ def coverage_polygon(kps: np.ndarray, coverage: str = DEFAULT_COVERAGE) -> Optio
             _pt(eye_c, down_u, side_u, -forehead * 0.75, temple),
         ]
     )
+    if profile > 0.0:
+        shift = float(np.clip(yaw, -1.0, 1.0)) * (0.35 * profile) * eye_dist
+        pts = pts + side_u * shift
     return pts
 
 
-def coverage_alpha(shape: tuple[int, int], kps: np.ndarray, coverage: str = DEFAULT_COVERAGE) -> np.ndarray:
+def coverage_alpha(
+    shape: tuple[int, int],
+    kps: np.ndarray,
+    coverage: str = DEFAULT_COVERAGE,
+    yaw: float = 0.0,
+) -> np.ndarray:
     """Float mask in ``[0, 1]``. The beard interior is 1; only the rim is soft."""
     height, width = shape
     alpha = np.zeros((height, width), dtype=np.float32)
-    polygon = coverage_polygon(kps, coverage)
+    polygon = coverage_polygon(kps, coverage, yaw=yaw)
     axes = face_axes(kps)
     if polygon is None or axes is None:
         return alpha
@@ -196,6 +214,7 @@ def paste_swapped_face(
     alpha: Optional[np.ndarray] = None,
     previous_delta: Optional[np.ndarray] = None,
     color_state: Optional[dict] = None,
+    yaw: float = 0.0,
 ) -> np.ndarray:
     """Blend ``swapped_bgr`` (the 128px InSwapper output) onto ``frame_bgr``.
 
@@ -206,7 +225,7 @@ def paste_swapped_face(
         return frame_bgr
     matrix = orient_paste_matrix(matrix, kps, size=int(swapped_bgr.shape[0]))
     if alpha is None:
-        alpha = coverage_alpha(frame_bgr.shape[:2], kps, mode)
+        alpha = coverage_alpha(frame_bgr.shape[:2], kps, mode, yaw=yaw)
     if float(alpha.max()) <= 0.0:
         return frame_bgr
 
