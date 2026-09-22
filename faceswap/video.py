@@ -180,23 +180,72 @@ def assert_duration_allowed(
 
 
 def read_frame_at(path: Path, timestamp_s: float) -> np.ndarray:
-    """Return one BGR frame at ``timestamp_s``."""
+    """Return one BGR frame at ``timestamp_s``.
+
+    The frame index is used instead of a millisecond seek. ``CAP_PROP_POS_MSEC``
+    often stays on frame 0, so a face that first appears on frame 10 was missed.
+    """
     cap = cv2.VideoCapture(str(path))
     if not cap.isOpened():
         raise RuntimeError(f"Could not open video: {path}")
     try:
         fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0) or 30.0
-        target = max(0.0, float(timestamp_s))
-        cap.set(cv2.CAP_PROP_POS_MSEC, target * 1000.0)
-        ok, frame = cap.read()
-        if not ok or frame is None:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, int(round(fps * target))))
+        count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        index = int(round(max(0.0, float(timestamp_s)) * fps))
+        if count > 0:
+            index = min(index, max(0, count - 1))
+    finally:
+        cap.release()
+    try:
+        return read_frame_index(path, index)
+    except RuntimeError as exc:
+        raise RuntimeError(f"Could not read a frame at {format_timestamp(timestamp_s)}") from exc
+
+
+def read_frame_index(path: Path, index: int) -> np.ndarray:
+    """Return frame ``index``. If the seek is ignored, decode forward from 0."""
+    cap = cv2.VideoCapture(str(path))
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open video: {path}")
+    index = max(0, int(index))
+    try:
+        if index == 0:
             ok, frame = cap.read()
+        else:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, index)
+            ok, frame = cap.read()
+            if not ok or frame is None or _same_as_first_frame(path, frame):
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                frame = _read_forward(cap, index)
+                ok = frame is not None
     finally:
         cap.release()
     if not ok or frame is None:
-        raise RuntimeError(f"Could not read a frame at {format_timestamp(timestamp_s)}")
+        raise RuntimeError(f"Could not read frame {index} from {path}")
     return frame
+
+
+def _read_forward(cap: cv2.VideoCapture, index: int) -> Optional[np.ndarray]:
+    frame = None
+    for _ in range(index + 1):
+        ok, frame = cap.read()
+        if not ok or frame is None:
+            return None
+    return frame
+
+
+def _same_as_first_frame(path: Path, frame: np.ndarray) -> bool:
+    """True when a seek returned frame 0 again. Some MP4s ignore POS_FRAMES."""
+    cap = cv2.VideoCapture(str(path))
+    if not cap.isOpened():
+        return False
+    try:
+        ok, first = cap.read()
+    finally:
+        cap.release()
+    if not ok or first is None or first.shape != frame.shape:
+        return False
+    return bool(np.array_equal(first, frame))
 
 
 def grab_first_frame(path: Path) -> Optional[np.ndarray]:

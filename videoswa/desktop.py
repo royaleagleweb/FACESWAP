@@ -964,6 +964,7 @@ class MainWindow(QMainWindow):
                 det_size=int(self.detector_size.value()),
                 det_thresh=self._det_thresh(),
                 auto_seek=True,
+                fps=float(self._info.fps or 30.0),
             )
         )
 
@@ -988,7 +989,10 @@ class MainWindow(QMainWindow):
         stretch = self.face_layout.takeAt(self.face_layout.count() - 1)
         del stretch
         if not people:
-            empty = QLabel("No faces at this timestamp. Move the slider and detect again.")
+            empty = QLabel(
+                "No faces on this sample. Move the ref-frame slider to a clearer moment, "
+                "or lower Min face size."
+            )
             empty.setObjectName("Muted")
             self.face_layout.addWidget(empty)
         for person in people:
@@ -1018,10 +1022,10 @@ class MainWindow(QMainWindow):
         if not found:
             QMessageBox.warning(
                 self,
-                "No faces found",
+                "Move the ref-frame slider",
                 note
                 or (
-                    "No faces at this frame. Move the slider, use a clearer shot, "
+                    "No faces on this sample frame. Move the ref-frame slider until a face is visible, "
                     "or lower Min face size and Detect sensitivity."
                 ),
             )

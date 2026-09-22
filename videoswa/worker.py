@@ -20,7 +20,7 @@ from faceswap.providers import format_providers, provider_status_text, tensorrt_
 from faceswap.quality import resolve_quality
 from faceswap.swapper import FaceSwapper
 from faceswap.utils import logger
-from faceswap.video import SwapCancelled, process_video, read_frame_at, reset_stats, swap_frame
+from faceswap.video import SwapCancelled, process_video, read_frame_at, read_frame_index, reset_stats, swap_frame
 from videoswa.images import crop_face
 from videoswa.jobs import MIN_ROI_CHANGE, SwapRequest, build_mappings, read_image, roi_mean_change
 
@@ -46,24 +46,43 @@ def _quality_note(stats: SwapStats) -> str:
     return "Audio is kept when Keep audio is on and FFmpeg can read the file."
 
 
-def seek_times(current_s: float, duration_s: float, limit: int = 8) -> list[float]:
-    """Nearby timestamps to try when the current frame has no face."""
+def seek_times(
+    current_s: float,
+    duration_s: float,
+    fps: float = 30.0,
+    limit: int = 12,
+) -> list[float]:
+    """Timestamps to try when the current sample frame has no face.
+
+    The list always prefers frame +10 after the current frame. VERSA.mp4 is
+    empty on frame 0 and has a face on frame 10. ±0.5s, ±1s, and the middle
+    of the clip are included after that.
+    """
+    rate = max(1.0, float(fps or 30.0))
     duration = max(0.0, float(duration_s))
-    current = min(max(0.0, float(current_s)), duration)
-    offsets = (0.0, 0.4, -0.4, 0.8, -0.8, 1.5, -1.5, 2.5, -2.5, 4.0, -4.0, 8.0, -8.0)
-    raw = [current + offset for offset in offsets]
-    raw.append(duration * 0.5)
-    raw.append(max(0.0, duration - 0.2))
-    times: list[float] = []
-    for value in raw:
-        if value < -1e-3 or value > duration + 1e-3:
-            continue
-        stamped = round(min(max(0.0, value), duration), 3)
-        if stamped not in times:
-            times.append(stamped)
-        if len(times) >= limit:
+    current = max(0.0, float(current_s))
+    if duration > 0.0:
+        current = min(current, duration)
+    current_frame = int(round(current * rate))
+    max_frame = int(round(duration * rate)) if duration > 0.0 else max(current_frame, 10)
+    half = max(1, int(round(0.5 * rate)))
+    one = max(1, int(round(1.0 * rate)))
+    offsets = (0, 10, 5, 15, -10, -5, half, -half, one, -one, 30, -30, 2, -2)
+    frames: list[int] = []
+    for offset in offsets:
+        index = current_frame + int(offset)
+        if 0 <= index <= max_frame and index not in frames:
+            frames.append(index)
+        if len(frames) >= limit:
             break
-    return times or [current]
+    if len(frames) < limit and duration > 0.0:
+        mid = int(round((duration * rate) / 2.0))
+        mid = min(max(0, mid), max_frame)
+        if mid not in frames:
+            frames.append(mid)
+    if not frames:
+        frames = [0]
+    return [round(index / rate, 3) for index in frames[:limit]]
 
 
 @dataclass
@@ -75,6 +94,7 @@ class DetectRequest:
     det_size: int = 640
     det_thresh: float = 0.30
     auto_seek: bool = True
+    fps: float = 30.0
 
 
 @dataclass
@@ -229,15 +249,24 @@ class EngineWorker(QThread):
         engine = self._engine_for(job.execution, enhance=False)
         self._apply_detector(engine, job.det_size, job.det_thresh)
         self.status.emit("Detecting faces…")
-        times = seek_times(job.timestamp_s, job.duration_s) if job.auto_seek else [float(job.timestamp_s)]
+        fps = max(1.0, float(job.fps or 30.0))
+        times = (
+            seek_times(job.timestamp_s, job.duration_s, fps=fps)
+            if job.auto_seek
+            else [float(job.timestamp_s)]
+        )
         found_time = float(job.timestamp_s)
         frame = None
         faces = []
         for timestamp in times:
+            index = int(round(float(timestamp) * fps))
             try:
-                candidate = read_frame_at(Path(job.video_path), timestamp)
+                candidate = read_frame_index(Path(job.video_path), index)
             except Exception:
-                continue
+                try:
+                    candidate = read_frame_at(Path(job.video_path), timestamp)
+                except Exception:
+                    continue
             faces = engine.analyzer.analyze(candidate)
             frame = candidate
             if faces:
@@ -252,13 +281,19 @@ class EngineWorker(QThread):
         note = getattr(engine.analyzer, "last_detect_note", "") or ""
         if not people:
             note = (
-                "No faces in this part of the video. Move the slider to a clearer shot, "
-                "pick a frame where the face is larger, or lower Min face size and Detect sensitivity."
+                "No faces on this sample frame. Videoswa also checked nearby frames "
+                "(frame +10, about ±0.5s, ±1s, and the middle of the clip) and still found none. "
+                "Move the ref-frame slider to a moment where the face is visible, "
+                "or lower Min face size and Detect sensitivity."
             )
             if "OpenCV" in (getattr(engine.analyzer, "last_detect_note", "") or ""):
                 note = f"{note}\n\n{engine.analyzer.last_detect_note}"
         elif abs(found_time - float(job.timestamp_s)) > 0.05:
-            parked = f"Moved the slider to {found_time:.1f}s because the current frame had no face."
+            frame_no = int(round(found_time * fps))
+            parked = (
+                f"No face on the current sample. Moved the ref-frame slider to "
+                f"frame {frame_no} ({found_time:.2f}s)."
+            )
             note = f"{note} {parked}".strip()
         self.detect_ready.emit({
             "people": people,

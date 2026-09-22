@@ -44,9 +44,16 @@ a source. **Add multi-photo identity** averages extra photos of the same person.
 
 If the GPU detector (DirectML or TensorRT) returns no faces, detection retries
 on CPU and stays there for the rest of the session. Face detection requires
-`opencv-python==4.10.0.84`. OpenCV 4.11 and 5.x, which GFPGAN used to pull in,
-make InsightFace return zero faces. Do not install `opencv-python-headless`
-next to it.
+`opencv-python==4.10.0.84`. GFPGAN pulls in `opencv-python`. Left unpinned,
+that install resolved to **OpenCV 5.0.0**, and InsightFace then returned zero
+faces on every frame, so Detect and Swap both looked broken. Do not loosen
+the pin, and do not install `opencv-python-headless` next to it.
+
+If the sample frame has no face (frame 0 of some clips, including ones where
+frame 10 does), Detect checks frame +10, about ±0.5s, ±1s, and the middle of
+the clip, then parks the ref-frame slider on the first hit. The read uses the
+frame index, because a millisecond seek often stays on frame 0. If those
+samples are empty too, a dialog tells you to move the ref-frame slider.
 
 **Object mask (XSeg)** is on for every normal swap, including preview. It
 keeps a lollipop, food, or a hand that covers the face, and it is warped into
@@ -190,10 +197,12 @@ pip install -r requirements-windows-gpu.txt
 
 `onnxruntime` (CPU) and `onnxruntime-gpu` cannot be installed together. The
 second file replaces the CPU wheel with `onnxruntime-gpu==1.22.0`.
-`requirements.txt` pins `opencv-python==4.10.0.84`. If a later
-`pip install -r requirements-enhance.txt` upgrades OpenCV, install the pin
-again. Detection on DirectML falls back to CPU when the GPU session returns
-no faces.
+`requirements.txt` and `requirements-enhance.txt` both pin
+`opencv-python==4.10.0.84`. GFPGAN had installed OpenCV 5.0.0 on a machine
+where that pin was missing, and detection returned zero faces afterward.
+If `pip install -r requirements-enhance.txt` upgrades OpenCV, install the pin
+again: `pip install opencv-python==4.10.0.84`. Detection on DirectML falls
+back to CPU when the GPU session returns no faces.
 
 Optional face sharpening (not required to run the app):
 

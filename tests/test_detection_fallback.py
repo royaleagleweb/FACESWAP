@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import cv2
 import numpy as np
 
 from faceswap.core import FaceMapping, FaceSwapEngine
@@ -13,6 +14,7 @@ from faceswap.face_analyzer import (
     prepare_detection_image,
     sensitivity_to_thresh,
 )
+from faceswap.video import read_frame_index
 from videoswa.jobs import MIN_ROI_CHANGE, roi_mean_change
 from videoswa.worker import seek_times
 
@@ -74,8 +76,10 @@ def _synthetic(dtype=np.uint8) -> np.ndarray:
 def test_requirements_pin_opencv_so_gfpgan_cannot_upgrade_it() -> None:
     requirements = (REPO / "requirements.txt").read_text(encoding="utf-8")
     enhance = (REPO / "requirements-enhance.txt").read_text(encoding="utf-8")
-    assert "opencv-python==4.10.0.84" in requirements
-    assert "opencv-python-headless" not in requirements
+    requirement_deps = "\n".join(line.split("#", 1)[0] for line in requirements.splitlines())
+    assert "opencv-python==4.10.0.84" in requirement_deps
+    assert "opencv-python-headless" not in requirement_deps
+    assert "OpenCV 5.0.0" in requirements
     assert "opencv-python==4.10.0.84" in enhance
     assert "gfpgan==1.3.8" in enhance
 
@@ -105,12 +109,37 @@ def test_both_detectors_empty_does_not_mark_the_gpu_blind() -> None:
     assert analyzer._gpu_detector_blind is False
 
 
-def test_seek_samples_nearby_timestamps_and_stops_at_eight() -> None:
-    times = seek_times(10.0, 30.0)
-    assert times[0] == 10.0
-    assert 10.4 in times and 9.6 in times
-    assert len(times) <= 8
-    assert seek_times(0.0, 0.0) == [0.0]
+def test_seek_includes_frame_ten_half_second_and_mid() -> None:
+    """Frame 0 can be empty while frame 10 has the only face (VERSA.mp4)."""
+    times = seek_times(0.0, 5.0, fps=30.0)
+    assert times[0] == 0.0
+    assert round(10 / 30.0, 3) in times
+    assert 0.5 in times
+    assert 1.0 in times
+    assert 2.5 in times
+    around = seek_times(10.0, 30.0, fps=30.0)
+    assert around[0] == 10.0
+    assert 10.5 in around and 9.5 in around
+    assert 11.0 in around and 9.0 in around
+    unknown = seek_times(0.0, 0.0)
+    assert unknown[0] == 0.0
+    assert round(10 / 30.0, 3) in unknown
+
+
+def test_frame_ten_is_not_read_as_frame_zero(tmp_path: Path) -> None:
+    path = tmp_path / "versa_like.mp4"
+    writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), 30.0, (32, 24))
+    assert writer.isOpened()
+    for index in range(12):
+        frame = np.zeros((24, 32, 3), dtype=np.uint8)
+        if index == 10:
+            frame[:] = 255
+        writer.write(frame)
+    writer.release()
+    first = read_frame_index(path, 0)
+    tenth = read_frame_index(path, 10)
+    assert float(first.mean()) < 5
+    assert float(tenth.mean()) > 200
 
 
 def test_tiny_roi_change_is_below_the_visible_swap_bar() -> None:

@@ -1,5 +1,8 @@
 numpy>=1.24,<2.1
-# Pinned. OpenCV 4.11+ and 5.x (often pulled in by GFPGAN) make InsightFace return zero faces.
+# Pinned. Do not loosen this. GFPGAN depends on opencv-python and, left
+# unpinned, installed OpenCV 5.0.0. That build makes InsightFace return zero
+# faces, so detection and swap both look like they did nothing. 4.10.0.84 is
+# the last known-good release. Do not install opencv-python-headless beside it.
 opencv-python==4.10.0.84
 onnx>=1.14.0
 onnxruntime>=1.16.0
