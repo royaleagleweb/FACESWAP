@@ -9,6 +9,7 @@ from faceswap.coverage import (
     coverage_alpha,
     face_axes,
     mask_reach_below_mouth,
+    match_edge_color,
     paste_swapped_face,
     template_128,
 )
@@ -117,3 +118,17 @@ def test_full_paste_replaces_beard_pixels_normal_leaves_them() -> None:
     assert alpha.max() >= 0.99
     assert np.any((alpha > 0.2) & (alpha < 0.8))
     assert FULL_BEARD_DEPTH_EM >= 1.8
+
+
+def test_edge_color_match_keeps_the_interior() -> None:
+    warped = np.zeros((20, 20, 3), dtype=np.float32)
+    warped[:] = (0, 0, 255)
+    roi = np.zeros_like(warped)
+    roi[:] = (0, 180, 0)
+    weight = np.full((20, 20, 1), 0.35, dtype=np.float32)
+    weight[4:16, 4:16] = 1.0
+    shifted = match_edge_color(warped, roi, weight)
+    assert shifted[8, 8, 2] == 255
+    assert shifted[8, 8, 1] == 0
+    assert shifted[0, 0, 2] < 255
+    assert shifted[0, 0, 1] > 20

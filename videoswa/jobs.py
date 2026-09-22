@@ -39,6 +39,7 @@ class SwapRequest:
     keep_audio: bool = True
     crf: int = 18
     preset: str = "medium"
+    scale: float = 1.0
     face_mode: str = FACE_MODE_SINGLE
     single_source: Optional[Path] = None
     selected_face: Optional[Face] = None

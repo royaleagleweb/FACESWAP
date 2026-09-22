@@ -13,7 +13,9 @@
 #   CUDNN_FE failure 7: GRAPH_EXECUTION_FAILED
 # Videoswa sets ORT_DISABLE_CUDNN_FRONTEND=1 when that variable is unset, asks
 # CUDA for cudnn_conv_algo_search=DEFAULT, and if the graph still fails it
-# rebuilds detection and the swapper on CPU ("CUDA failed; using CPU").
+# rebuilds on DirectML when that provider is installed, otherwise CPU.
+# For a GPU path that does not use CUDA, switch to
+# requirements-windows-directml.txt (do not install both packages).
 # onnxruntime-gpu==1.19.2 is the last build without that frontend conv path,
 # but it expects TensorRT 10.2, not 10.9. 1.20.1 still uses the frontend and
 # TensorRT 10.4. Stay on 1.22.0 when you want TensorRT 10.9.

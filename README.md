@@ -7,7 +7,7 @@ with the original audio copied back when FFmpeg can read it.
 
 The swap engine is InsightFace: `buffalo_l` for detection and recognition,
 and `inswapper_128` for the identity swap. Inference goes through ONNX Runtime.
-On NVIDIA GPUs the provider order is **TensorRT, then CUDA, then CPU**.
+On Windows the provider order is **TensorRT, then CUDA, then DirectML, then CPU**.
 
 ## Desktop app
 
@@ -171,7 +171,9 @@ python -m videoswa
 A working RTX 4070 install prints `TensorrtExecutionProvider` before
 `CUDAExecutionProvider` and `CPUExecutionProvider`.
 
-In the app, leave execution on **Auto (TensorRT → CUDA → CPU)**. The first
+In the app, leave execution on **Auto**. On Windows that is TensorRT, then
+CUDA, then DirectML, then CPU. The window shows the provider that is actually
+running. **Running on CPU** means the export will be slow. The first
 swap compiles TensorRT engines into `models\trt_cache`. That can take several
 minutes and is reused on the next run. FP16 engines are the default on this
 path. Set `VIDEOSWA_TRT_FP16=0` before launching if you need FP32. The workspace
@@ -207,6 +209,31 @@ search. `onnxruntime-gpu==1.19.2` is the last Windows build without the cuDNN
 9 frontend conv path; it does not match TensorRT 10.9. `1.20.1` still uses
 that frontend (TensorRT 10.4). Keep `1.22.0` when you want TensorRT 10.9.
 
+### DirectML when CUDA is broken
+
+DirectML is the fast Windows GPU path that does not use CUDA or the cuDNN
+frontend. `onnxruntime-directml` cannot sit next to `onnxruntime-gpu`. From
+the same virtualenv:
+
+```bat
+pip uninstall -y onnxruntime onnxruntime-gpu onnxruntime-directml
+pip install -r requirements-windows-directml.txt
+```
+
+That file pins `onnxruntime-directml==1.22.0`. Restart Videoswa and leave
+execution on Auto, or choose **DirectML**. The banner should say **Running on
+DirectML**. If DirectML is not installed, a CUDA graph failure still continues
+on CPU and the banner says so.
+
+**Export speed** defaults to **Full quality**. **Half resolution (faster)**
+runs the swap on a smaller frame and writes an MP4 at the original size. Use
+it when the banner says CPU. **Sharpen swapped faces (GFPGAN)** stays off
+until you tick it. If GFPGAN is missing, the checkbox explains
+`pip install -r requirements-enhance.txt`. When the package is installed,
+`GFPGANv1.4.pth` downloads into `models/` on the first enhanced swap.
+Detection and swapping reuse the same InsightFace sessions; turning sharpening
+on does not reload InSwapper.
+
 ### CPU-only Windows
 
 Skip CUDA and TensorRT. `pip install -r requirements.txt` is enough, then
@@ -230,7 +257,7 @@ python run.py swap -t party.mp4 --pair alice.jpg=ref_alice.jpg --pair bob.jpg=re
 
 | Flag | Meaning |
 | --- | --- |
-| `--execution auto` | TensorRT, then CUDA, then CPU |
+| `--execution auto` | TensorRT, then CUDA, then DirectML, then CPU on Windows |
 | `--execution cuda` | CUDA, then CPU. Skips TensorRT |
 | `--cpu` | CPU only |
 | `--coverage full` | Jaw and beard replacement (default) |
@@ -339,6 +366,8 @@ videoswa/           PySide6 desktop window
 requirements.txt    CPU install, including PySide6
 requirements-windows-gpu.txt
                     onnxruntime-gpu pin for TensorRT / CUDA
+requirements-windows-directml.txt
+                    Windows GPU path when CUDA is broken
 ```
 
 ## Troubleshooting
@@ -354,8 +383,11 @@ requirements-windows-gpu.txt
   CUDA-only is still a supported fallback.
 - **Detect faces fails with `CUDNN_FE` / `GRAPH_EXECUTION_FAILED`.** The CUDA
   provider loaded, then cuDNN rejected a convolution. Videoswa rebuilds on
-  CPU and the status line says `CUDA failed; using CPU`. Launch with
-  `ORT_DISABLE_CUDNN_FRONTEND=1` (Videoswa sets this when it is unset). Use
-  the project `.venv\Scripts\python.exe`, not a system Python 3.11.
+  DirectML when that provider is installed, otherwise on CPU. The banner
+  names the provider. Install `requirements-windows-directml.txt` for a GPU
+  that does not use CUDA. Launch with the project `.venv\Scripts\python.exe`.
+- **The swap is slow.** Read the provider banner. CPU is the slow path.
+  Half resolution is the faster export. DirectML is the Windows GPU
+  alternative when CUDA is unhealthy.
 - **First GPU run is very slow.** TensorRT is building engines in
   `models/trt_cache`. The next run of the same model should start promptly.

@@ -94,6 +94,9 @@ def test_window_loads_short_video(tmp_path: Path) -> None:
         assert "beard" in window.coverage.currentText().lower()
         assert window.face_mode.currentData() == "single"
         assert window.apply_all.isChecked() is False
+        assert "Running on" in window.provider_banner.text()
+        assert window.enhance.isEnabled()
+        assert window.speed.currentData() == 1.0
         assert window.output_edit.text().endswith("_videoswa.mp4")
         assert window.time_slider.isEnabled()
         app.processEvents()

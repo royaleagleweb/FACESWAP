@@ -68,10 +68,45 @@ class FaceSwapper:
             self._enhancer = _try_load_gfpgan(use_gpu=uses_gpu(providers))
 
     def adopt_cpu(self) -> None:
-        """Drop a CUDA/TensorRT session that failed while the graph was running."""
+        """Drop a GPU session that failed while the graph was running."""
         if self._on_cpu:
             return
         self._load(use_gpu=False, execution="cpu", enhance=self._enhance_requested)
+
+    def adopt_execution(self, execution: str) -> None:
+        """Reload on DirectML or CPU. InSwapper weights stay on disk."""
+        if execution == "cpu":
+            self.adopt_cpu()
+            return
+        self._load(use_gpu=True, execution=execution, enhance=self._enhance_requested)
+
+    def set_enhance(self, enhance: bool) -> Optional[str]:
+        """Toggle GFPGAN without reloading the InSwapper session.
+
+        Returns an install tip when sharpening was requested and could not start.
+        """
+        enhance = bool(enhance)
+        if enhance and self._enhancer is not None:
+            self._enhance_requested = True
+            return None
+        if not enhance:
+            self._enhance_requested = False
+            self._enhancer = None
+            return None
+        tip = gfpgan_install_tip()
+        if tip is not None:
+            self._enhance_requested = False
+            self._enhancer = None
+            return tip
+        self._enhance_requested = True
+        self._enhancer = _try_load_gfpgan(use_gpu=not self._on_cpu)
+        if self._enhancer is None:
+            self._enhance_requested = False
+            return (
+                "GFPGAN is installed but did not start. "
+                "Videoswa downloads GFPGANv1.4.pth into the models folder on first use."
+            )
+        return None
 
     def swap(
         self,
@@ -123,6 +158,20 @@ class _FaceShim:
         self.embedding = face.embedding
         self.normed_embedding = face.normed_embedding
         self.det_score = face.det_score
+
+
+def gfpgan_install_tip() -> Optional[str]:
+    """How to enable sharpening, or None when GFPGAN can be imported."""
+    try:
+        import gfpgan  # noqa: F401
+    except Exception:
+        return (
+            "GFPGAN is optional and is not installed in this Python.\n\n"
+            "From the Videoswa virtualenv run:\n"
+            "pip install -r requirements-enhance.txt\n\n"
+            "The first enhanced swap downloads GFPGANv1.4.pth into models/."
+        )
+    return None
 
 
 def _try_load_gfpgan(use_gpu: bool):

@@ -145,7 +145,9 @@ def coverage_alpha(shape: tuple[int, int], kps: np.ndarray, coverage: str = DEFA
         return alpha
     _eye_c, _mouth_c, _down_u, _side_u, _em, eye_dist = axes
     mode = normalize_coverage(coverage)
-    feather = max(8.0, (0.22 if mode == COVERAGE_FULL else 0.10) * eye_dist)
+    # Full coverage keeps a short rim. A wide feather mixes two skin colors
+    # and looks muddy; the beard interior stays fully replaced.
+    feather = max(4.0, (0.11 if mode == COVERAGE_FULL else 0.10) * eye_dist)
 
     binary = np.zeros((height, width), dtype=np.uint8)
     cv2.fillPoly(binary, [np.round(polygon).astype(np.int32)], 255)
@@ -226,9 +228,28 @@ def paste_swapped_face(
     out = frame_bgr.copy()
     roi = out[y0:y1, x0:x1].astype(np.float32)
     weight = alpha[y0:y1, x0:x1, None]
-    blended = warped.astype(np.float32) * weight + roi * (1.0 - weight)
+    warped_f = warped.astype(np.float32)
+    if mode == COVERAGE_FULL:
+        warped_f = match_edge_color(warped_f, roi, weight)
+    blended = warped_f * weight + roi * (1.0 - weight)
     out[y0:y1, x0:x1] = np.clip(blended, 0, 255).astype(np.uint8)
     return out
+
+
+def match_edge_color(warped: np.ndarray, roi: np.ndarray, weight: np.ndarray) -> np.ndarray:
+    """Move the soft rim of the swap toward the original frame color.
+
+    The interior (alpha near 1) keeps the swapped color. Only the feather
+    band shifts, so the blend is not a muddy average of two palettes.
+    """
+    alpha = weight[..., 0] if weight.ndim == 3 else weight
+    rim = (alpha > 0.12) & (alpha < 0.88)
+    if int(np.count_nonzero(rim)) < 16:
+        return warped
+    delta = roi[rim].mean(axis=0) - warped[rim].mean(axis=0)
+    strength = np.clip((1.0 - alpha) * 0.9, 0.0, 1.0).astype(np.float32)[..., None]
+    shifted = warped.astype(np.float32) + delta.astype(np.float32) * strength
+    return np.clip(shifted, 0.0, 255.0)
 
 
 def mask_reach_below_mouth(alpha: np.ndarray, kps: np.ndarray, threshold: float = 0.5) -> float:

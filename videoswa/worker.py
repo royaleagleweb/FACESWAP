@@ -16,7 +16,7 @@ from PySide6.QtCore import QThread, Signal
 
 from faceswap.core import FaceSwapEngine
 from faceswap.face_analyzer import FaceAnalyzer
-from faceswap.providers import format_providers
+from faceswap.providers import format_providers, provider_status_text
 from faceswap.swapper import FaceSwapper
 from faceswap.utils import logger
 from faceswap.video import SwapCancelled, process_video, read_frame_at, reset_stats
@@ -46,6 +46,7 @@ class EngineWorker(QThread):
     swap_failed = Signal(str)
     swap_cancelled = Signal()
     status = Signal(str)
+    provider = Signal(str)
 
     def __init__(self) -> None:
         super().__init__()
@@ -90,9 +91,12 @@ class EngineWorker(QThread):
                     self.swap_failed.emit(message)
 
     def _engine_for(self, execution: str, enhance: bool) -> FaceSwapEngine:
-        key = (execution, bool(enhance))
-        if self._engine is not None and self._engine_key == key:
+        if self._engine is not None and self._engine_key == execution:
             self._bind_cuda_status(self._engine)
+            tip = self._engine.swapper.set_enhance(enhance)
+            if tip:
+                self.status.emit(tip)
+            self._emit_provider(self._engine)
             return self._engine
         self.status.emit(
             "Loading InsightFace models. The first run downloads buffalo_l and inswapper_128."
@@ -101,21 +105,34 @@ class EngineWorker(QThread):
         analyzer = FaceAnalyzer(use_gpu=use_gpu, execution=execution)
         swapper = FaceSwapper(use_gpu=use_gpu, enhance=enhance, execution=execution)
         self._engine = FaceSwapEngine(analyzer=analyzer, swapper=swapper)
-        self._engine_key = key
+        self._engine_key = execution
         self._bind_cuda_status(self._engine)
-        active = getattr(swapper, "active_providers", None) or []
-        if active:
-            detail = " → ".join(active)
-        else:
-            detail = format_providers(getattr(swapper, "providers", []))
-        self.status.emit(f"Models ready. InSwapper providers: {detail}")
+        self._emit_provider(self._engine)
         return self._engine
 
     def _bind_cuda_status(self, engine: FaceSwapEngine) -> None:
         guard = getattr(engine, "cuda_guard", None)
         if guard is None:
             return
-        guard.on_fallback = lambda message: self.status.emit(message)
+
+        def _report(message: str) -> None:
+            self.status.emit(message)
+            self.provider.emit(message)
+
+        guard.on_fallback = _report
+
+    def _emit_provider(self, engine: FaceSwapEngine) -> None:
+        guard = getattr(engine, "cuda_guard", None)
+        note = getattr(guard, "note", None) if guard is not None else None
+        if note:
+            self.provider.emit(note)
+            self.status.emit(note)
+            return
+        names = getattr(engine.swapper, "active_providers", None) or getattr(engine.swapper, "providers", [])
+        text = provider_status_text(names)
+        detail = format_providers(getattr(engine.swapper, "providers", []) or [])
+        self.provider.emit(text)
+        self.status.emit(f"Models ready. {text} ({detail})" if detail else f"Models ready. {text}")
 
     def _detect(self, job: DetectRequest) -> None:
         engine = self._engine_for(job.execution, enhance=False)
@@ -151,6 +168,7 @@ class EngineWorker(QThread):
             crf=job.crf,
             preset=job.preset,
             cancel_event=self._cancel,
+            scale=job.scale,
         )
         stats = engine.stats
         summary = (

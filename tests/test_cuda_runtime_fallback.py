@@ -12,13 +12,17 @@ from faceswap.providers import (
     CPU,
     CUDA,
     CUDA_FAILED_STATUS,
+    DIRECTML,
+    DIRECTML_FALLBACK_STATUS,
     TENSORRT,
     CudaRuntimeGuard,
     configure_cuda_runtime,
     cuda_provider_options,
     is_cuda_runtime_failure,
+    preferred_fallback_mode,
     provider_attempts,
     provider_names,
+    provider_status_text,
 )
 
 CHANA_ERROR = (
@@ -98,6 +102,20 @@ def test_runtime_failure_rebuilds_analyzer_and_swapper_on_cpu() -> None:
     assert analyzer.providers == [CPU]
 
 
+def test_windows_cuda_failure_prefers_directml() -> None:
+    mode = preferred_fallback_mode(
+        [(CUDA, {}), CPU],
+        [TENSORRT, CUDA, DIRECTML, CPU],
+        platform="win32",
+    )
+    assert mode == "directml"
+    assert preferred_fallback_mode([(CUDA, {})], [CUDA, CPU], platform="win32") == "cpu"
+    assert "CPU" in provider_status_text([CPU])
+    assert "slow" in provider_status_text([CPU]).lower()
+    assert provider_status_text([DIRECTML, CPU]) == "Running on DirectML."
+    assert DIRECTML_FALLBACK_STATUS.startswith("CUDA failed; using DirectML")
+
+
 def test_second_cudnn_failure_is_not_retried_forever() -> None:
     analyzer = FaceAnalyzer.__new__(FaceAnalyzer)
     analyzer.providers = [(CUDA, {})]
@@ -107,3 +125,23 @@ def test_second_cudnn_failure_is_not_retried_forever() -> None:
     guard.attach(analyzer)
     with pytest.raises(RuntimeError, match="GRAPH_EXECUTION_FAILED"):
         analyzer.analyze(np.zeros((2, 2, 3), dtype=np.uint8))
+
+
+def test_sharpen_toggle_does_not_reload_inswapper(monkeypatch: pytest.MonkeyPatch) -> None:
+    from faceswap.swapper import FaceSwapper
+
+    monkeypatch.setattr(
+        "faceswap.swapper.gfpgan_install_tip",
+        lambda: "pip install -r requirements-enhance.txt",
+    )
+    swapper = FaceSwapper.__new__(FaceSwapper)
+    swapper._enhancer = None
+    swapper._enhance_requested = False
+    swapper._on_cpu = True
+    loads: list = []
+    swapper._load = lambda **kwargs: loads.append(kwargs)
+    tip = swapper.set_enhance(True)
+    assert tip is not None
+    assert "requirements-enhance" in tip
+    assert loads == []
+    assert swapper.set_enhance(False) is None

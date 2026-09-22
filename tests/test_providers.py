@@ -39,6 +39,34 @@ def test_cpu_mode_is_only_cpu() -> None:
     assert attempts == [[CPU]]
 
 
+def test_windows_auto_includes_directml_before_cpu(tmp_path: Path) -> None:
+    from faceswap.providers import DIRECTML
+
+    attempts = provider_attempts(
+        "auto",
+        available=[TENSORRT, CUDA, DIRECTML, CPU],
+        cache_dir=tmp_path,
+        platform="win32",
+    )
+    assert provider_names(attempts[0]) == [TENSORRT, CUDA, DIRECTML, CPU]
+    assert provider_names(attempts[1]) == [CUDA, DIRECTML, CPU]
+    assert provider_names(attempts[2]) == [DIRECTML, CPU]
+    assert provider_names(attempts[3]) == [CPU]
+
+
+def test_linux_auto_does_not_insert_directml_ahead_of_cuda(tmp_path: Path) -> None:
+    from faceswap.providers import DIRECTML
+
+    attempts = provider_attempts(
+        "auto",
+        available=[TENSORRT, CUDA, DIRECTML, CPU],
+        cache_dir=tmp_path,
+        platform="linux",
+    )
+    assert provider_names(attempts[0]) == [TENSORRT, CUDA, CPU]
+    assert all(DIRECTML not in provider_names(attempt) for attempt in attempts)
+
+
 def test_directml_when_no_nvidia(tmp_path: Path) -> None:
     attempts = provider_attempts(
         "auto",

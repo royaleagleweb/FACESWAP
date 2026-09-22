@@ -100,10 +100,17 @@ class FaceAnalyzer:
         logger.info("FaceAnalyzer active providers: %s", active or "(unreported)")
 
     def adopt_cpu(self) -> None:
-        """Drop a CUDA/TensorRT session that failed while the graph was running."""
+        """Drop a GPU session that failed while the graph was running."""
         if self._on_cpu:
             return
         self._load(use_gpu=False, execution="cpu")
+
+    def adopt_execution(self, execution: str) -> None:
+        """Reload on DirectML or CPU without rebuilding from a fresh object."""
+        if execution == "cpu":
+            self.adopt_cpu()
+            return
+        self._load(use_gpu=True, execution=execution)
 
     def analyze(self, image_bgr: np.ndarray) -> List[Face]:
         """Detect every face in an image and return them sorted left-to-right."""

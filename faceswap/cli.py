@@ -101,6 +101,7 @@ def cmd_swap(args: argparse.Namespace) -> int:
             keep_audio=not args.no_audio,
             crf=args.crf,
             preset=args.preset,
+            scale=args.scale,
         )
     else:
         out = process_image(
@@ -145,10 +146,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--execution",
         choices=list(EXECUTION_CHOICES),
         default="auto",
-        help="ONNX Runtime providers: auto is TensorRT, then CUDA, then CPU",
+        help="ONNX Runtime providers: auto is TensorRT, then CUDA, then DirectML, then CPU",
     )
     s.add_argument("--cpu", action="store_true", help="Force CPU inference")
     s.add_argument("--enhance", action="store_true", help="Run GFPGAN on swapped faces (optional extra)")
+    s.add_argument(
+        "--scale",
+        type=float,
+        default=1.0,
+        help="Process scale. 1 is full quality. 0.5 is faster and the MP4 stays full size.",
+    )
     s.add_argument("--no-audio", action="store_true", help="Drop original audio track")
     s.add_argument("--crf", type=int, default=18, help="x264 CRF (lower = better quality)")
     s.add_argument("--preset", default="medium", help="x264 preset")

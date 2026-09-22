@@ -16,6 +16,7 @@ from faceswap.video import (
     VideoTooLongError,
     assert_duration_allowed,
     process_video,
+    swap_frame,
 )
 
 
@@ -99,3 +100,16 @@ def test_cancel_writes_nothing(tmp_path: Path) -> None:
         )
     assert not (tmp_path / "out.mp4").exists()
     assert engine.calls == 1
+
+
+def test_half_resolution_swap_returns_the_original_size() -> None:
+    class _Engine:
+        def process_frame(self, frame, _mappings):
+            self.shape = frame.shape
+            return frame
+
+    engine = _Engine()
+    frame = np.zeros((40, 60, 3), dtype=np.uint8)
+    out = swap_frame(engine, frame, [], scale=0.5)
+    assert out.shape == frame.shape
+    assert engine.shape == (20, 30, 3)

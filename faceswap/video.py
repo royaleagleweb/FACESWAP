@@ -217,6 +217,7 @@ def process_video(
     preset: str = "medium",
     cancel_event: Optional[threading.Event] = None,
     limit_s: Optional[float] = None,
+    scale: float = 1.0,
 ) -> Path:
     """Apply face swaps frame-by-frame and re-mux original audio.
 
@@ -269,7 +270,7 @@ def process_video(
                 ok, frame = cap.read()
                 if not ok:
                     break
-                out = engine.process_frame(frame, mappings)
+                out = swap_frame(engine, frame, mappings, scale=scale)
                 if out.shape[1] != info.width or out.shape[0] != info.height:
                     out = cv2.resize(out, (info.width, info.height))
                 writer.write(out)
@@ -296,6 +297,25 @@ def process_video(
     logger.info("Wrote %s", output_path)
     logger.info("Stats: %s", engine.stats)
     return output_path
+
+
+def swap_frame(engine: FaceSwapEngine, frame: np.ndarray, mappings, scale: float = 1.0) -> np.ndarray:
+    """Swap one frame. ``scale`` below 1 runs the model on a smaller image.
+
+    The returned frame is always the original size. Half resolution is the
+    faster export path when inference is on CPU or DirectML.
+    """
+    scale = float(scale or 1.0)
+    height, width = frame.shape[:2]
+    if scale >= 0.99 or width < 4 or height < 4:
+        return engine.process_frame(frame, mappings)
+    small_w = max(2, int(round(width * scale)))
+    small_h = max(2, int(round(height * scale)))
+    small = cv2.resize(frame, (small_w, small_h), interpolation=cv2.INTER_AREA)
+    swapped = engine.process_frame(small, mappings)
+    if swapped.shape[1] != width or swapped.shape[0] != height:
+        swapped = cv2.resize(swapped, (width, height), interpolation=cv2.INTER_LINEAR)
+    return swapped
 
 
 def _mux_audio(silent_video: Path, original: Path, dest: Path, crf: int, preset: str) -> None:

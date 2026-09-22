@@ -33,6 +33,7 @@ from PySide6.QtWidgets import (
 )
 
 from faceswap.face_analyzer import face_label
+from faceswap.swapper import gfpgan_install_tip
 from faceswap.utils import logger
 from faceswap.video import (
     VIDEO_SUFFIXES,
@@ -53,14 +54,6 @@ _PRESETS = [
     "ultrafast", "superfast", "veryfast", "faster", "fast",
     "medium", "slow", "slower", "veryslow",
 ]
-
-
-def _gfpgan_available() -> bool:
-    try:
-        import gfpgan  # noqa: F401
-    except Exception:
-        return False
-    return True
 
 
 class _LogBridge(QWidget):
@@ -192,6 +185,7 @@ class MainWindow(QMainWindow):
         self.worker.swap_failed.connect(self._on_swap_failed)
         self.worker.swap_cancelled.connect(self._on_swap_cancelled)
         self.worker.status.connect(self._set_status)
+        self.worker.provider.connect(self.show_provider)
         self._log_bridge = _LogBridge()
         self._log_handler = _QtLogHandler(self._log_bridge)
         self._log_handler.setFormatter(logging.Formatter("%(levelname)s %(message)s"))
@@ -256,10 +250,20 @@ class MainWindow(QMainWindow):
         form = QVBoxLayout(options)
         form.addWidget(QLabel("Execution"))
         self.execution = QComboBox()
-        self.execution.addItem("Auto (TensorRT → CUDA → CPU)", "auto")
+        if sys.platform.startswith("win"):
+            auto_label = "Auto (TensorRT → CUDA → DirectML → CPU)"
+        else:
+            auto_label = "Auto (TensorRT → CUDA → CPU)"
+        self.execution.addItem(auto_label, "auto")
         self.execution.addItem("CUDA only", "cuda")
+        if sys.platform.startswith("win"):
+            self.execution.addItem("DirectML", "directml")
         self.execution.addItem("CPU only", "cpu")
         form.addWidget(self.execution)
+        self.provider_banner = QLabel("Running on: waiting for models")
+        self.provider_banner.setWordWrap(True)
+        self.provider_banner.setObjectName("ProviderBanner")
+        form.addWidget(self.provider_banner)
 
         sim_row = QHBoxLayout()
         sim_row.addWidget(QLabel("Match threshold"))
@@ -280,13 +284,26 @@ class MainWindow(QMainWindow):
         )
         form.addWidget(self.coverage)
 
+        form.addWidget(QLabel("Export speed"))
+        self.speed = QComboBox()
+        self.speed.addItem("Full quality", 1.0)
+        self.speed.addItem("Half resolution (faster)", 0.5)
+        self.speed.setToolTip(
+            "Full quality is the default export. Half resolution is faster on CPU "
+            "and DirectML. The MP4 is still the original size."
+        )
+        form.addWidget(self.speed)
+
         self.keep_audio = QCheckBox("Keep original audio")
         self.keep_audio.setChecked(True)
         self.enhance = QCheckBox("Sharpen swapped faces (GFPGAN)")
         self.enhance.setChecked(False)
-        if not _gfpgan_available():
-            self.enhance.setEnabled(False)
-            self.enhance.setToolTip("Optional. Install GFPGAN to enable this (requirements-enhance.txt).")
+        install_tip = gfpgan_install_tip()
+        self.enhance.setToolTip(
+            install_tip
+            or "Optional. The first enhanced swap downloads GFPGANv1.4.pth into models/."
+        )
+        self.enhance.toggled.connect(self._on_enhance_toggled)
         form.addWidget(self.keep_audio)
         form.addWidget(self.enhance)
 
@@ -418,6 +435,13 @@ class MainWindow(QMainWindow):
             QLabel#Title { font-size: 22px; font-weight: 600; background: transparent; }
             QLabel#Muted, QLabel#CardTitle { background: transparent; }
             QLabel#Muted { color: #9aa3ad; }
+            QLabel#ProviderBanner, QLabel#ProviderSlow {
+                font-weight: 600;
+                padding: 8px;
+                border-radius: 6px;
+            }
+            QLabel#ProviderBanner { background: #1e3a2f; color: #d5f5e3; }
+            QLabel#ProviderSlow { background: #4a3418; color: #ffe0b2; }
             QLabel#CardTitle { font-weight: 600; }
             QLabel#Preview {
                 background: #12141a;
@@ -451,6 +475,24 @@ class MainWindow(QMainWindow):
             QScrollArea { border: none; }
             """
         )
+
+    def show_provider(self, text: str) -> None:
+        self.provider_banner.setText(text)
+        slow = "CPU" in text and "DirectML" not in text
+        self.provider_banner.setObjectName("ProviderSlow" if slow else "ProviderBanner")
+        self.provider_banner.style().unpolish(self.provider_banner)
+        self.provider_banner.style().polish(self.provider_banner)
+
+    def _on_enhance_toggled(self, checked: bool) -> None:
+        if not checked:
+            return
+        tip = gfpgan_install_tip()
+        if tip is None:
+            return
+        QMessageBox.information(self, "GFPGAN is not installed", tip)
+        self.enhance.blockSignals(True)
+        self.enhance.setChecked(False)
+        self.enhance.blockSignals(False)
 
     def _set_status(self, text: str) -> None:
         self.status.setText(text)
@@ -684,6 +726,7 @@ class MainWindow(QMainWindow):
             keep_audio=self.keep_audio.isChecked(),
             crf=self.crf.value(),
             preset=self.preset.currentText(),
+            scale=float(self.speed.currentData()),
             face_mode=str(self.face_mode.currentData()),
             single_source=single,
             selected_face=selected,

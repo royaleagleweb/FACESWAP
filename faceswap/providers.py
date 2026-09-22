@@ -1,15 +1,15 @@
 """ONNX Runtime execution providers for Videoswa.
 
-NVIDIA Windows preference is TensorRT, then CUDA, then CPU. Session creation
-is retried down that list when TensorRT (or CUDA) fails to initialize, which
-is the usual result of a missing ``nvinfer`` DLL or a CUDA/TensorRT version
-mismatch. CoreML and DirectML are used only when neither TensorRT nor CUDA
-is available.
+NVIDIA Windows preference is TensorRT, then CUDA, then DirectML, then CPU.
+Session creation is retried down that list when TensorRT or CUDA fails to
+initialize. DirectML is the fast Windows path when CUDA's cuDNN frontend
+is unhealthy. CoreML is used on macOS when no NVIDIA provider is present.
 """
 
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 from typing import Callable, Iterable, Optional, Sequence, Union
 
@@ -27,11 +27,15 @@ CPU = "CPUExecutionProvider"
 EXECUTION_AUTO = "auto"
 EXECUTION_TENSORRT = "tensorrt"
 EXECUTION_CUDA = "cuda"
+EXECUTION_DIRECTML = "directml"
 EXECUTION_CPU = "cpu"
+CUDA_FAILED_STATUS = "CUDA failed; using CPU"
+DIRECTML_FALLBACK_STATUS = "CUDA failed; using DirectML"
 EXECUTION_CHOICES = (
     EXECUTION_AUTO,
     EXECUTION_TENSORRT,
     EXECUTION_CUDA,
+    EXECUTION_DIRECTML,
     EXECUTION_CPU,
 )
 
@@ -39,8 +43,6 @@ EXECUTION_CHOICES = (
 def default_trt_cache_dir() -> Path:
     return MODELS_DIR / "trt_cache"
 
-
-CUDA_FAILED_STATUS = "CUDA failed; using CPU"
 
 # cuDNN 9's frontend conv path (ORT 1.20+) can create a CUDA session and then
 # fail inside Conv with ``CUDNN_FE failure 7: GRAPH_EXECUTION_FAILED``.
@@ -95,19 +97,38 @@ class CudaRuntimeGuard:
     def recover(self, exc: BaseException) -> bool:
         if not is_cuda_runtime_failure(exc):
             return False
-        if self.note:
+        if self.note == CUDA_FAILED_STATUS:
             return False
         if not any(_member_uses_gpu(member) for member in self.members):
             return False
-        logger.warning("%s. %s", CUDA_FAILED_STATUS, exc)
+        try:
+            available = installed_providers()
+        except Exception:
+            available = [CPU]
+        mode = preferred_fallback_mode(self._current_providers(), available)
+        logger.warning("%s. %s", _fallback_note(mode), exc)
         for member in self.members:
-            adopt = getattr(member, "adopt_cpu", None)
-            if callable(adopt):
-                adopt()
-        self.note = CUDA_FAILED_STATUS
+            switched = False
+            if mode != EXECUTION_CPU:
+                adopt_mode = getattr(member, "adopt_execution", None)
+                if callable(adopt_mode):
+                    adopt_mode(mode)
+                    switched = True
+            if not switched:
+                adopt = getattr(member, "adopt_cpu", None)
+                if callable(adopt):
+                    adopt()
+        self.note = _note_for_members(self.members, mode)
         if self.on_fallback is not None:
             self.on_fallback(self.note)
         return True
+
+    def _current_providers(self) -> Sequence[ProviderEntry]:
+        for member in self.members:
+            providers = getattr(member, "providers", None)
+            if providers:
+                return providers
+        return [CPU]
 
 
 def _member_uses_gpu(member: object) -> bool:
@@ -210,6 +231,76 @@ def tensorrt_provider_options(cache_dir: Path) -> dict:
     }
 
 
+def _is_windows(platform: Optional[str] = None) -> bool:
+    return (platform or sys.platform).startswith("win")
+
+
+def preferred_fallback_mode(
+    current: Sequence[ProviderEntry],
+    available: Sequence[str],
+    platform: Optional[str] = None,
+) -> str:
+    """Next execution mode after TensorRT or CUDA fails while the graph is running.
+
+    Windows prefers DirectML when that provider is installed. Otherwise CPU.
+    """
+    names = set(provider_names(current))
+    if names & {TENSORRT, CUDA} and DIRECTML in set(available) and _is_windows(platform):
+        return EXECUTION_DIRECTML
+    return EXECUTION_CPU
+
+
+def _fallback_note(mode: str) -> str:
+    if mode == EXECUTION_DIRECTML:
+        return DIRECTML_FALLBACK_STATUS
+    return CUDA_FAILED_STATUS
+
+
+def _note_for_members(members: Sequence[object], requested_mode: str) -> str:
+    for member in members:
+        providers = getattr(member, "providers", None)
+        if not providers:
+            continue
+        device = active_device_name(providers)
+        if device == "DirectML":
+            return DIRECTML_FALLBACK_STATUS
+        if device == "CPU":
+            return CUDA_FAILED_STATUS
+        return f"CUDA failed; using {device}"
+    return _fallback_note(requested_mode)
+
+
+def active_device_name(providers: Sequence) -> str:
+    """Short name of the provider that will actually run."""
+    names = list(providers)
+    if names and not isinstance(names[0], str):
+        names = provider_names(names)
+    for key, label in (
+        (TENSORRT, "TensorRT"),
+        (CUDA, "CUDA"),
+        (DIRECTML, "DirectML"),
+        (COREML, "CoreML"),
+        (CPU, "CPU"),
+    ):
+        if key in names:
+            return label
+    return "CPU"
+
+
+def provider_status_text(providers: Sequence) -> str:
+    """Banner copy for the desktop window."""
+    name = active_device_name(providers)
+    if name == "CPU":
+        return (
+            "Running on CPU — this is slow. Choose Half resolution for a faster "
+            "export, or on Windows install onnxruntime-directml "
+            "(requirements-windows-directml.txt)."
+        )
+    if name == "DirectML":
+        return "Running on DirectML."
+    return f"Running on {name}."
+
+
 def cuda_provider_options() -> dict:
     # DEFAULT selects cuDNN frontend HeurMode FALLBACK, which is the least
     # aggressive conv path this ONNX Runtime build exposes. HEURISTIC is
@@ -228,7 +319,9 @@ def _gpu_providers(
     *,
     allow_tensorrt: bool,
     allow_cuda: bool,
+    allow_directml: bool,
     cache_dir: Path,
+    platform: Optional[str] = None,
 ) -> ProviderList:
     present = set(available)
     providers: ProviderList = []
@@ -236,11 +329,14 @@ def _gpu_providers(
         providers.append((TENSORRT, tensorrt_provider_options(cache_dir)))
     if allow_cuda and CUDA in present:
         providers.append((CUDA, cuda_provider_options()))
-    if not providers:
-        if DIRECTML in present:
-            providers.append(DIRECTML)
-        elif COREML in present:
-            providers.append(COREML)
+    nvidia = any(provider_name(entry) in {TENSORRT, CUDA} for entry in providers)
+    # On Windows, DirectML stays behind CUDA so a broken cuDNN path can fall
+    # through without going straight to CPU. Elsewhere DirectML is only used
+    # when TensorRT and CUDA are not available.
+    if allow_directml and DIRECTML in present and (_is_windows(platform) or not nvidia):
+        providers.append(DIRECTML)
+    elif not providers and COREML in present:
+        providers.append(COREML)
     providers.append(CPU)
     return providers
 
@@ -267,11 +363,12 @@ def provider_attempts(
     execution: str = EXECUTION_AUTO,
     available: Optional[Sequence[str]] = None,
     cache_dir: Optional[Path] = None,
+    platform: Optional[str] = None,
 ) -> list[ProviderList]:
     """Provider lists to try, best first.
 
-    ``auto`` and ``tensorrt`` both prefer TensorRT and fall back to CUDA,
-    then CPU. ``cuda`` skips TensorRT. ``cpu`` never requests a GPU.
+    On Windows, ``auto`` is TensorRT, then CUDA, then DirectML, then CPU.
+    ``cuda`` skips TensorRT. ``directml`` skips NVIDIA. ``cpu`` is only CPU.
     """
     mode = (execution or EXECUTION_AUTO).strip().lower()
     if mode not in EXECUTION_CHOICES:
@@ -282,38 +379,46 @@ def provider_attempts(
     if available is None:
         available = installed_providers()
     cache = cache_dir or default_trt_cache_dir()
+    plat = platform or sys.platform
+    present = set(available)
 
     if mode == EXECUTION_CPU:
         return [[CPU]]
+    if mode == EXECUTION_DIRECTML:
+        if DIRECTML not in present:
+            logger.warning(
+                "DirectML was requested but DmlExecutionProvider is not installed. "
+                "Install onnxruntime-directml (see requirements-windows-directml.txt)."
+            )
+            return [[CPU]]
+        return _dedupe([[DIRECTML, CPU], [CPU]])
 
     allow_tensorrt = mode in {EXECUTION_AUTO, EXECUTION_TENSORRT}
     allow_cuda = mode in {EXECUTION_AUTO, EXECUTION_TENSORRT, EXECUTION_CUDA}
-    present = set(available)
+    allow_directml = mode in {EXECUTION_AUTO, EXECUTION_TENSORRT, EXECUTION_CUDA, EXECUTION_DIRECTML}
 
     if mode == EXECUTION_TENSORRT and TENSORRT not in present:
         logger.warning(
             "TensorRT was requested but TensorrtExecutionProvider is not in "
-            "this ONNX Runtime build (%s). Falling back to CUDA, then CPU.",
+            "this ONNX Runtime build (%s). Falling back to CUDA, then DirectML, then CPU.",
             ", ".join(available) or "no providers",
         )
 
-    attempts: list[ProviderList] = [
-        _gpu_providers(
+    def _attempt(use_trt: bool, use_cuda: bool) -> ProviderList:
+        return _gpu_providers(
             available,
-            allow_tensorrt=allow_tensorrt,
-            allow_cuda=allow_cuda,
+            allow_tensorrt=use_trt,
+            allow_cuda=use_cuda,
+            allow_directml=allow_directml,
             cache_dir=cache,
+            platform=plat,
         )
-    ]
+
+    attempts: list[ProviderList] = [_attempt(allow_tensorrt, allow_cuda)]
     if allow_tensorrt and TENSORRT in present:
-        attempts.append(
-            _gpu_providers(
-                available,
-                allow_tensorrt=False,
-                allow_cuda=allow_cuda,
-                cache_dir=cache,
-            )
-        )
+        attempts.append(_attempt(False, allow_cuda))
+    if allow_cuda and CUDA in present and allow_directml and DIRECTML in present and _is_windows(plat):
+        attempts.append(_attempt(False, False))
     attempts.append([CPU])
     return _dedupe(attempts)
 
@@ -377,7 +482,7 @@ def run_with_provider_fallback(
 
     raise RuntimeError(
         f"Could not start {what}. On an RTX 4070, install onnxruntime-gpu, "
-        "CUDA 12.x, and TensorRT 10.x, and put the TensorRT lib folder on PATH "
-        "(see the Videoswa README). CPU-only ONNX Runtime is the fallback when "
-        "those libraries are missing."
+        "CUDA 12.x, and TensorRT 10.x, and put the TensorRT lib folder on PATH. "
+        "If CUDA fails inside a convolution, install onnxruntime-directml instead "
+        "(requirements-windows-directml.txt). CPU is the last fallback."
     ) from last_error
