@@ -15,7 +15,10 @@ from faceswap.face_analyzer import Face, coerce_gender
 from faceswap.video import MAX_VIDEO_SECONDS, VIDEO_SUFFIXES, assert_duration_allowed
 
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".heic", ".heif"}
-MIN_ROI_CHANGE = 8.0
+# A face-region difference around 8 is a real swap on a small face (VERSA frame 10).
+# The full frame can still look unchanged. Only a near-zero difference means the
+# paste or mask erased the swap.
+MIN_ROI_CHANGE = 1.5
 FACE_MODE_SINGLE = "single"
 FACE_MODE_MULTIPLE = "multiple"
 
@@ -101,8 +104,9 @@ def _read_heic(path: Path) -> Optional[np.ndarray]:
 def roi_mean_change(original: np.ndarray, swapped: np.ndarray, boxes) -> float:
     """Largest mean absolute difference inside a swapped face box.
 
-    A tiny change on the face means the preview still looks like the original,
-    even when a swap was attempted.
+    Around 8 is a real identity change when the face is small. The full-frame
+    mean stays near zero in that case. A value under 1.5 means the paste mask
+    put the original face back.
     """
     if original is None or swapped is None or original.shape != swapped.shape:
         return 0.0

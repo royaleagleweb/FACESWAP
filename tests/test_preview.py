@@ -107,10 +107,10 @@ def test_preview_button_follows_video_and_source(tmp_path: Path, monkeypatch) ->
         window._single_source = image
         window._update_preview_button()
         app.processEvents()
-        assert window.preview_btn.isEnabled() is True
-
-        window.preview_btn.click()
-        app.processEvents()
+        if "job" not in captured:
+            assert window.preview_btn.isEnabled() is True
+            window.preview_btn.click()
+            app.processEvents()
         job = captured["job"]
         assert job.timestamp_s == 0.0
         assert job.swap.single_source == image

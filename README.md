@@ -28,10 +28,12 @@ A new clip, in order:
 3. The face list fills in on its own (or click **Detect faces**). Side and
    profile faces stay in the list. Thumbnails are labeled **Face 1 — Male**
    or **Face 2 — Female**.
-4. **Preview frame**. The sample must show an obvious identity change. If
-   nothing moved inside the face, a dialog tells you to move the slider, pick
-   a clearer photo, or lower **Min face size**. Drag **Before / after** to
-   wipe (0 is the original, 100 is the swap). **Play swapped** walks the clip.
+4. **Preview frame** runs on its own once a source and a face are both ready.
+   **Preview**, **Play swapped**, and **Swap** stay in the bar at the bottom.
+   A small face can change the face box by about 8 and still leave the full
+   frame looking almost the same — that is a real swap. Use **Before / after**
+   to see it. If the paste mask erases the face (the box does not change), a
+   dialog says so. **Play swapped** walks the clip.
 5. **Swap**. The MP4 keeps the original audio when **Keep audio** is on.
    **Cancel** stops between frames and does not leave an output file behind.
    If the export never swapped a face, the finished dialog says so and names

@@ -70,6 +70,7 @@ class SwapStats:
     faces_unmatched: int = 0
     faces_held: int = 0
     faces_skipped: int = 0
+    faces_wiped: int = 0
 
 
 @dataclass
@@ -201,6 +202,13 @@ class FaceSwapEngine:
             out = self.swapper.swap(
                 out, target_face=face, source_face=source, coverage=self.coverage
             )
+            if getattr(self.swapper, "paste_wiped", False):
+                self.stats.faces_wiped += 1
+                logger.warning(
+                    getattr(self.swapper, "last_paste_note", "")
+                    or "The paste mask wiped a swapped face."
+                )
+                continue
             self.last_boxes.append(np.asarray(face.bbox, dtype=np.float32).copy())
             self.stats.faces_swapped += 1
             if held:

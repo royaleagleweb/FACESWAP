@@ -170,6 +170,8 @@ class FaceSwapper:
         )
         if not paste_back:
             return swapped
+        self.paste_wiped = False
+        self.last_paste_note = ""
         mode = normalize_coverage(coverage)
         alpha = None
         if self.object_mask:
@@ -187,6 +189,13 @@ class FaceSwapper:
                 precise=precise,
                 yaw=yaw,
             )
+            if alpha is None or float(np.max(alpha)) < 0.05:
+                self._mark_wiped(
+                    "The face mask was empty, so the swapped face was not pasted. "
+                    "Turn Precise edges off. If the object mask removed the whole face, "
+                    "try another frame."
+                )
+                return frame
         previous = self.color_memory.get(self._color_key) if self._color_key is not None else None
         color_state: dict = {}
         out = paste_swapped_face(
@@ -224,7 +233,19 @@ class FaceSwapper:
                 import cv2
 
                 out = cv2.addWeighted(enhanced, strength, out, 1.0 - strength, 0.0)
+        if _box_mean_abs(frame, out, target_face.bbox) < 1.5:
+            self._mark_wiped(
+                "The paste mask wiped this swap. The face region did not change. "
+                "Turn Precise edges off and preview again. "
+                "A small face that changes by about 8 is a real swap and is kept."
+            )
+            return frame
         return out
+
+    def _mark_wiped(self, note: str) -> None:
+        self.paste_wiped = True
+        self.last_paste_note = note
+        logger.warning(note)
 
 
 class _FaceShim:
@@ -278,6 +299,20 @@ def _ensure_gfpgan_weights() -> Path:
     from .utils import ensure_gfpgan
 
     return ensure_gfpgan()
+
+
+def _box_mean_abs(before: np.ndarray, after: np.ndarray, bbox: np.ndarray) -> float:
+    """Mean absolute change inside a face box. About 8 is a real small-face swap."""
+    if before.shape != after.shape:
+        return 0.0
+    height, width = before.shape[:2]
+    x1, y1, x2, y2 = [int(round(float(v))) for v in np.asarray(bbox).reshape(-1)[:4]]
+    x1, y1 = max(0, x1), max(0, y1)
+    x2, y2 = min(width, x2), min(height, y2)
+    if x2 <= x1 or y2 <= y1:
+        return 0.0
+    delta = np.abs(before[y1:y2, x1:x2].astype(np.int16) - after[y1:y2, x1:x2].astype(np.int16))
+    return float(np.mean(delta))
 
 
 def _sharpen_roi(frame: np.ndarray, bbox: np.ndarray, amount: float) -> np.ndarray:

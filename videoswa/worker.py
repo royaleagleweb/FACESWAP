@@ -27,10 +27,16 @@ from videoswa.jobs import MIN_ROI_CHANGE, SwapRequest, build_mappings, read_imag
 
 def _quality_note(stats: SwapStats) -> str:
     """Tell the user why a swap still looks like the original, or looks soft."""
+    if getattr(stats, "faces_wiped", 0) and stats.faces_swapped <= 0:
+        return (
+            "The swap was computed, then the paste mask wiped the face back to the original. "
+            "Turn Precise edges off and run Preview again. "
+            "A small face that only shifts the face region by about 8 is a real swap and is kept."
+        )
     if stats.faces_swapped <= 0:
         return (
             "No faces were swapped, so the video still looks like the original. "
-            "Move the sample slider until a face is listed, use a clearer source photo, "
+            "Move the ref-frame slider until a face is listed, use a clearer source photo, "
             "or lower Min face size and the match threshold."
         )
     if stats.faces_detected <= 0:
@@ -384,23 +390,24 @@ class EngineWorker(QThread):
             engine, frame, mappings, scale=job.swap.scale, time_s=job.timestamp_s
         )
         change = roi_mean_change(frame, swapped, getattr(engine, "last_boxes", []))
-        unchanged = engine.stats.faces_swapped == 0 or change < MIN_ROI_CHANGE
-        if engine.stats.faces_swapped == 0:
+        wiped = engine.stats.faces_wiped > 0 and engine.stats.faces_swapped == 0
+        unchanged = wiped or engine.stats.faces_swapped == 0 or change < MIN_ROI_CHANGE
+        if wiped or (engine.stats.faces_swapped > 0 and change < MIN_ROI_CHANGE):
+            note = (
+                "The paste mask wiped this swap, so the frame still looks original. "
+                "Turn Precise edges off and preview again. "
+                "A small face that changes by about 8 inside the face box is a real swap and is kept."
+            )
+        elif engine.stats.faces_swapped == 0:
             note = (
                 "No face was swapped on this frame, so the preview still looks like the original. "
-                "Move the slider until a face is listed, use a clearer source photo, "
+                "Move the ref-frame slider until a face is listed, use a clearer source photo, "
                 "or lower the match threshold and Min face size."
-            )
-        elif change < MIN_ROI_CHANGE:
-            note = (
-                "The preview barely changed inside the face, so this is not a usable swap. "
-                "Move the slider to a clearer face, pick a clearer source photo, "
-                "or lower Min face size and the match threshold."
             )
         else:
             note = (
-                "Preview ready. The face identity changed. Drag Before / after, "
-                "then press Swap to export the video with audio."
+                f"Preview ready. The face changed (face-region difference {change:.0f}). "
+                "A small face barely moves the full frame — use Before / after to see it, then press Swap."
             )
         self.preview_ready.emit(frame, swapped, note, unchanged)
 

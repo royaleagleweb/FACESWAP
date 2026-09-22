@@ -142,14 +142,54 @@ def test_frame_ten_is_not_read_as_frame_zero(tmp_path: Path) -> None:
     assert float(tenth.mean()) > 200
 
 
-def test_tiny_roi_change_is_below_the_visible_swap_bar() -> None:
+def test_a_wiped_paste_is_not_counted_as_a_swap() -> None:
+    source = Face(
+        bbox=np.array([0, 0, 10, 10], dtype=np.float32),
+        kps=np.zeros((5, 2), dtype=np.float32),
+        embedding=np.array([1.0, 0.0], dtype=np.float32),
+        det_score=0.9,
+        gender=1,
+    )
+    target = Face(
+        bbox=np.array([4, 4, 36, 36], dtype=np.float32),
+        kps=np.zeros((5, 2), dtype=np.float32),
+        embedding=np.array([1.0, 0.0], dtype=np.float32),
+        det_score=0.9,
+        gender=1,
+    )
+
+    class _Analyzer:
+        def analyze(self, _frame):
+            return [target]
+
+    class _Wiper:
+        def swap(self, frame, target_face, source_face, paste_back=True, coverage="full"):
+            self.paste_wiped = True
+            self.last_paste_note = "The paste mask wiped this swap."
+            return frame
+
+    engine = FaceSwapEngine(analyzer=_Analyzer(), swapper=_Wiper(), similarity_threshold=0.2)
+    mapping = FaceMapping(source_face=source, reference_face=target)
+    frame = np.zeros((48, 48, 3), dtype=np.uint8)
+    assert engine.process_frame(frame, [mapping]).max() == 0
+    assert engine.stats.faces_swapped == 0
+    assert engine.stats.faces_wiped == 1
+
+
+def test_small_face_diff_around_eight_is_a_real_swap() -> None:
+    """VERSA frame 10 changed by about 8 inside the face. That is a swap.
+
+    The full frame stays near zero because the face is small. Only a wiped
+    paste (difference under 1.5) is a failure.
+    """
     original = np.full((40, 40, 3), 20, dtype=np.uint8)
-    swapped = original.copy()
-    swapped[8:24, 8:24] = 24
-    change = roi_mean_change(original, swapped, [np.array([8, 8, 24, 24])])
-    assert change < MIN_ROI_CHANGE
-    swapped[8:24, 8:24] = 200
-    assert roi_mean_change(original, swapped, [np.array([8, 8, 24, 24])]) >= MIN_ROI_CHANGE
+    wiped = original.copy()
+    wiped[8:24, 8:24] = 21
+    assert roi_mean_change(original, wiped, [np.array([8, 8, 24, 24])]) < MIN_ROI_CHANGE
+    real = original.copy()
+    real[8:24, 8:24] = 28
+    assert roi_mean_change(original, real, [np.array([8, 8, 24, 24])]) >= MIN_ROI_CHANGE
+    assert MIN_ROI_CHANGE < 8
 
 
 def test_match_gender_blocks_only_when_enabled() -> None:

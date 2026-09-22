@@ -240,13 +240,31 @@ class MainWindow(QMainWindow):
     def _build(self) -> None:
         root = QWidget()
         self.setCentralWidget(root)
-        outer = QHBoxLayout(root)
-        outer.setContentsMargins(12, 12, 12, 12)
-        outer.setSpacing(12)
+        shell = QVBoxLayout(root)
+        shell.setContentsMargins(12, 12, 12, 12)
+        shell.setSpacing(10)
+        columns = QHBoxLayout()
+        columns.setSpacing(12)
+        columns.addWidget(self._build_source_column())
+        columns.addLayout(self._build_preview_column(), stretch=1)
+        columns.addWidget(self._build_quality_column())
+        shell.addLayout(columns, stretch=1)
+        shell.addWidget(self._build_action_bar())
 
-        outer.addWidget(self._build_source_column())
-        outer.addLayout(self._build_preview_column(), stretch=1)
-        outer.addWidget(self._build_quality_column())
+    def _build_action_bar(self) -> QFrame:
+        """Preview, Play, and Swap stay on screen. They are the whole job."""
+        bar = QFrame()
+        bar.setObjectName("Panel")
+        row = QHBoxLayout(bar)
+        row.setContentsMargins(10, 8, 10, 8)
+        for widget in (self.detect_btn, self.preview_btn, self.play_btn):
+            widget.setMinimumHeight(40)
+            row.addWidget(widget)
+        self.run_btn.setMinimumHeight(52)
+        self.cancel_btn.setMinimumHeight(40)
+        row.addWidget(self.run_btn, stretch=1)
+        row.addWidget(self.cancel_btn)
+        return bar
 
     def _scroll(self, widget: QWidget, width: int) -> QScrollArea:
         scroll = QScrollArea()
@@ -719,7 +737,13 @@ class MainWindow(QMainWindow):
             }
             QPushButton:hover { background: #343b47; }
             QPushButton:disabled { color: #6d7580; }
-            QPushButton#Primary { background: #2f6fed; border-color: #2f6fed; }
+            QPushButton#Primary {
+                background: #2f6fed;
+                border-color: #2f6fed;
+                font-size: 18px;
+                font-weight: 700;
+                padding: 10px 18px;
+            }
             QPushButton#Primary:hover { background: #3d7cf5; }
             QProgressBar {
                 background: #12141a;
@@ -1029,6 +1053,9 @@ class MainWindow(QMainWindow):
                     "or lower Min face size and Detect sensitivity."
                 ),
             )
+            return
+        if self._preview_inputs_ready():
+            QTimer.singleShot(0, self._preview_swap)
 
     def _on_detect_failed(self, message: str) -> None:
         self.progress.setRange(0, 100)
@@ -1649,7 +1676,10 @@ class MainWindow(QMainWindow):
         self._set_busy(False)
         self._set_status(f"Wrote {path}. {summary}")
         self._stop_play()
-        if "still looks like the original" in summary or "No faces were swapped" in summary:
+        if any(
+            phrase in summary
+            for phrase in ("still looks like the original", "No faces were swapped", "wiped")
+        ):
             QMessageBox.warning(self, "Swap did not change the video", f"Saved\n{path}\n\n{summary}")
         else:
             QMessageBox.information(self, "Swap finished", f"Saved\n{path}\n\n{summary}")
