@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import numpy as np
 
+import cv2
+
 from faceswap.coverage import (
     FULL_BEARD_DEPTH_EM,
     coverage_alpha,
     face_axes,
     mask_reach_below_mouth,
     match_edge_color,
+    orient_paste_matrix,
     paste_swapped_face,
     template_128,
 )
@@ -118,6 +121,35 @@ def test_full_paste_replaces_beard_pixels_normal_leaves_them() -> None:
     assert alpha.max() >= 0.99
     assert np.any((alpha > 0.2) & (alpha < 0.8))
     assert FULL_BEARD_DEPTH_EM >= 1.8
+
+
+def test_inverted_matrix_is_reoriented_before_paste() -> None:
+    kps = _landmarks()
+    matrix = _umeyama(kps, template_128())
+    inverse = cv2.invertAffineTransform(matrix.astype(np.float64))
+    recovered = orient_paste_matrix(inverse, kps)
+    assert np.allclose(recovered, matrix, atol=1e-4)
+
+    frame = np.zeros((480, 460, 3), dtype=np.uint8)
+    frame[:, :] = (0, 190, 0)
+    swapped = np.full((128, 128, 3), 70, dtype=np.uint8)
+    swapped[100:128, :] = (0, 0, 255)
+    eye = template_128()[0]
+    ex, ey = int(round(eye[0])), int(round(eye[1]))
+    swapped[ey - 4:ey + 5, ex - 4:ex + 5] = (255, 0, 0)
+
+    corrected = paste_swapped_face(frame, swapped, inverse, kps, "full")
+    bx, by = _beard_pixel(kps, 1.5)
+    assert corrected[by, bx, 2] > 200
+    assert corrected[by, bx, 1] < 40
+    left_eye = kps[0].astype(int)
+    assert corrected[left_eye[1], left_eye[0], 0] > 200
+
+
+def test_degenerate_landmarks_keep_the_given_matrix() -> None:
+    matrix = np.array([[2.0, 0.0, 3.0], [0.0, 2.0, 4.0]], dtype=np.float64)
+    kept = orient_paste_matrix(matrix, np.zeros((5, 2), dtype=np.float64))
+    assert np.allclose(kept, matrix)
 
 
 def test_edge_color_match_keeps_the_interior() -> None:

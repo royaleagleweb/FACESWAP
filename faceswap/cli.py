@@ -25,7 +25,7 @@ from typing import List, Optional, Tuple
 
 import cv2
 
-from .core import FaceSwapEngine
+from .core import DEFAULT_SIMILARITY, FaceSwapEngine
 from .coverage import COVERAGE_CHOICES, DEFAULT_COVERAGE
 from .face_analyzer import FaceAnalyzer
 from .providers import EXECUTION_CHOICES
@@ -134,7 +134,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Source=Reference image pair. Repeat for multi-face swaps.",
     )
     s.add_argument("-o", "--output", help="Output path (default: outputs/<name>_videoswa.mp4)")
-    s.add_argument("--similarity", type=float, default=0.45, help="Cosine threshold for reference match")
+    s.add_argument(
+        "--similarity",
+        type=float,
+        default=DEFAULT_SIMILARITY,
+        help="Cosine threshold for the first lock. A tracked face is kept below this.",
+    )
     s.add_argument(
         "--coverage",
         choices=list(COVERAGE_CHOICES),

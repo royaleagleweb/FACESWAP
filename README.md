@@ -262,7 +262,7 @@ python run.py swap -t party.mp4 --pair alice.jpg=ref_alice.jpg --pair bob.jpg=re
 | `--cpu` | CPU only |
 | `--coverage full` | Jaw and beard replacement (default) |
 | `--coverage normal` | Tight inner-face oval |
-| `--similarity 0.45` | Cosine threshold for "this is the same person" |
+| `--similarity 0.32` | First-lock cosine threshold. A tracked face is kept below this |
 | `--enhance` | GFPGAN on each swapped face, if that extra is installed |
 | `--no-audio` | Drop the original audio track |
 | `--crf 18 --preset medium` | x264 quality and speed |
@@ -279,13 +279,29 @@ Videoswa's default is **full coverage**. The eyes, nose, and mouth still come
 from the aligned InSwapper crop. Below that crop, the swapped chin is stretched
 over a landmark footprint that runs about **two eye-to-mouth lengths below the
 mouth** and about **one eye-to-eye width out to each side of the jaw**. Inside
-that footprint the replacement is complete (mask value 1). Only the outer band
-is feathered, over roughly a fifth of the eye distance, so the edge is soft
-and the beard itself is not a half-transparent oval.
+that footprint the replacement is complete (mask value 1). The soft rim is a
+thin band, and only a light color correction is applied there, so the original
+face does not show back through the cheeks, jaw, or beard.
 
 The desktop control is **Face coverage**. **Full, including beard** is
 selected when the window opens. **Normal (tight face)** is the smaller oval.
 The CLI flag is `--coverage full` (default) or `--coverage normal`.
+
+## Quality tips
+
+A usable swap shows the source identity on the target person for almost every
+frame, including when the head turns a little.
+
+- Use a sharp, frontal source photo. The face should be unobstructed.
+- Sample a video frame where that person's face is clear and large.
+- Leave **Face coverage** on **Full, including beard**.
+- The match threshold starts at **32%**. Raise it if the wrong person is
+  swapped. Lower it only if the right person is left as the original.
+- Videoswa locks a face to its source while the box still overlaps and the
+  embedding is still that person, so a brief pose change does not flicker
+  back to the original clip. A different person in that box is not swapped.
+- **Sharpen swapped faces (GFPGAN)** stays off. Turn it on when the result
+  looks soft.
 
 ## Single face and multiple faces
 

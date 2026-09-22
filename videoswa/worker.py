@@ -14,7 +14,7 @@ from typing import Optional
 
 from PySide6.QtCore import QThread, Signal
 
-from faceswap.core import FaceSwapEngine
+from faceswap.core import FaceSwapEngine, SwapStats
 from faceswap.face_analyzer import FaceAnalyzer
 from faceswap.providers import format_providers, provider_status_text
 from faceswap.swapper import FaceSwapper
@@ -22,6 +22,22 @@ from faceswap.utils import logger
 from faceswap.video import SwapCancelled, process_video, read_frame_at, reset_stats
 from videoswa.images import crop_face
 from videoswa.jobs import SwapRequest, build_mappings
+
+
+def _quality_note(stats: SwapStats) -> str:
+    """Tell the user why a swap still looks like the original, or looks soft."""
+    if stats.faces_detected <= 0:
+        return (
+            "No faces were detected. Sample a frame where the face is clear and frontal."
+        )
+    if stats.faces_swapped < 0.7 * stats.faces_detected and stats.faces_unmatched > stats.faces_swapped:
+        return (
+            "Many frames kept the original face. Use a clear frontal sample, "
+            "or lower the match threshold. Raise it if the wrong person is swapped."
+        )
+    return (
+        "If the swap looks soft, enable Sharpen swapped faces (GFPGAN). It stays off until you turn it on."
+    )
 
 
 @dataclass
@@ -175,4 +191,7 @@ class EngineWorker(QThread):
             f"Frames {stats.frames} · faces detected {stats.faces_detected} · "
             f"swapped {stats.faces_swapped} · unmatched {stats.faces_unmatched}"
         )
+        if stats.faces_held:
+            summary += f" · held through {stats.faces_held} softer frame(s)"
+        summary += " " + _quality_note(stats)
         self.swap_finished.emit(str(output), summary)

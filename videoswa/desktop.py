@@ -269,11 +269,24 @@ class MainWindow(QMainWindow):
         sim_row.addWidget(QLabel("Match threshold"))
         self.similarity = QSpinBox()
         self.similarity.setRange(10, 90)
-        self.similarity.setValue(45)
+        self.similarity.setValue(32)
         self.similarity.setSuffix(" %")
-        self.similarity.setToolTip("Cosine similarity required to treat a detection as the same person.")
+        self.similarity.setToolTip(
+            "Similarity required to lock a person the first time. After that, "
+            "Videoswa keeps the same source while the face stays in place. "
+            "Raise this if the wrong person is swapped."
+        )
         sim_row.addWidget(self.similarity)
         form.addLayout(sim_row)
+        tips = QLabel(
+            "Quality tips: use a sharp frontal source photo, sample a frame where "
+            "the face is clear, and leave coverage on Full. Raise the match "
+            "threshold only if the wrong person is swapped. If the result looks "
+            "soft, enable GFPGAN below — it stays off until you turn it on."
+        )
+        tips.setWordWrap(True)
+        tips.setObjectName("Muted")
+        form.addWidget(tips)
 
         form.addWidget(QLabel("Face coverage"))
         self.coverage = QComboBox()
@@ -301,7 +314,8 @@ class MainWindow(QMainWindow):
         install_tip = gfpgan_install_tip()
         self.enhance.setToolTip(
             install_tip
-            or "Optional. The first enhanced swap downloads GFPGANv1.4.pth into models/."
+            or "Optional, and off by default. Turn this on when the swap looks soft. "
+            "The first enhanced swap downloads GFPGANv1.4.pth into models/."
         )
         self.enhance.toggled.connect(self._on_enhance_toggled)
         form.addWidget(self.keep_audio)

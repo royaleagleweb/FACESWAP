@@ -9,7 +9,7 @@ from typing import Optional
 import cv2
 import numpy as np
 
-from faceswap.core import FaceMapping, FaceSwapEngine
+from faceswap.core import DEFAULT_SIMILARITY, FaceMapping, FaceSwapEngine
 from faceswap.coverage import DEFAULT_COVERAGE
 from faceswap.face_analyzer import Face
 from faceswap.video import MAX_VIDEO_SECONDS, VIDEO_SUFFIXES, assert_duration_allowed
@@ -34,7 +34,7 @@ class SwapRequest:
     output_path: Path
     execution: str = "auto"
     enhance: bool = False
-    similarity: float = 0.45
+    similarity: float = DEFAULT_SIMILARITY
     coverage: str = DEFAULT_COVERAGE
     keep_audio: bool = True
     crf: int = 18

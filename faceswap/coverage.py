@@ -154,7 +154,9 @@ def coverage_alpha(shape: tuple[int, int], kps: np.ndarray, coverage: str = DEFA
     if not np.any(binary):
         return alpha
     dist = cv2.distanceTransform(binary, cv2.DIST_L2, 5)
-    t = np.clip(dist / feather, 0.0, 1.0)
+    # Reach full replacement a short distance inside the outline. A wide
+    # ramp leaves the original face showing through the cheeks and jaw.
+    t = np.clip(dist / (feather * 0.55), 0.0, 1.0)
     # Smoothstep: flat 0 outside, flat 1 once `feather` px inside the outline.
     alpha = (t * t * (3.0 - 2.0 * t)).astype(np.float32)
     return alpha
@@ -199,6 +201,7 @@ def paste_swapped_face(
     mode = normalize_coverage(coverage)
     if swapped_bgr is None or swapped_bgr.size == 0 or matrix is None:
         return frame_bgr
+    matrix = orient_paste_matrix(matrix, kps, size=int(swapped_bgr.shape[0]))
     alpha = coverage_alpha(frame_bgr.shape[:2], kps, mode)
     if float(alpha.max()) <= 0.0:
         return frame_bgr
@@ -247,9 +250,74 @@ def match_edge_color(warped: np.ndarray, roi: np.ndarray, weight: np.ndarray) ->
     if int(np.count_nonzero(rim)) < 16:
         return warped
     delta = roi[rim].mean(axis=0) - warped[rim].mean(axis=0)
-    strength = np.clip((1.0 - alpha) * 0.9, 0.0, 1.0).astype(np.float32)[..., None]
+    # A strong shift paints the original skin back onto the rim and the swap
+    # reads as the source clip. Keep only a light edge correction.
+    strength = np.clip((1.0 - alpha) * 0.35, 0.0, 1.0).astype(np.float32)[..., None]
     shifted = warped.astype(np.float32) + delta.astype(np.float32) * strength
     return np.clip(shifted, 0.0, 255.0)
+
+
+def orient_paste_matrix(matrix: np.ndarray, kps: np.ndarray, size: int = 128) -> np.ndarray:
+    """Return the 2×3 frame→crop matrix that lands landmarks on the template.
+
+    InsightFace ``estimate_norm`` maps the frame landmarks onto the 128px
+    template. If a session instead returns the crop→frame matrix, sampling
+    it as frame→crop pastes the identity in the wrong place.
+    """
+    forward = np.asarray(matrix, dtype=np.float64).reshape(2, 3)
+    template = template_128()
+    if size != 128:
+        template = template * (float(size) / 128.0)
+    if _maps_onto_template(forward, kps, template):
+        return forward
+    try:
+        inverse = cv2.invertAffineTransform(forward)
+    except cv2.error:
+        inverse = None
+    if inverse is not None and _maps_onto_template(inverse, kps, template):
+        return np.asarray(inverse, dtype=np.float64)
+    if face_axes(kps) is None:
+        return forward
+    rebuilt = _estimate_similarity(np.asarray(kps, dtype=np.float64).reshape(-1, 2), template)
+    if rebuilt is not None and _maps_onto_template(rebuilt, kps, template):
+        return rebuilt
+    return forward
+
+
+def _maps_onto_template(matrix: np.ndarray, kps: np.ndarray, template: np.ndarray, tol: float = 8.0) -> bool:
+    pts = np.asarray(kps, dtype=np.float64).reshape(-1, 2)
+    if pts.shape != template.shape:
+        return False
+    mapped = np.hstack([pts, np.ones((pts.shape[0], 1))]) @ np.asarray(matrix, dtype=np.float64).reshape(2, 3).T
+    return float(np.linalg.norm(mapped - template, axis=1).max()) <= tol
+
+
+def _estimate_similarity(src: np.ndarray, dst: np.ndarray) -> Optional[np.ndarray]:
+    """Umeyama similarity: ``src`` (frame landmarks) → ``dst`` (template)."""
+    src = np.asarray(src, dtype=np.float64)
+    dst = np.asarray(dst, dtype=np.float64)
+    if src.shape != dst.shape or src.shape[0] < 2:
+        return None
+    count = src.shape[0]
+    mu_src = src.mean(axis=0)
+    mu_dst = dst.mean(axis=0)
+    src_c = src - mu_src
+    dst_c = dst - mu_dst
+    variance = float((src_c ** 2).sum() / count)
+    if variance < 1e-8:
+        return None
+    cov = (dst_c.T @ src_c) / count
+    u, singular, vt = np.linalg.svd(cov)
+    sign = np.eye(2)
+    if np.linalg.det(u) * np.linalg.det(vt) < 0:
+        sign[1, 1] = -1
+    rotation = u @ sign @ vt
+    scale = float(np.trace(np.diag(singular) @ sign) / variance)
+    translation = mu_dst - scale * (rotation @ mu_src)
+    matrix = np.zeros((2, 3), dtype=np.float64)
+    matrix[:, :2] = scale * rotation
+    matrix[:, 2] = translation
+    return matrix
 
 
 def mask_reach_below_mouth(alpha: np.ndarray, kps: np.ndarray, threshold: float = 0.5) -> float:

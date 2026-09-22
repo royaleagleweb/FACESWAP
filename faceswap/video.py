@@ -241,6 +241,9 @@ def process_video(
     expected = info.frame_count
     if expected <= 0 and info.fps > 0:
         expected = max(1, int(round(info.duration_s * info.fps)))
+    reset_tracks = getattr(engine, "reset_tracks", None)
+    if callable(reset_tracks):
+        reset_tracks()
 
     cap = cv2.VideoCapture(str(input_path))
     if not cap.isOpened():
@@ -358,4 +361,7 @@ def process_image(
 
 def reset_stats(engine: FaceSwapEngine) -> SwapStats:
     engine.stats = SwapStats()
+    reset_tracks = getattr(engine, "reset_tracks", None)
+    if callable(reset_tracks):
+        reset_tracks()
     return engine.stats
