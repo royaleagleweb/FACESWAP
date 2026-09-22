@@ -350,8 +350,8 @@ pip install pytest
 pytest
 ```
 
-The suite covers the TensorRT → CUDA → CPU provider order, CUDA conv
-failures falling back to CPU, the 5-minute
+The suite covers the TensorRT → CUDA → CPU provider order, Windows DirectML
+before CPU, CUDA conv failures falling back to CPU, the 5-minute
 rejection (no frames swapped), cancel, gender labels, single-face versus
 per-face mapping, multi-face matching, and that the desktop window opens on
 Single face with full beard coverage. It does not download the swap models
