@@ -1,0 +1,10 @@
+# NVIDIA Windows (RTX 4070 class). Do this AFTER requirements.txt, from an
+# activated virtualenv. onnxruntime and onnxruntime-gpu cannot both be installed.
+#
+#   pip uninstall -y onnxruntime onnxruntime-directml
+#   pip install -r requirements-windows-gpu.txt
+#
+# 1.22.x is the CUDA 12.8 build that matches TensorRT 10.9 in the README.
+# onnxruntime-gpu 1.27 and newer publish CUDA 13 wheels instead — use those
+# only when CUDA 13 and a matching TensorRT build are what you installed.
+onnxruntime-gpu==1.22.0

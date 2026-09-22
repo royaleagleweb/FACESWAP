@@ -1,0 +1,4 @@
+# Optional. Enables the "Sharpen swapped faces" checkbox and `--enhance`.
+# These packages pull an older PyTorch stack; the desktop app runs without them.
+gfpgan>=1.3.8
+basicsr>=1.4.2

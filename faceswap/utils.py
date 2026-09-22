@@ -29,12 +29,12 @@ for _d in (MODELS_DIR, TEMP_DIR, OUTPUTS_DIR):
     _d.mkdir(parents=True, exist_ok=True)
 
 
-# Public mirrors for the inswapper_128 ONNX model. The model is the same one
-# used by the official InsightFace examples; checksum verifies integrity.
+# Public mirrors for InsightFace's inswapper_128 ONNX model. The checksum
+# verifies integrity. Drop the file at models/inswapper_128.onnx to skip this.
 INSWAPPER_URLS = [
-    "https://github.com/facefusion/facefusion-assets/releases/download/models-3.0.0/inswapper_128.onnx",
     "https://huggingface.co/ezioruan/inswapper_128.onnx/resolve/main/inswapper_128.onnx",
     "https://huggingface.co/deepinsight/inswapper/resolve/main/inswapper_128.onnx",
+    "https://huggingface.co/datasets/Gourieff/ReActor/resolve/main/models/inswapper_128.onnx",
 ]
 INSWAPPER_SHA256 = "a290273ed497312095dac48cdef20feec9d5208298223dd01288ab202b54bea7"
 
@@ -90,18 +90,14 @@ def ensure_inswapper() -> Path:
     return download_file(INSWAPPER_URLS, target, INSWAPPER_SHA256)
 
 
-def select_providers(use_gpu: bool = True) -> list[str]:
-    """Pick onnxruntime execution providers based on what's installed."""
-    try:
-        import onnxruntime as ort
-    except ImportError as exc:
-        raise RuntimeError("onnxruntime is required") from exc
+def select_providers(use_gpu: bool = True, execution: str = "auto"):
+    """First ONNX Runtime provider list Videoswa will try.
 
-    available = set(ort.get_available_providers())
-    preferred: list[str] = []
-    if use_gpu:
-        for p in ("CUDAExecutionProvider", "CoreMLExecutionProvider", "DmlExecutionProvider"):
-            if p in available:
-                preferred.append(p)
-    preferred.append("CPUExecutionProvider")
-    return preferred
+    Kept for callers that only need the preferred list. Loading code should
+    use ``faceswap.providers.provider_attempts`` so a failed TensorRT session
+    can fall back to CUDA and then CPU.
+    """
+    from .providers import provider_attempts
+
+    mode = "cpu" if not use_gpu else execution
+    return provider_attempts(mode)[0]

@@ -10,25 +10,56 @@ from typing import Optional
 
 import numpy as np
 
+from .coverage import DEFAULT_COVERAGE, normalize_coverage, paste_swapped_face
 from .face_analyzer import Face
-from .utils import ensure_inswapper, logger, select_providers
+from .providers import (
+    active_providers_from_sessions,
+    provider_attempts,
+    run_with_provider_fallback,
+    uses_gpu,
+)
+from .utils import ensure_inswapper, logger
 
 
 class FaceSwapper:
-    """Swap a target face in a frame with a source face's identity."""
+    """Swap a target face in a frame with a source face's identity.
 
-    def __init__(self, use_gpu: bool = True, enhance: bool = False) -> None:
+    ``execution="auto"`` registers TensorRT, then CUDA, then CPU. A failed
+    TensorRT session is retried without it. ``use_gpu=False`` forces CPU.
+    """
+
+    def __init__(
+        self,
+        use_gpu: bool = True,
+        enhance: bool = False,
+        execution: str = "auto",
+    ) -> None:
         import insightface  # local import
 
         model_path = ensure_inswapper()
-        providers = select_providers(use_gpu=use_gpu)
-        logger.info("FaceSwapper providers: %s", providers)
-        self.swapper = insightface.model_zoo.get_model(
-            str(model_path), providers=providers
+        mode = "cpu" if not use_gpu else execution
+        attempts = provider_attempts(mode)
+
+        def _load(providers):
+            model = insightface.model_zoo.get_model(str(model_path), providers=providers)
+            session = getattr(model, "session", None)
+            active = active_providers_from_sessions([session] if session is not None else [])
+            if uses_gpu(providers) and active == ["CPUExecutionProvider"]:
+                raise RuntimeError(
+                    "InSwapper fell back to CPU. TensorRT or CUDA libraries "
+                    "are probably missing from PATH."
+                )
+            return model, active
+
+        loaded, providers = run_with_provider_fallback(
+            attempts, _load, what="InSwapper (inswapper_128)"
         )
+        self.swapper, self.active_providers = loaded
+        self.providers = providers
+        logger.info("InSwapper active providers: %s", self.active_providers or "(unreported)")
         self._enhancer = None
         if enhance:
-            self._enhancer = _try_load_gfpgan(use_gpu=use_gpu)
+            self._enhancer = _try_load_gfpgan(use_gpu=uses_gpu(providers))
 
     def swap(
         self,
@@ -36,15 +67,35 @@ class FaceSwapper:
         target_face: Face,
         source_face: Face,
         paste_back: bool = True,
+        coverage: str = DEFAULT_COVERAGE,
     ) -> np.ndarray:
-        """Replace target_face in frame with source_face identity."""
+        """Replace target_face in frame with source_face identity.
+
+        ``coverage="full"`` (default) extends the paste over the jaw and beard.
+        ``coverage="normal"`` keeps the tight face oval.
+        """
         # InsightFace expects its own Face objects, but the swapper actually only
         # uses .kps and .normed_embedding. We pass a small shim.
         src_shim = _FaceShim(source_face)
         tgt_shim = _FaceShim(target_face)
-        out = self.swapper.get(frame, tgt_shim, src_shim, paste_back=paste_back)
+        # paste_back=False returns the 128px swap plus the frame→crop matrix.
+        # Videoswa composites that itself so the beard is not cropped off.
+        swapped, matrix = self.swapper.get(frame, tgt_shim, src_shim, paste_back=False)
+        if not paste_back:
+            return swapped
+        out = paste_swapped_face(
+            frame,
+            swapped,
+            matrix,
+            target_face.kps,
+            coverage=normalize_coverage(coverage),
+        )
         if self._enhancer is not None:
-            out = _enhance_face_region(out, target_face.bbox, self._enhancer)
+            out = _enhance_face_region(
+                out,
+                _enhance_bbox(target_face.bbox, coverage),
+                self._enhancer,
+            )
         return out
 
 
@@ -88,6 +139,24 @@ def _ensure_gfpgan_weights() -> Path:
         "https://github.com/TencentARC/GFPGAN/releases/download/v1.3.4/GFPGANv1.4.pth",
     ]
     return download_file(urls, target, expected_sha256=None)
+
+
+def _enhance_bbox(bbox: np.ndarray, coverage: str) -> np.ndarray:
+    """Grow the enhancer window so a full-coverage beard is inside it."""
+    x1, y1, x2, y2 = [float(v) for v in bbox]
+    width = max(1.0, x2 - x1)
+    height = max(1.0, y2 - y1)
+    if normalize_coverage(coverage) == "full":
+        x1 -= 0.30 * width
+        x2 += 0.30 * width
+        y1 -= 0.20 * height
+        y2 += 0.95 * height
+    else:
+        x1 -= 0.15 * width
+        x2 += 0.15 * width
+        y1 -= 0.15 * height
+        y2 += 0.20 * height
+    return np.array([x1, y1, x2, y2], dtype=np.float32)
 
 
 def _enhance_face_region(frame: np.ndarray, bbox: np.ndarray, enhancer) -> np.ndarray:

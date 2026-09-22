@@ -14,6 +14,7 @@ from typing import Iterable, List, Optional, Sequence
 
 import numpy as np
 
+from .coverage import DEFAULT_COVERAGE
 from .face_analyzer import Face, FaceAnalyzer, cosine_similarity
 from .swapper import FaceSwapper
 from .utils import logger
@@ -53,6 +54,7 @@ class FaceSwapEngine:
     analyzer: FaceAnalyzer
     swapper: FaceSwapper
     similarity_threshold: float = 0.45
+    coverage: str = DEFAULT_COVERAGE
     apply_to_all_when_no_reference: bool = True
     stats: SwapStats = field(default_factory=SwapStats)
 
@@ -86,7 +88,9 @@ class FaceSwapEngine:
                     best_sim = sim
                     best = m
             if best is not None and best_sim >= self.similarity_threshold:
-                out = self.swapper.swap(out, target_face=face, source_face=best.source_face)
+                out = self.swapper.swap(
+                    out, target_face=face, source_face=best.source_face, coverage=self.coverage
+                )
                 self.stats.faces_swapped += 1
                 continue
 
@@ -94,7 +98,9 @@ class FaceSwapEngine:
                 # If multiple wildcard mappings exist, use the first one — caller
                 # is expected to provide just one wildcard.
                 m = wildcard[0]
-                out = self.swapper.swap(out, target_face=face, source_face=m.source_face)
+                out = self.swapper.swap(
+                    out, target_face=face, source_face=m.source_face, coverage=self.coverage
+                )
                 self.stats.faces_swapped += 1
             else:
                 self.stats.faces_unmatched += 1

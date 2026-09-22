@@ -7,7 +7,14 @@ from typing import List, Optional
 
 import numpy as np
 
-from .utils import logger, select_providers
+from .providers import (
+    CPU,
+    active_providers_from_sessions,
+    provider_attempts,
+    run_with_provider_fallback,
+    uses_gpu,
+)
+from .utils import logger
 
 
 @dataclass
@@ -37,21 +44,49 @@ class Face:
 
 
 class FaceAnalyzer:
-    """Wraps insightface.FaceAnalysis for detection + embedding extraction."""
+    """Wraps insightface.FaceAnalysis for detection + embedding extraction.
+
+    ``execution`` selects the ONNX Runtime provider order. ``auto`` (the
+    default) is TensorRT, then CUDA, then CPU. ``use_gpu=False`` forces CPU
+    and overrides ``execution``.
+    """
 
     def __init__(
         self,
         det_size: tuple[int, int] = (640, 640),
         use_gpu: bool = True,
         det_thresh: float = 0.5,
+        execution: str = "auto",
     ) -> None:
         from insightface.app import FaceAnalysis  # local import; heavy
 
-        providers = select_providers(use_gpu=use_gpu)
-        logger.info("FaceAnalyzer providers: %s", providers)
+        mode = "cpu" if not use_gpu else execution
+        attempts = provider_attempts(mode)
 
-        self.app = FaceAnalysis(name="buffalo_l", providers=providers)
-        self.app.prepare(ctx_id=0 if use_gpu else -1, det_size=det_size, det_thresh=det_thresh)
+        def _load(providers):
+            app = FaceAnalysis(name="buffalo_l", providers=providers)
+            app.prepare(
+                ctx_id=0 if uses_gpu(providers) else -1,
+                det_size=det_size,
+                det_thresh=det_thresh,
+            )
+            sessions = [
+                getattr(model, "session", None)
+                for model in getattr(app, "models", {}).values()
+            ]
+            active = active_providers_from_sessions(session for session in sessions if session)
+            if uses_gpu(providers) and active == [CPU]:
+                raise RuntimeError(
+                    "ONNX Runtime fell back to CPU. TensorRT or CUDA libraries "
+                    "are probably missing from PATH."
+                )
+            return app, active
+
+        loaded, providers = run_with_provider_fallback(attempts, _load, what="Face detection (buffalo_l)")
+        self.app, active = loaded
+        self.providers = providers
+        self.active_providers = active
+        logger.info("FaceAnalyzer active providers: %s", active or "(unreported)")
 
     def analyze(self, image_bgr: np.ndarray) -> List[Face]:
         """Detect every face in an image and return them sorted left-to-right."""
