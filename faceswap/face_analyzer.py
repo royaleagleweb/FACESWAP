@@ -11,6 +11,7 @@ from .providers import (
     CPU,
     active_providers_from_sessions,
     provider_attempts,
+    run_with_cuda_fallback,
     run_with_provider_fallback,
     uses_gpu,
 )
@@ -62,6 +63,11 @@ class FaceAnalyzer:
         det_thresh: float = 0.5,
         execution: str = "auto",
     ) -> None:
+        self.det_size = det_size
+        self.det_thresh = det_thresh
+        self._load(use_gpu=use_gpu, execution=execution)
+
+    def _load(self, use_gpu: bool, execution: str) -> None:
         from insightface.app import FaceAnalysis  # local import; heavy
 
         mode = "cpu" if not use_gpu else execution
@@ -71,8 +77,8 @@ class FaceAnalyzer:
             app = FaceAnalysis(name="buffalo_l", providers=providers)
             app.prepare(
                 ctx_id=0 if uses_gpu(providers) else -1,
-                det_size=det_size,
-                det_thresh=det_thresh,
+                det_size=self.det_size,
+                det_thresh=self.det_thresh,
             )
             sessions = [
                 getattr(model, "session", None)
@@ -90,12 +96,22 @@ class FaceAnalyzer:
         self.app, active = loaded
         self.providers = providers
         self.active_providers = active
+        self._on_cpu = not uses_gpu(providers)
         logger.info("FaceAnalyzer active providers: %s", active or "(unreported)")
+
+    def adopt_cpu(self) -> None:
+        """Drop a CUDA/TensorRT session that failed while the graph was running."""
+        if self._on_cpu:
+            return
+        self._load(use_gpu=False, execution="cpu")
 
     def analyze(self, image_bgr: np.ndarray) -> List[Face]:
         """Detect every face in an image and return them sorted left-to-right."""
         if image_bgr is None or image_bgr.size == 0:
             return []
+        return run_with_cuda_fallback(getattr(self, "cuda_guard", None), lambda: self._analyze_impl(image_bgr))
+
+    def _analyze_impl(self, image_bgr: np.ndarray) -> List[Face]:
         raw = self.app.get(image_bgr)
         faces: List[Face] = []
         for f in raw:

@@ -16,6 +16,7 @@ import numpy as np
 
 from .coverage import DEFAULT_COVERAGE
 from .face_analyzer import Face, FaceAnalyzer, cosine_similarity
+from .providers import CudaRuntimeGuard
 from .swapper import FaceSwapper
 from .utils import logger
 
@@ -57,6 +58,12 @@ class FaceSwapEngine:
     coverage: str = DEFAULT_COVERAGE
     apply_to_all_when_no_reference: bool = True
     stats: SwapStats = field(default_factory=SwapStats)
+
+    def __post_init__(self) -> None:
+        self.cuda_guard = CudaRuntimeGuard()
+        for member in (self.analyzer, self.swapper):
+            if hasattr(member, "adopt_cpu"):
+                self.cuda_guard.attach(member)
 
     def process_frame(
         self,

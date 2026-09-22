@@ -40,6 +40,93 @@ def default_trt_cache_dir() -> Path:
     return MODELS_DIR / "trt_cache"
 
 
+CUDA_FAILED_STATUS = "CUDA failed; using CPU"
+
+# cuDNN 9's frontend conv path (ORT 1.20+) can create a CUDA session and then
+# fail inside Conv with ``CUDNN_FE failure 7: GRAPH_EXECUTION_FAILED``.
+# ONNX Runtime does not expose a provider option that turns that frontend off.
+# ``ORT_DISABLE_CUDNN_FRONTEND=1`` is the switch newer builds and Windows
+# launchers honor; ``cudnn_conv_algo_search=DEFAULT`` is the fallback heuristic
+# the CUDA provider does expose.
+_CUDA_RUNTIME_MARKERS = (
+    "CUDNN_FE",
+    "GRAPH_EXECUTION_FAILED",
+    "FAILED TO INITIALIZE CUDNN",
+    "CUDNN_STATUS",
+    "CUDA FAILURE",
+    "CUDA_ERROR",
+    "CUBLAS_STATUS",
+)
+
+
+def configure_cuda_runtime() -> None:
+    """Prefer the cuDNN path that does not use the broken frontend graph.
+
+    Set ``ORT_DISABLE_CUDNN_FRONTEND=0`` before startup to keep the faster
+    HEURISTIC search. The variable is applied before ONNX Runtime is imported.
+    """
+    os.environ.setdefault("ORT_DISABLE_CUDNN_FRONTEND", "1")
+
+
+def cudnn_frontend_disabled() -> bool:
+    configure_cuda_runtime()
+    return _env_flag("ORT_DISABLE_CUDNN_FRONTEND", True)
+
+
+def is_cuda_runtime_failure(exc: BaseException) -> bool:
+    """True when a session already started and a CUDA/cuDNN kernel then failed."""
+    text = f"{type(exc).__name__}: {exc}".upper()
+    return any(marker in text for marker in _CUDA_RUNTIME_MARKERS)
+
+
+class CudaRuntimeGuard:
+    """Rebuild every attached session on CPU after a mid-graph CUDA failure."""
+
+    def __init__(self) -> None:
+        self.members: list[object] = []
+        self.note: Optional[str] = None
+        self.on_fallback: Optional[Callable[[str], None]] = None
+
+    def attach(self, member: object) -> None:
+        if member not in self.members:
+            self.members.append(member)
+        setattr(member, "cuda_guard", self)
+
+    def recover(self, exc: BaseException) -> bool:
+        if not is_cuda_runtime_failure(exc):
+            return False
+        if self.note:
+            return False
+        if not any(_member_uses_gpu(member) for member in self.members):
+            return False
+        logger.warning("%s. %s", CUDA_FAILED_STATUS, exc)
+        for member in self.members:
+            adopt = getattr(member, "adopt_cpu", None)
+            if callable(adopt):
+                adopt()
+        self.note = CUDA_FAILED_STATUS
+        if self.on_fallback is not None:
+            self.on_fallback(self.note)
+        return True
+
+
+def _member_uses_gpu(member: object) -> bool:
+    providers = getattr(member, "providers", None)
+    if not providers:
+        return False
+    return uses_gpu(providers)
+
+
+def run_with_cuda_fallback(guard: Optional[CudaRuntimeGuard], fn: Callable[[], object]) -> object:
+    """Run ``fn`` once, and once more on CPU if CUDA fails inside the graph."""
+    try:
+        return fn()
+    except Exception as exc:
+        if guard is None or not guard.recover(exc):
+            raise
+    return fn()
+
+
 def preload_runtime_libraries() -> None:
     """Load CUDA/cuDNN DLLs shipped as Python wheels, when ORT supports it.
 
@@ -47,6 +134,7 @@ def preload_runtime_libraries() -> None:
     TensorRT ``lib`` directory still has to be on ``PATH`` (Windows) or
     ``LD_LIBRARY_PATH`` (Linux).
     """
+    configure_cuda_runtime()
     try:
         import onnxruntime as ort
     except ImportError:
@@ -123,11 +211,14 @@ def tensorrt_provider_options(cache_dir: Path) -> dict:
 
 
 def cuda_provider_options() -> dict:
+    # DEFAULT selects cuDNN frontend HeurMode FALLBACK, which is the least
+    # aggressive conv path this ONNX Runtime build exposes. HEURISTIC is
+    # faster when the frontend graph actually runs.
+    search = "DEFAULT" if cudnn_frontend_disabled() else "HEURISTIC"
     return {
         "device_id": _device_id(),
         "arena_extend_strategy": "kNextPowerOfTwo",
-        # HEURISTIC avoids the long exhaustive autotune on every new shape.
-        "cudnn_conv_algo_search": "HEURISTIC",
+        "cudnn_conv_algo_search": search,
         "do_copy_in_default_stream": True,
     }
 

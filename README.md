@@ -184,6 +184,29 @@ with CUDA, then CPU, and the log says which one came up. The usual cause is
 `nvinfer_10.dll` not on PATH, or a TensorRT build that does not match the
 ONNX Runtime wheel.
 
+Auto mode still requests TensorRT, then CUDA, then CPU. A CUDA session can
+start and then die inside a convolution (`CUDNN_FE` / `GRAPH_EXECUTION_FAILED`
+on an RTX 4070). Videoswa treats that as a runtime failure, drops both the
+detector and InSwapper sessions, and continues on CPU. The status line says
+**CUDA failed; using CPU**.
+
+ONNX Runtime does not offer a provider option that disables the cuDNN
+frontend. The switch it does honor is the environment variable, and the CUDA
+option it does expose is `cudnn_conv_algo_search=DEFAULT` (the fallback
+heuristic). Videoswa sets `ORT_DISABLE_CUDNN_FRONTEND=1` when you have not set
+it, before ONNX Runtime is imported. A desktop shortcut or `Videoswa` launcher
+should do the same if it starts Python itself:
+
+```bat
+set ORT_DISABLE_CUDNN_FRONTEND=1
+.venv\Scripts\python.exe -m videoswa
+```
+
+Set `ORT_DISABLE_CUDNN_FRONTEND=0` before launch to keep the faster HEURISTIC
+search. `onnxruntime-gpu==1.19.2` is the last Windows build without the cuDNN
+9 frontend conv path; it does not match TensorRT 10.9. `1.20.1` still uses
+that frontend (TensorRT 10.4). Keep `1.22.0` when you want TensorRT 10.9.
+
 ### CPU-only Windows
 
 Skip CUDA and TensorRT. `pip install -r requirements.txt` is enough, then
@@ -328,5 +351,10 @@ requirements-windows-gpu.txt
 - **Provider list has no TensorRT.** Confirm `nvinfer_10.dll` is on PATH and
   that TensorRT, CUDA, and `onnxruntime-gpu` are the versions in the table.
   CUDA-only is still a supported fallback.
+- **Detect faces fails with `CUDNN_FE` / `GRAPH_EXECUTION_FAILED`.** The CUDA
+  provider loaded, then cuDNN rejected a convolution. Videoswa rebuilds on
+  CPU and the status line says `CUDA failed; using CPU`. Launch with
+  `ORT_DISABLE_CUDNN_FRONTEND=1` (Videoswa sets this when it is unset). Use
+  the project `.venv\Scripts\python.exe`, not a system Python 3.11.
 - **First GPU run is very slow.** TensorRT is building engines in
   `models/trt_cache`. The next run of the same model should start promptly.

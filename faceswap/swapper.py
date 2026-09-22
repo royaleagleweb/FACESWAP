@@ -15,6 +15,7 @@ from .face_analyzer import Face
 from .providers import (
     active_providers_from_sessions,
     provider_attempts,
+    run_with_cuda_fallback,
     run_with_provider_fallback,
     uses_gpu,
 )
@@ -34,6 +35,10 @@ class FaceSwapper:
         enhance: bool = False,
         execution: str = "auto",
     ) -> None:
+        self._enhance_requested = bool(enhance)
+        self._load(use_gpu=use_gpu, execution=execution, enhance=enhance)
+
+    def _load(self, use_gpu: bool, execution: str, enhance: bool) -> None:
         import insightface  # local import
 
         model_path = ensure_inswapper()
@@ -56,10 +61,17 @@ class FaceSwapper:
         )
         self.swapper, self.active_providers = loaded
         self.providers = providers
+        self._on_cpu = not uses_gpu(providers)
         logger.info("InSwapper active providers: %s", self.active_providers or "(unreported)")
         self._enhancer = None
         if enhance:
             self._enhancer = _try_load_gfpgan(use_gpu=uses_gpu(providers))
+
+    def adopt_cpu(self) -> None:
+        """Drop a CUDA/TensorRT session that failed while the graph was running."""
+        if self._on_cpu:
+            return
+        self._load(use_gpu=False, execution="cpu", enhance=self._enhance_requested)
 
     def swap(
         self,
@@ -80,7 +92,10 @@ class FaceSwapper:
         tgt_shim = _FaceShim(target_face)
         # paste_back=False returns the 128px swap plus the frame→crop matrix.
         # Videoswa composites that itself so the beard is not cropped off.
-        swapped, matrix = self.swapper.get(frame, tgt_shim, src_shim, paste_back=False)
+        swapped, matrix = run_with_cuda_fallback(
+            getattr(self, "cuda_guard", None),
+            lambda: self.swapper.get(frame, tgt_shim, src_shim, paste_back=False),
+        )
         if not paste_back:
             return swapped
         out = paste_swapped_face(
