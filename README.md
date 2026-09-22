@@ -258,12 +258,20 @@ checkbox.
 
 The first run downloads:
 
-- `models/inswapper_128.onnx` (about 530 MB), checksum-verified
+- `models/inswapper_128.onnx` (554,253,681 bytes), SHA256
+  `e4a3f08c753cb72d04e10aa0f7dbe3deebbf39567d4ead6dce08e98aa49e16af`
 - InsightFace `buffalo_l` under `~/.insightface/models/`
 
-You can place `inswapper_128.onnx` in `models/` yourself and the download is
-skipped. Override directories with `FACESWAP_MODELS_DIR`, `FACESWAP_TEMP_DIR`,
-and `FACESWAP_OUTPUTS_DIR`.
+Mirrors are tried in order, starting with `Chuchuwa2/inswap` and
+`crw-dev/Deepinsightinswapper`. A download that does not match is discarded
+and the next mirror is tried. An older redistributed copy,
+`a290273ed497312095dac48cdef20feec9d5208298223dd01288ab202b54bea7`, is also
+accepted. If every mirror fails, the error lists each URL, the hash it
+produced, and the hashes Videoswa will accept.
+
+You can place `inswapper_128.onnx` in `models/` yourself when it matches one
+of those hashes and the download is skipped. Override directories with
+`FACESWAP_MODELS_DIR`, `FACESWAP_TEMP_DIR`, and `FACESWAP_OUTPUTS_DIR`.
 
 ## Programmatic use
 
