@@ -60,6 +60,12 @@ def _read(path: Path):
 
 
 def cmd_swap(args: argparse.Namespace) -> int:
+    from .runtime_check import environment_message, environment_problems
+
+    problems = environment_problems()
+    if problems:
+        raise SystemExit(environment_message(problems))
+
     target = Path(args.target)
     if not target.exists():
         raise SystemExit(f"Target not found: {target}")
@@ -93,6 +99,9 @@ def cmd_swap(args: argparse.Namespace) -> int:
     engine.swapper.object_mask = not args.no_object_mask
     engine.swapper.precise_edges = args.precise_edges
     engine.swapper.allow_restore = args.enhance
+    engine.swapper.pixel_boost = int(getattr(args, "pixel_boost", 128) or 128)
+    engine.swapper.restorer = "codeformer" if getattr(args, "codeformer", False) else "gfpgan"
+    engine.swapper.codeformer_fidelity = float(getattr(args, "fidelity", 0.5))
 
     mappings = engine.build_mappings([(_read(s), _read(r) if r else None) for s, r in pairs])
 
@@ -169,6 +178,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     s.add_argument("--cpu", action="store_true", help="Force CPU inference")
     s.add_argument("--enhance", action="store_true", help="Run GFPGAN on swapped faces (optional extra)")
+    s.add_argument("--codeformer", action="store_true", help="Use CodeFormer instead of GFPGAN when --enhance is set")
+    s.add_argument("--fidelity", type=float, default=0.5, help="CodeFormer fidelity. 0 restores harder, 1 stays closer")
+    s.add_argument(
+        "--pixel-boost",
+        type=int,
+        default=128,
+        choices=[128, 256, 512],
+        help="InSwapper tile size. 256 is the 8 GB default in the desktop app.",
+    )
     s.add_argument(
         "--scale",
         type=float,

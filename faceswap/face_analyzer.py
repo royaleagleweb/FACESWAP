@@ -244,11 +244,95 @@ class FaceAnalyzer:
         return faces
 
     def best_face(self, image_bgr: np.ndarray) -> Optional[Face]:
-        """Return the largest face — useful for source reference images."""
-        faces = self.analyze(image_bgr)
-        if not faces:
+        """Largest face in a source photo, after retries for size and padding.
+
+        Phone photos are often huge, tiny, or not square. SCRFD stretches the
+        whole image into ``det_size``, so a very wide frame hides the face.
+        This pads to a square, scales into a useful range, then tries detector
+        sizes 640, 320, and 1024 with a lower threshold.
+        """
+        image = prepare_source_image(image_bgr)
+        if image.size == 0:
+            self.last_detect_note = "The source image was empty."
             return None
-        return max(faces, key=lambda f: f.area)
+        saved_size = self.det_size
+        saved_thresh = float(self.det_thresh)
+        sizes: list[int] = []
+        for side in (int(saved_size[0]), 640, 320, 1024):
+            if side > 0 and side not in sizes:
+                sizes.append(side)
+        try:
+            for index, side in enumerate(sizes):
+                thresh = saved_thresh if index == 0 else min(saved_thresh, 0.20)
+                self.set_detection((side, side), thresh)
+                faces = self.analyze(image)
+                if faces:
+                    self.last_detect_note = ""
+                    return max(faces, key=lambda item: item.area)
+            padded = pad_detection_image(image, border=64)
+            self.set_detection((640, 640), min(saved_thresh, 0.15))
+            faces = self.analyze(padded)
+            if faces:
+                self.last_detect_note = ""
+                return max(faces, key=lambda item: item.area)
+        finally:
+            self.set_detection(saved_size, saved_thresh)
+        tried = ", ".join(str(side) for side in sizes)
+        self.last_detect_note = (
+            "No face found in this photo. Videoswa applied rotation from the file, "
+            f"tried detector sizes {tried}, then a padded 640px pass at a lower threshold. "
+            "Use a clearer JPG or PNG of one person, with the face large enough to see."
+        )
+        return None
+
+    def best_source_face(self, image_bgr: np.ndarray) -> Optional[Face]:
+        return self.best_face(image_bgr)
+
+
+def prepare_source_image(image: np.ndarray, max_side: int = 1600, min_side: int = 640) -> np.ndarray:
+    """Square, uint8 BGR image in a range SCRFD can actually see."""
+    image = prepare_detection_image(image)
+    if image.size == 0:
+        return image
+    height, width = image.shape[:2]
+    long_side = max(height, width)
+    if long_side > max_side:
+        scale = max_side / float(long_side)
+        image = cv2.resize(
+            image,
+            (max(1, int(round(width * scale))), max(1, int(round(height * scale)))),
+            interpolation=cv2.INTER_AREA,
+        )
+    elif 0 < long_side < min_side:
+        scale = min_side / float(long_side)
+        image = cv2.resize(
+            image,
+            (max(1, int(round(width * scale))), max(1, int(round(height * scale)))),
+            interpolation=cv2.INTER_CUBIC,
+        )
+    return pad_to_square(image)
+
+
+def pad_to_square(image: np.ndarray, fill: int = 114) -> np.ndarray:
+    height, width = image.shape[:2]
+    side = max(height, width)
+    if side == height and side == width:
+        return np.ascontiguousarray(image)
+    canvas = np.full((side, side, 3), fill, dtype=np.uint8)
+    y0 = (side - height) // 2
+    x0 = (side - width) // 2
+    canvas[y0:y0 + height, x0:x0 + width] = image
+    return canvas
+
+
+def pad_detection_image(image: np.ndarray, border: int = 64) -> np.ndarray:
+    """Extra gray margin. A face against the edge survives the detector resize."""
+    image = prepare_detection_image(image)
+    if image.size == 0:
+        return image
+    return cv2.copyMakeBorder(
+        image, border, border, border, border, cv2.BORDER_CONSTANT, value=(114, 114, 114)
+    )
 
 
 def prepare_detection_image(image: np.ndarray) -> np.ndarray:

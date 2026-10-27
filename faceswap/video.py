@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import queue
 import shutil
 import subprocess
 import tempfile
@@ -256,10 +257,18 @@ def grab_first_frame(path: Path) -> Optional[np.ndarray]:
 
 
 def resolve_encoder(choice: str = "auto") -> str:
-    """Prefer NVENC when ffmpeg lists it. Anything else stays on libx264."""
+    """Prefer NVENC when ffmpeg lists it. H.264 first, then HEVC, then libx264."""
     name = (choice or "auto").strip().lower()
-    if name in {"auto", "h264_nvenc", "nvenc"} and _ffmpeg_has_encoder("h264_nvenc"):
+    if name in {"h264_nvenc", "nvenc"}:
+        return "h264_nvenc" if _ffmpeg_has_encoder("h264_nvenc") else "libx264"
+    if name in {"hevc_nvenc", "hevc"}:
+        return "hevc_nvenc" if _ffmpeg_has_encoder("hevc_nvenc") else "libx264"
+    if name in {"libx264", "x264"}:
+        return "libx264"
+    if _ffmpeg_has_encoder("h264_nvenc"):
         return "h264_nvenc"
+    if _ffmpeg_has_encoder("hevc_nvenc"):
+        return "hevc_nvenc"
     return "libx264"
 
 
@@ -338,29 +347,29 @@ def process_video(
             unit="f",
             disable=progress is not None,
         )
-        idx = 0
         try:
-            while True:
-                if cancel_event is not None and cancel_event.is_set():
-                    cancelled = True
-                    break
-                ok, frame = cap.read()
-                if not ok:
-                    break
-                time_s = (idx / info.fps) if info.fps else 0.0
-                out = swap_frame(engine, frame, mappings, scale=scale, time_s=time_s)
-                if out.shape[1] != info.width or out.shape[0] != info.height:
-                    out = cv2.resize(out, (info.width, info.height))
-                writer.write(out)
-                idx += 1
-                bar.update(1)
-                if progress is not None:
-                    progress(idx, expected)
+            # Decode, swap, and encode overlap. The swap thread is the only one
+            # that touches the ONNX session. Detection stays on that thread too;
+            # every-other-frame tracking is the batching the detector can do.
+            pipeline_error, cancelled = _pipeline_frames(
+                cap,
+                writer,
+                engine,
+                mappings,
+                info,
+                scale=scale,
+                cancel_event=cancel_event,
+                progress=progress,
+                expected=expected,
+                bar=bar,
+            )
         finally:
             cap.release()
             writer.release()
             bar.close()
 
+        if pipeline_error is not None:
+            raise pipeline_error
         if cancelled:
             raise SwapCancelled("Swap cancelled. No output file was written.")
 
@@ -406,7 +415,135 @@ def swap_frame(
 def _video_encode_args(encoder: str, crf: int, preset: str) -> list[str]:
     if encoder == "h264_nvenc":
         return ["-c:v", "h264_nvenc", "-cq", str(crf), "-preset", "p4", "-pix_fmt", "yuv420p"]
+    if encoder == "hevc_nvenc":
+        return ["-c:v", "hevc_nvenc", "-cq", str(crf), "-preset", "p4", "-pix_fmt", "yuv420p"]
     return ["-c:v", "libx264", "-crf", str(crf), "-preset", preset, "-pix_fmt", "yuv420p"]
+
+
+def _pipeline_frames(
+    cap,
+    writer,
+    engine,
+    mappings,
+    info,
+    *,
+    scale: float,
+    cancel_event: Optional[threading.Event],
+    progress: Optional[Callable[[int, int], None]],
+    expected: int,
+    bar,
+) -> tuple[Optional[BaseException], bool]:
+    """Overlap decode and encode around a single swap thread.
+
+    Returns ``(error, cancelled)``. Frames stay in order because one thread
+    swaps them. A cancel or a swap error does not leave the final MP4 behind;
+    the caller raises before the ffmpeg mux.
+    """
+    decode_q: queue.Queue = queue.Queue(maxsize=4)
+    encode_q: queue.Queue = queue.Queue(maxsize=4)
+    stop = threading.Event()
+    errors: list[BaseException] = []
+    cancelled = {"value": False}
+
+    def _put(target: queue.Queue, item) -> bool:
+        while not stop.is_set():
+            try:
+                target.put(item, timeout=0.2)
+                return True
+            except queue.Full:
+                continue
+        return False
+
+    def _decode() -> None:
+        index = 0
+        try:
+            while not stop.is_set():
+                if cancel_event is not None and cancel_event.is_set():
+                    cancelled["value"] = True
+                    stop.set()
+                    break
+                ok, frame = cap.read()
+                if not ok:
+                    break
+                time_s = (index / info.fps) if info.fps else 0.0
+                if not _put(decode_q, (index, time_s, frame)):
+                    break
+                index += 1
+        except Exception as exc:
+            errors.append(exc)
+            stop.set()
+
+    def _swap() -> None:
+        try:
+            while not stop.is_set():
+                if cancel_event is not None and cancel_event.is_set():
+                    cancelled["value"] = True
+                    stop.set()
+                    break
+                try:
+                    item = decode_q.get(timeout=0.2)
+                except queue.Empty:
+                    continue
+                if item is None:
+                    break
+                index, time_s, frame = item
+                out = swap_frame(engine, frame, mappings, scale=scale, time_s=time_s)
+                if out.shape[1] != info.width or out.shape[0] != info.height:
+                    out = cv2.resize(out, (info.width, info.height))
+                if not _put(encode_q, (index, out)):
+                    break
+        except Exception as exc:
+            errors.append(exc)
+            stop.set()
+
+    def _encode() -> None:
+        written = 0
+        try:
+            while True:
+                if stop.is_set() and encode_q.empty():
+                    break
+                try:
+                    item = encode_q.get(timeout=0.2)
+                except queue.Empty:
+                    if stop.is_set():
+                        break
+                    continue
+                if item is None:
+                    break
+                _index, out = item
+                writer.write(out)
+                written += 1
+                bar.update(1)
+                if progress is not None:
+                    progress(written, expected)
+        except Exception as exc:
+            errors.append(exc)
+            stop.set()
+
+    workers = (
+        threading.Thread(target=_decode, name="videoswa-decode"),
+        threading.Thread(target=_swap, name="videoswa-swap"),
+        threading.Thread(target=_encode, name="videoswa-encode"),
+    )
+    for worker in workers:
+        worker.start()
+    # The decode thread ending is not enough: the swap thread waits on the
+    # queue. Close it with a sentinel once decode has joined.
+    workers[0].join()
+    _put(decode_q, None)
+    if stop.is_set():
+        try:
+            decode_q.put(None, timeout=0.2)
+        except queue.Full:
+            pass
+    workers[1].join()
+    try:
+        encode_q.put(None, timeout=0.5)
+    except queue.Full:
+        stop.set()
+    workers[2].join()
+    error = errors[0] if errors else None
+    return error, bool(cancelled["value"] and error is None)
 
 
 def _run_ffmpeg(cmd: list[str]) -> None:

@@ -148,14 +148,109 @@ def run_with_cuda_fallback(guard: Optional[CudaRuntimeGuard], fn: Callable[[], o
     return fn()
 
 
-def preload_runtime_libraries() -> None:
-    """Load CUDA/cuDNN DLLs shipped as Python wheels, when ORT supports it.
+def windows_dll_candidates(
+    search_roots: Optional[Sequence[Path]] = None,
+    torch_lib: Optional[Path] = None,
+) -> list[Path]:
+    """Directories that hold CUDA, cuDNN, and TensorRT DLLs from pip wheels.
 
-    TensorRT itself is not bundled in the ``onnxruntime-gpu`` wheel. The
-    TensorRT ``lib`` directory still has to be on ``PATH`` (Windows) or
-    ``LD_LIBRARY_PATH`` (Linux).
+    ``torch/lib``, each ``nvidia/*/bin``, and ``tensorrt_libs`` (the
+    ``tensorrt-cu12`` wheel). A system CUDA install is not required when these
+    folders exist. The list is empty on a search that finds nothing.
+    """
+    found: list[Path] = []
+    if torch_lib is None:
+        torch_lib = _torch_lib_dir()
+    if torch_lib is not None:
+        found.append(Path(torch_lib))
+    roots = list(search_roots) if search_roots is not None else _site_package_roots()
+    for root in roots:
+        root = Path(root)
+        nvidia = root / "nvidia"
+        if nvidia.is_dir():
+            for child in sorted(nvidia.iterdir()):
+                bindir = child / "bin"
+                if bindir.is_dir():
+                    found.append(bindir)
+        tensorrt_libs = root / "tensorrt_libs"
+        if tensorrt_libs.is_dir():
+            found.append(tensorrt_libs)
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for path in found:
+        key = str(path)
+        if key in seen or not path.is_dir():
+            continue
+        seen.add(key)
+        unique.append(path)
+    return unique
+
+
+def register_windows_dll_directories(
+    search_roots: Optional[Sequence[Path]] = None,
+    torch_lib: Optional[Path] = None,
+) -> list[str]:
+    """Put pip CUDA / TensorRT DLLs on the Windows loader path before ORT imports.
+
+    No-op off Windows. Returns the directories that were registered.
+    """
+    if os.name != "nt":
+        return []
+    added: list[str] = []
+    for directory in windows_dll_candidates(search_roots=search_roots, torch_lib=torch_lib):
+        text = str(directory)
+        add_dll = getattr(os, "add_dll_directory", None)
+        if callable(add_dll):
+            try:
+                add_dll(text)
+            except OSError as exc:
+                logger.warning("Could not add DLL directory %s: %s", text, exc)
+                continue
+        added.append(text)
+    if added:
+        current = os.environ.get("PATH", "")
+        os.environ["PATH"] = os.pathsep.join(added + [current])
+    return added
+
+
+def _torch_lib_dir() -> Optional[Path]:
+    try:
+        import torch
+    except Exception:
+        return None
+    lib = Path(torch.__file__).resolve().parent / "lib"
+    return lib if lib.is_dir() else None
+
+
+def _site_package_roots() -> list[Path]:
+    roots: list[Path] = []
+    try:
+        import site
+
+        roots.extend(Path(path) for path in site.getsitepackages())
+        user = site.getusersitepackages()
+        if user:
+            roots.append(Path(user))
+    except Exception:
+        pass
+    for entry in sys.path:
+        if not entry:
+            continue
+        path = Path(entry)
+        if path.name.lower() in {"site-packages", "dist-packages"} and path not in roots:
+            roots.append(path)
+    return roots
+
+
+def preload_runtime_libraries() -> None:
+    """Load CUDA/cuDNN/TensorRT DLLs shipped as Python wheels, before ORT starts.
+
+    On Windows the torch, nvidia-*-cu12, and tensorrt-cu12 library folders are
+    registered first, then ``onnxruntime.preload_dlls()`` when that function
+    exists. A system CUDA install is optional on that path.
     """
     configure_cuda_runtime()
+    register_windows_dll_directories()
     try:
         import onnxruntime as ort
     except ImportError:

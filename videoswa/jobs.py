@@ -68,23 +68,86 @@ class SwapRequest:
     color_match: float = 0.60
     sharpen: float = 0.12
     restore_strength: float = 0.65
+    pixel_boost: int = 128
+    restorer: str = "gfpgan"
+    codeformer_fidelity: float = 0.5
+
+
+MAX_IDENTITY_PHOTOS = 5
+
+
+def average_normed_embeddings(vectors: list[np.ndarray]) -> np.ndarray:
+    """Mean of L2-normalized embeddings, normalized again."""
+    stacked = np.stack([np.asarray(item, dtype=np.float32).reshape(-1) for item in vectors], axis=0)
+    mean = stacked.mean(axis=0)
+    return (mean / (np.linalg.norm(mean) + 1e-8)).astype(np.float32)
 
 
 def read_image(path: Path) -> np.ndarray:
+    """Load a source photo as BGR, honoring EXIF rotation and alpha.
+
+    ``cv2.imread`` ignores phone orientation and turns a transparent PNG into
+    a black plate, which is why a normal source photo can detect as empty.
+    """
     path = Path(path)
-    image = cv2.imread(str(path), cv2.IMREAD_COLOR)
-    if image is not None:
-        return image
+    pil_image = _read_pil(path)
+    if pil_image is not None:
+        return pil_image
+    raw = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+    if raw is not None:
+        return _bgr_from_cv(raw)
     suffix = path.suffix.lower()
     if suffix in {".heic", ".heif"}:
-        heic = _read_heic(path)
-        if heic is not None:
-            return heic
         raise ValueError(
             f"Could not read {path.name}. HEIC needs pillow-heif "
             "(pip install pillow-heif), or export the photo as JPG or PNG."
         )
     raise ValueError(f"Could not read image: {path}")
+
+
+def _read_pil(path: Path) -> Optional[np.ndarray]:
+    try:
+        from PIL import Image, ImageOps
+    except ImportError:
+        return None
+    suffix = path.suffix.lower()
+    if suffix in {".heic", ".heif"}:
+        try:
+            import pillow_heif
+
+            pillow_heif.register_heif_opener()
+        except Exception:
+            return None
+    try:
+        with Image.open(path) as handle:
+            image = ImageOps.exif_transpose(handle)
+            if image.mode == "RGBA" or (image.mode == "P" and "transparency" in image.info):
+                rgba = image.convert("RGBA")
+                background = Image.new("RGB", rgba.size, (255, 255, 255))
+                background.paste(rgba, mask=rgba.split()[-1])
+                image = background
+            else:
+                image = image.convert("RGB")
+            rgb = np.asarray(image)
+    except Exception:
+        return None
+    if rgb.ndim != 3 or rgb.shape[2] != 3:
+        return None
+    return np.ascontiguousarray(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+
+
+def _bgr_from_cv(raw: np.ndarray) -> np.ndarray:
+    if raw.ndim == 2:
+        return cv2.cvtColor(raw, cv2.COLOR_GRAY2BGR)
+    if raw.ndim == 3 and raw.shape[2] == 4:
+        bgr = raw[:, :, :3].astype(np.float32)
+        alpha = raw[:, :, 3:4].astype(np.float32) / 255.0
+        white = np.full_like(bgr, 255.0)
+        flat = bgr * alpha + white * (1.0 - alpha)
+        return np.clip(flat, 0, 255).astype(np.uint8)
+    if raw.ndim == 3 and raw.shape[2] == 3:
+        return raw
+    raise ValueError("The source image is not a gray, BGR, or BGRA photo.")
 
 
 def _read_heic(path: Path) -> Optional[np.ndarray]:
@@ -225,7 +288,8 @@ def _source_face(engine: FaceSwapEngine, path: Path, identity_paths: list[Path],
             "(JPG, PNG, or HEIC), or lower Min face size if the face is small."
         )
     embeddings = [np.asarray(face.normed_embedding, dtype=np.float32)]
-    for extra in identity_paths or []:
+    extras = list(identity_paths or [])[: MAX_IDENTITY_PHOTOS - 1]
+    for extra in extras:
         extra_image = read_image(Path(extra))
         extra_face = engine.analyzer.best_face(extra_image)
         if extra_face is None:
@@ -235,9 +299,7 @@ def _source_face(engine: FaceSwapEngine, path: Path, identity_paths: list[Path],
             )
         embeddings.append(np.asarray(extra_face.normed_embedding, dtype=np.float32))
     if len(embeddings) > 1:
-        mean = np.mean(np.stack(embeddings, axis=0), axis=0)
-        mean = mean / (np.linalg.norm(mean) + 1e-8)
-        face = replace(face, embedding=mean.astype(np.float32))
+        face = replace(face, embedding=average_normed_embeddings(embeddings))
     code = coerce_gender(gender)
     if code is not None:
         face = replace(face, gender=code)

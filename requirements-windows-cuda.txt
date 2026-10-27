@@ -1,0 +1,31 @@
+# Lenovo / RTX 4070 Laptop (8 GB), Python 3.11, torch already on CUDA 12.4.
+# No Visual Studio is required. Do this from an activated virtualenv AFTER
+# requirements.txt. Do not install this file next to onnxruntime or
+# onnxruntime-directml — pick one runtime.
+#
+#   pip uninstall -y opencv-python opencv-python-headless opencv-contrib-python numpy onnxruntime onnxruntime-directml
+#   pip install numpy==1.26.4
+#   pip install -r requirements.txt
+#   pip install -r requirements-windows-cuda.txt
+#   pip install opencv-python==4.10.0.84
+#   pip uninstall -y opencv-python-headless
+#
+# insightface 0.7.3 on cp311 Windows is the prebuilt wheel. The PyPI sdist
+# needs MSVC and fails on this laptop. The wheel is built against numpy 1.x;
+# numpy 2 raises "numpy.dtype size changed".
+# albumentations (pulled in by GFPGAN) installs opencv-python-headless 5.0,
+# which makes InsightFace return zero faces. Uninstall headless and keep
+# opencv-python==4.10.0.84.
+numpy==1.26.4
+https://github.com/Gourieff/Assets/raw/main/Insightface/insightface-0.7.3-cp311-cp311-win_amd64.whl
+opencv-python==4.10.0.84
+onnxruntime-gpu==1.22.0
+# TensorRT 10.9 matches onnxruntime-gpu 1.22. The wheel's DLLs live in
+# site-packages/tensorrt_libs. Videoswa adds that directory before ORT loads.
+tensorrt-cu12==10.9.0.34
+# CUDA 12 runtime and cuDNN 9, so onnxruntime-gpu does not need a system CUDA.
+nvidia-cublas-cu12
+nvidia-cuda-runtime-cu12
+nvidia-cudnn-cu12
+nvidia-cufft-cu12
+nvidia-curand-cu12

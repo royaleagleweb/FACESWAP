@@ -99,9 +99,14 @@ def test_window_loads_short_video(tmp_path: Path) -> None:
         assert window.speed.currentData() == 1.0
         assert window.execution.findData("tensorrt") >= 0
         assert window.object_mask.isChecked() is True
-        assert window.precise_edges.isChecked() is False
-        assert window.fast_draft.isChecked() is True
-        assert window.detect_every.isChecked() is True
+        assert window.precise_edges.isChecked() is True
+        assert window.quality_preset.currentData() == "quality"
+        assert window.pixel_boost.currentData() == 512
+        assert window.restorer.currentData() == "codeformer"
+        assert "photos of this person" in window.identity_btn.text()
+        assert window.identity_count.text() == "Identity photos: 0/5"
+        assert window.fast_draft.isChecked() is False
+        assert window.detect_every.isChecked() is False
         assert window.min_face.value() == 0
         assert window.compare_slider.value() == 50
         assert window.compare_slider.isEnabled() is False

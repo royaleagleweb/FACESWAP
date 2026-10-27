@@ -185,6 +185,47 @@ C:\TensorRT-10.9.0.34\lib
 
 Open a new terminal so the updated PATH is visible.
 
+### Lenovo laptop, no MSVC (CUDA from pip)
+
+Roy's Lenovo (RTX 4070 Laptop 8 GB, i9-13900HX, 32 GB, Python 3.11, torch
+2.x cu124) does not have Visual Studio. `pip install insightface` tries to
+compile and fails. Use the prebuilt wheel, numpy 1.26.4, and
+`requirements-windows-cuda.txt`. That file also installs `onnxruntime-gpu`
+1.22, `tensorrt-cu12` 10.9, and the `nvidia-*-cu12` wheels. Videoswa adds
+`torch\\lib`, each `nvidia\\*\\bin`, and `site-packages\\tensorrt_libs` to
+the DLL search path and calls `onnxruntime.preload_dlls()` before a session
+starts, so a separate CUDA toolkit install is optional.
+
+Albumentations (pulled in with GFPGAN) installs `opencv-python-headless` 5.0.
+That build makes detection return zero faces. Uninstall it. Startup refuses
+to continue quietly when numpy 2, OpenCV 5 / 4.11, or the headless package
+is present. The window states the exact `pip` command.
+
+Update an existing Windows virtualenv:
+
+```bat
+.venv\Scripts\activate
+pip uninstall -y opencv-python opencv-python-headless opencv-contrib-python numpy onnxruntime onnxruntime-directml
+pip install numpy==1.26.4
+pip install https://github.com/Gourieff/Assets/raw/main/Insightface/insightface-0.7.3-cp311-cp311-win_amd64.whl
+pip install -r requirements.txt
+pip install -r requirements-windows-cuda.txt
+pip install opencv-python==4.10.0.84
+pip uninstall -y opencv-python-headless
+python -c "import cv2,numpy; print(cv2.__version__, numpy.__version__)"
+python -m videoswa
+```
+
+`cv2` must print `4.10.0` and numpy must print `1.26.4`. A DirectML machine
+should keep `requirements-windows-directml.txt` instead of the CUDA file.
+Do not install both ONNX Runtime packages.
+
+TensorRT engines are FP16 and cached in `models\trt_cache`. The final export
+uses `h264_nvenc` when FFmpeg lists it, then `hevc_nvenc`, then `libx264`.
+Decode, swap, and encode run on separate threads. The swap thread is the only
+one that touches the ONNX session. Export detects every 2nd frame and tracks
+the frames in between. Fast draft applies to preview only.
+
 ### 6. Python packages
 
 From the repository root:
@@ -470,6 +511,9 @@ videoswa/           PySide6 desktop window
 requirements.txt    CPU install, including PySide6
 requirements-windows-gpu.txt
                     onnxruntime-gpu pin for TensorRT / CUDA
+requirements-windows-cuda.txt
+                    Lenovo CUDA stack: numpy 1.26.4, InsightFace cp311 wheel,
+                    opencv-python 4.10.0.84, onnxruntime-gpu, tensorrt-cu12
 requirements-windows-directml.txt
                     Windows GPU path when CUDA is broken
 ```
@@ -492,6 +536,22 @@ requirements-windows-directml.txt
   that does not use CUDA. Launch with the project `.venv\Scripts\python.exe`.
 - **The swap is slow.** Read the provider banner. CPU is the slow path.
   Half resolution is the faster export. DirectML is the Windows GPU
-  alternative when CUDA is unhealthy.
+  alternative when CUDA is unhealthy. The window opens on **Quality**
+  (pixel boost 512, CodeFormer, precise edges, every frame). On an 8 GB GPU
+  switch to **Balanced** (pixel boost 256, detect every 2nd frame) if the
+  export runs out of memory. **Fast** is the 128px preview path.
+- **The swap flickers.** Landmarks and the paste mask are smoothed per
+  person. A missed detection keeps the last good face for a few frames
+  instead of flashing the original. A scene cut resets that smoothing.
+- **A source photo says there is no face.** The photo is shown in the
+  preview. Videoswa honors EXIF rotation, flattens a transparent PNG onto
+  white, and retries detector sizes 640, 320, and 1024. Use a clearer JPG
+  or PNG if it still finds nobody.
+- **`numpy.dtype size changed` or zero faces after a GFPGAN install.**
+  numpy 2 or `opencv-python-headless` is installed. Use the Lenovo update
+  commands above. The app shows the same message at startup.
+- **Add 3–5 photos of one person** from the source column. Videoswa averages
+  the normalized embeddings. Precise edges and temporal color smoothing are
+  on for a final render. Fast draft preview skips GFPGAN and BiSeNet.
 - **First GPU run is very slow.** TensorRT is building engines in
   `models/trt_cache`. The next run of the same model should start promptly.

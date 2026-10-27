@@ -193,6 +193,11 @@ def _sample_maps(cx: np.ndarray, cy: np.ndarray, size: int, coverage: str) -> tu
         return sx.astype(np.float32), sy.astype(np.float32)
 
     mouth_y, eye_mouth = _mouth_metrics()
+    # Pixel boost pastes a 256 or 512 crop. Scale the 128px mouth so the
+    # beard stretch still starts at the crop edge instead of inside the face.
+    scale = float(size) / 128.0
+    mouth_y *= scale
+    eye_mouth *= scale
     cy_end = mouth_y + FULL_BEARD_DEPTH_EM * eye_mouth
     chin0 = 0.78 * (size - 1)
     chin1 = 0.96 * (size - 1)

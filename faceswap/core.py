@@ -9,16 +9,17 @@ fires using the corresponding source identity.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Iterable, List, Optional, Sequence
 
 import numpy as np
 
-from .coverage import DEFAULT_COVERAGE
+from .coverage import DEFAULT_COVERAGE, paste_swapped_face
 from .face_analyzer import Face, FaceAnalyzer, coerce_gender, cosine_similarity
 from .providers import CudaRuntimeGuard
 from .pose import PROFILE_YAW, face_yaw
 from .quality import SourceRotation, face_span_px, lock_gender
+from .smooth import OneEuroFilter, landmark_jumped
 from .swapper import FaceSwapper
 from .utils import logger
 
@@ -83,6 +84,12 @@ class _FaceTrack:
     missed: int = 0
     gender_votes: list = field(default_factory=list)
     locked_gender: Optional[int] = None
+    source_face: Optional[Face] = None
+    kps_smooth: Optional[np.ndarray] = None
+    velocity: Optional[np.ndarray] = None
+    landmark_filter: Optional[OneEuroFilter] = None
+    last_canvas: Optional[np.ndarray] = None
+    last_matrix: Optional[np.ndarray] = None
 
 
 @dataclass
@@ -175,7 +182,12 @@ class FaceSwapEngine:
                 kept.append(face)
             faces = kept
         if not faces:
+            held = self._replay_tracks(frame_bgr)
             self._age_tracks(set())
+            if held is not None:
+                self.stats.faces_swapped += 1
+                self.stats.faces_held += 1
+                return held
             return frame_bgr
 
         wildcard = [m for m in mappings if m.reference_face is None]
@@ -192,7 +204,9 @@ class FaceSwapEngine:
             mapping, held = decision
             track = self._touch_track(face, mapping)
             touched.add(id(track))
-            source = self.rotation.choose(mapping.source_face, face, time_s)
+            face = self._stabilize_face(track, face, time_s)
+            pinned = track.source_face if track.source_face is not None else mapping.source_face
+            source = self.rotation.choose(pinned, face, time_s)
             if self._gender_blocks(source, face):
                 self.stats.faces_unmatched += 1
                 continue
@@ -203,12 +217,20 @@ class FaceSwapEngine:
                 out, target_face=face, source_face=source, coverage=self.coverage
             )
             if getattr(self.swapper, "paste_wiped", False):
+                replay = self._paste_held(out, track, face)
+                if replay is not None:
+                    out = replay
+                    self.stats.faces_swapped += 1
+                    self.stats.faces_held += 1
+                    self.last_boxes.append(np.asarray(face.bbox, dtype=np.float32).copy())
+                    continue
                 self.stats.faces_wiped += 1
                 logger.warning(
                     getattr(self.swapper, "last_paste_note", "")
                     or "The paste mask wiped a swapped face."
                 )
                 continue
+            self._remember_swap(track)
             self.last_boxes.append(np.asarray(face.bbox, dtype=np.float32).copy())
             self.stats.faces_swapped += 1
             if held:
@@ -358,6 +380,7 @@ class FaceSwapEngine:
                 mapping=mapping,
                 bbox=np.asarray(face.bbox, dtype=np.float32).copy(),
                 embedding=embedding.copy(),
+                source_face=mapping.source_face,
             )
             self._tracks.append(best)
         else:
@@ -365,8 +388,84 @@ class FaceSwapEngine:
             mixed = _EMA_KEEP * best.embedding + (1.0 - _EMA_KEEP) * embedding
             best.embedding = mixed / (np.linalg.norm(mixed) + 1e-8)
             best.missed = 0
+        if best.source_face is None:
+            best.source_face = mapping.source_face
         self._lock_track_gender(best, face)
         return best
+
+    def _stabilize_face(self, track: _FaceTrack, face: Face, time_s: float) -> Face:
+        """One Euro filter on the 5 landmarks. A scene cut resets it."""
+        raw = np.asarray(face.kps, dtype=np.float64).reshape(-1, 2)
+        if raw.shape != (5, 2):
+            return face
+        if track.landmark_filter is None:
+            track.landmark_filter = OneEuroFilter()
+        if landmark_jumped(track.kps_smooth, raw):
+            track.landmark_filter.reset()
+            track.velocity = None
+        smoothed = np.asarray(track.landmark_filter(time_s, raw), dtype=np.float64).reshape(5, 2)
+        if track.kps_smooth is not None and track.kps_smooth.shape == smoothed.shape:
+            track.velocity = smoothed - track.kps_smooth
+        track.kps_smooth = smoothed
+        delta = smoothed.mean(axis=0) - raw.mean(axis=0)
+        bbox = np.asarray(face.bbox, dtype=np.float32).copy()
+        bbox[0::2] += float(delta[0])
+        bbox[1::2] += float(delta[1])
+        track.bbox = bbox.copy()
+        return replace(face, kps=smoothed.astype(np.float32), bbox=bbox)
+
+    def _remember_swap(self, track: _FaceTrack) -> None:
+        canvas = getattr(self.swapper, "last_canvas", None)
+        if canvas is None:
+            return
+        track.last_canvas = np.asarray(canvas).copy()
+        matrix = getattr(self.swapper, "last_matrix", None)
+        if matrix is not None:
+            track.last_matrix = np.asarray(matrix, dtype=np.float64).reshape(2, 3).copy()
+
+    def _paste_held(self, frame: np.ndarray, track: _FaceTrack, face: Face) -> Optional[np.ndarray]:
+        if track.last_canvas is None or track.kps_smooth is None:
+            return None
+        matrix = track.last_matrix
+        if matrix is None:
+            matrix = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float64)
+        try:
+            return paste_swapped_face(
+                frame,
+                track.last_canvas,
+                matrix,
+                track.kps_smooth,
+                coverage=self.coverage,
+            )
+        except Exception:
+            return None
+
+    def _replay_tracks(self, frame: np.ndarray) -> Optional[np.ndarray]:
+        """Keep the last good face in place when detection misses for a frame or two."""
+        out = frame
+        used = False
+        for track in self._tracks:
+            if track.last_canvas is None or track.kps_smooth is None:
+                continue
+            if track.velocity is not None:
+                track.kps_smooth = track.kps_smooth + track.velocity
+                shift = track.velocity.mean(axis=0)
+                track.bbox = np.asarray(track.bbox, dtype=np.float32).copy()
+                track.bbox[0::2] += float(shift[0])
+                track.bbox[1::2] += float(shift[1])
+            face = Face(
+                bbox=np.asarray(track.bbox, dtype=np.float32),
+                kps=np.asarray(track.kps_smooth, dtype=np.float32),
+                embedding=np.asarray(track.embedding, dtype=np.float32),
+                det_score=1.0,
+            )
+            pasted = self._paste_held(out, track, face)
+            if pasted is None:
+                continue
+            out = pasted
+            used = True
+            self.last_boxes.append(np.asarray(track.bbox, dtype=np.float32).copy())
+        return out if used else None
 
     def _lock_track_gender(self, track: _FaceTrack, face: Face) -> None:
         """Majority gender from the first detections, then keep it."""

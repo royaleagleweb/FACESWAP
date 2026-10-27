@@ -17,6 +17,7 @@ from PySide6.QtCore import QThread, Signal
 from faceswap.core import FaceSwapEngine, SwapStats
 from faceswap.face_analyzer import FaceAnalyzer
 from faceswap.providers import format_providers, provider_status_text, tensorrt_missing_note
+from faceswap.pixel_boost import normalize_pixel_boost
 from faceswap.quality import resolve_quality
 from faceswap.swapper import FaceSwapper
 from faceswap.utils import logger
@@ -314,15 +315,18 @@ class EngineWorker(QThread):
         self._apply_detector(engine, job.det_size, job.det_thresh)
         path = Path(job.path)
         image = read_image(path)
-        face = engine.analyzer.best_face(image)
+        finder = getattr(engine.analyzer, "best_source_face", None) or engine.analyzer.best_face
+        face = finder(image)
         if face is None:
+            note = getattr(engine.analyzer, "last_detect_note", "") or ""
             self.source_ready.emit(
                 str(path),
                 False,
-                (
-                    f"No face found in {path.name}. Use a clear photo of one person "
-                    "(JPG, PNG, or HEIC). If the face is small or turned, lower Min face size "
-                    "and Detect sensitivity, then add the photo again."
+                note
+                or (
+                    f"No face found in {path.name}. Videoswa checked EXIF rotation, "
+                    "transparent PNGs, and detector sizes 640, 320, and 1024. "
+                    "Use a clearer photo of one person (JPG, PNG, or HEIC)."
                 ),
                 job.role,
             )
@@ -353,8 +357,18 @@ class EngineWorker(QThread):
         swapper.color_match = float(getattr(job, "color_match", 0.60))
         swapper.sharpen = float(getattr(job, "sharpen", 0.0))
         swapper.restore_strength = float(getattr(job, "restore_strength", 1.0))
+        swapper.codeformer_fidelity = float(getattr(job, "codeformer_fidelity", 0.5))
+        boost = normalize_pixel_boost(getattr(job, "pixel_boost", 128))
+        if preview and job.fast_draft_preview:
+            boost = 128
+        swapper.pixel_boost = boost
+        swapper.restorer = str(getattr(job, "restorer", "gfpgan") or "gfpgan")
         self._apply_detector(engine, int(getattr(job, "det_size", 640)), float(getattr(job, "det_thresh", 0.30)))
-        if enhance and hasattr(swapper, "set_enhance"):
+        if hasattr(swapper, "prepare_restorer"):
+            tip = swapper.prepare_restorer(enhance, swapper.restorer)
+            if tip:
+                self.status.emit(tip)
+        elif enhance and hasattr(swapper, "set_enhance"):
             tip = swapper.set_enhance(True)
             if tip:
                 self.status.emit(tip)

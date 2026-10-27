@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import shutil
 import sys
 from pathlib import Path
@@ -34,11 +35,15 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from faceswap.face_analyzer import face_label, opencv_detection_warning, sensitivity_to_thresh
+from faceswap.codeformer import codeformer_install_tip
+from faceswap.face_analyzer import face_label, sensitivity_to_thresh
 from faceswap.pose import face_yaw, pose_name
+from faceswap.quality import quality_preset
+from faceswap.runtime_check import environment_message, environment_problems
 from faceswap.utils import optional_model_report
 from faceswap.swapper import gfpgan_install_tip
 from faceswap.utils import logger
+from videoswa.jobs import MAX_IDENTITY_PHOTOS
 from faceswap.video import (
     VIDEO_SUFFIXES,
     VideoDurationUnknownError,
@@ -49,7 +54,7 @@ from faceswap.video import (
     read_frame_at,
 )
 from videoswa.images import bgr_to_qpixmap, wipe_preview
-from videoswa.jobs import FACE_MODE_MULTIPLE, FACE_MODE_SINGLE, FaceSource, SwapRequest, validate_request
+from videoswa.jobs import FACE_MODE_MULTIPLE, FACE_MODE_SINGLE, FaceSource, SwapRequest, read_image, validate_request
 from videoswa.project import PROJECT_SUFFIX, gender_mark, load_project, save_project
 from videoswa.worker import DetectRequest, DetectedPerson, EngineWorker, PreviewRequest, SourceCheckRequest
 
@@ -233,9 +238,11 @@ class MainWindow(QMainWindow):
         self.worker.start()
         if not shutil.which("ffmpeg"):
             self._set_status("FFmpeg was not found. Audio cannot be copied into the MP4 until it is installed.")
-        opencv_note = opencv_detection_warning()
-        if opencv_note:
-            self._set_status(opencv_note)
+        problems = environment_problems()
+        if problems:
+            self._set_status(environment_message(problems))
+        if hasattr(self, "model_status"):
+            self.model_status.setText(self._model_status_text())
 
     def _build(self) -> None:
         root = QWidget()
@@ -303,9 +310,16 @@ class MainWindow(QMainWindow):
         add_row.addWidget(self.single_btn)
         add_row.addWidget(remove_btn)
         form.addLayout(add_row)
-        identity_btn = QPushButton("+ Add multi-photo identity")
-        identity_btn.clicked.connect(self._add_identity_photos)
-        form.addWidget(identity_btn)
+        self.identity_btn = QPushButton("Add 3–5 photos of this person")
+        self.identity_btn.setToolTip(
+            "Add more photos of the selected source. Videoswa averages their "
+            "embeddings, up to 5 photos including the first one."
+        )
+        self.identity_btn.clicked.connect(self._add_identity_photos)
+        form.addWidget(self.identity_btn)
+        self.identity_count = QLabel("Identity photos: 0/5")
+        self.identity_count.setObjectName("Muted")
+        form.addWidget(self.identity_count)
         gender_row = QHBoxLayout()
         male_btn = QPushButton("Set gender Male")
         female_btn = QPushButton("Set gender Female")
@@ -429,7 +443,7 @@ class MainWindow(QMainWindow):
         self.fast_playback.setChecked(False)
         self.fast_playback.toggled.connect(self._on_fast_playback)
         self.fast_draft = QCheckBox("Fast draft in preview")
-        self.fast_draft.setChecked(True)
+        self.fast_draft.setChecked(False)
         self.fast_draft.setToolTip(
             "Preview and playback skip GFPGAN and BiSeNet. Object mask stays on. Swap uses the quality panel."
         )
@@ -499,23 +513,32 @@ class MainWindow(QMainWindow):
 
         form.addWidget(QLabel("Quality preset"))
         self.quality_preset = QComboBox()
-        self.quality_preset.addItem("Balanced", "balanced")
-        self.quality_preset.addItem("Fast draft", "fast")
         self.quality_preset.addItem("Quality", "quality")
+        self.quality_preset.addItem("Balanced", "balanced")
+        self.quality_preset.addItem("Fast", "fast")
         self.quality_preset.currentIndexChanged.connect(self._on_quality_preset)
         form.addWidget(self.quality_preset)
 
-        self.enhance = QCheckBox("Restore faces (GFPGAN)")
-        self.enhance.setChecked(gfpgan_install_tip() is None)
+        self.enhance = QCheckBox("Restore faces")
+        self.enhance.setChecked(codeformer_install_tip() is None or gfpgan_install_tip() is None)
         install_tip = gfpgan_install_tip()
         self.enhance.setToolTip(
             install_tip
-            or "Optional. Faces under 96px are skipped. The first enhanced swap downloads GFPGANv1.4.pth."
+            or "Optional. Faces under 96px are skipped. GFPGAN or CodeFormer runs on the swapped face."
         )
         self.enhance.toggled.connect(self._on_enhance_toggled)
         form.addWidget(self.enhance)
-        form.addWidget(self._percent_row("Restore", "restore_slider", 65))
-        form.addWidget(self._percent_row("Sharpen", "sharpen_slider", 12))
+        self.restorer = QComboBox()
+        self.restorer.addItem("CodeFormer", "codeformer")
+        self.restorer.addItem("GFPGAN", "gfpgan")
+        self.restorer.setToolTip(
+            "CodeFormer downloads codeformer.pth on first use. "
+            "Fidelity 0 restores harder. Fidelity 1 stays closer to the swap."
+        )
+        form.addWidget(self.restorer)
+        form.addWidget(self._percent_row("Restore blend", "restore_slider", 65))
+        form.addWidget(self._percent_row("CodeFormer fidelity", "fidelity_slider", 50))
+        form.addWidget(self._percent_row("Sharpen", "sharpen_slider", 18))
         form.addWidget(self._percent_row("Color match", "color_slider", 60))
 
         self.object_mask = QCheckBox("AI face mask + object preservation")
@@ -524,8 +547,12 @@ class MainWindow(QMainWindow):
             "On for every normal swap. Keeps lollipops, food, and hands. "
             "XSeg downloads into models/xseg.onnx on the first swap."
         )
-        self.precise_edges = QCheckBox("Precise edges (BiSeNet)")
-        self.precise_edges.setChecked(False)
+        self.precise_edges = QCheckBox("Precise edges (BiSeNet + XSeg)")
+        self.precise_edges.setChecked(True)
+        self.precise_edges.setToolTip(
+            "On for a final render. Fast draft preview skips BiSeNet and keeps the object mask. "
+            "The jaw and beard edge is feathered."
+        )
         self.beard = QCheckBox("Male has a beard (extend to jaw)")
         self.beard.setChecked(True)
         self.beard.toggled.connect(self._on_beard)
@@ -570,10 +597,22 @@ class MainWindow(QMainWindow):
         self.crf.setValue(18)
         crf_row.addWidget(self.crf)
         form.addLayout(crf_row)
+        form.addWidget(QLabel("Pixel boost"))
+        self.pixel_boost = QComboBox()
+        self.pixel_boost.addItem("128 — fast", 128)
+        self.pixel_boost.addItem("256 — 8 GB default", 256)
+        self.pixel_boost.addItem("512 — sharpest", 512)
+        self.pixel_boost.setCurrentIndex(2)
+        self.pixel_boost.setToolTip(
+            "InSwapper is 128px. 256 and 512 split the aligned face into 128 tiles, "
+            "swap each one, and stitch them. Fast draft preview stays at 128."
+        )
+        form.addWidget(self.pixel_boost)
         form.addWidget(QLabel("Encoder"))
         self.encoder = QComboBox()
         self.encoder.addItem("Auto (GPU NVENC)", "auto")
-        self.encoder.addItem("NVENC", "h264_nvenc")
+        self.encoder.addItem("NVENC H.264", "h264_nvenc")
+        self.encoder.addItem("NVENC HEVC", "hevc_nvenc")
         self.encoder.addItem("libx264", "libx264")
         form.addWidget(self.encoder)
         self.preset = QComboBox()
@@ -631,7 +670,7 @@ class MainWindow(QMainWindow):
         min_row.addWidget(self.min_face)
         form.addLayout(min_row)
         self.detect_every = QCheckBox("Detect every 2nd frame")
-        self.detect_every.setChecked(True)
+        self.detect_every.setChecked(False)
         self.detect_every.setToolTip("Full export detects every other frame. Preview always detects the one frame.")
         form.addWidget(self.detect_every)
         form.addWidget(QLabel("Export speed"))
@@ -642,7 +681,7 @@ class MainWindow(QMainWindow):
         self.fast_draft_btn = QPushButton("⚡ Fast draft")
         self.fast_draft_btn.clicked.connect(self._apply_fast_draft)
         form.addWidget(self.fast_draft_btn)
-        self.model_status = QLabel(optional_model_report())
+        self.model_status = QLabel(self._model_status_text())
         self.model_status.setWordWrap(True)
         self.model_status.setObjectName("Muted")
         form.addWidget(self.model_status)
@@ -763,22 +802,35 @@ class MainWindow(QMainWindow):
         self.provider_banner.style().unpolish(self.provider_banner)
         self.provider_banner.style().polish(self.provider_banner)
 
+    def _restorer_tip(self) -> Optional[str]:
+        if hasattr(self, "restorer") and self.restorer.currentData() == "codeformer":
+            return codeformer_install_tip()
+        return gfpgan_install_tip()
+
     def _on_enhance_toggled(self, checked: bool) -> None:
         if not checked:
             return
-        tip = gfpgan_install_tip()
+        tip = self._restorer_tip()
         if tip is None:
             return
-        QMessageBox.information(self, "GFPGAN is not installed", tip)
+        title = "CodeFormer is not installed" if self.restorer.currentData() == "codeformer" else "GFPGAN is not installed"
+        QMessageBox.information(self, title, tip)
         self.enhance.blockSignals(True)
         self.enhance.setChecked(False)
         self.enhance.blockSignals(False)
+
+    def _model_status_text(self) -> str:
+        text = optional_model_report()
+        problems = environment_problems()
+        if problems:
+            text = text + "\n" + " ".join(problems)
+        return text
 
     def _set_status(self, text: str) -> None:
         self.status.setText(text)
         self._append_log(text)
         if hasattr(self, "model_status"):
-            self.model_status.setText(optional_model_report())
+            self.model_status.setText(self._model_status_text())
 
     def _append_log(self, text: str) -> None:
         self.log.appendPlainText(text)
@@ -1093,7 +1145,17 @@ class MainWindow(QMainWindow):
     def _on_source_ready(self, path: str, ok: bool, message: str, role: str) -> None:
         if not ok:
             self._set_status(message)
-            QMessageBox.warning(self, "Source photo has no face", message)
+            try:
+                preview = read_image(Path(path))
+                self._preview_bgr = preview
+                self._paint_preview(preview)
+            except Exception:
+                preview = None
+            QMessageBox.warning(
+                self,
+                "Source photo has no face",
+                message + ("\n\nThe photo is shown in the preview so you can see what was read." if preview is not None else ""),
+            )
             return
         photo = Path(path)
         if role == "identity":
@@ -1101,10 +1163,21 @@ class MainWindow(QMainWindow):
             if anchor is None:
                 return
             extras = self._identity_paths.setdefault(str(anchor), [])
-            if photo not in extras and photo != anchor:
-                extras.append(photo)
+            if photo == anchor or photo in extras:
+                self._set_status(f"{photo.name} is already part of this identity.")
+                return
+            if 1 + len(extras) >= MAX_IDENTITY_PHOTOS:
+                self._set_status(f"This identity already has {MAX_IDENTITY_PHOTOS} photos.")
+                QMessageBox.information(
+                    self,
+                    "Identity is full",
+                    f"Use up to {MAX_IDENTITY_PHOTOS} photos of one person. Remove one before adding another.",
+                )
+                return
+            extras.append(photo)
             self._refresh_source_list()
-            self._set_status(f"{message} Added to this identity.")
+            total = 1 + len(extras)
+            self._set_status(f"{message} Identity photos: {total}/{MAX_IDENTITY_PHOTOS}.")
             return
         self._remember_source(photo)
         self._set_status(message)
@@ -1122,11 +1195,10 @@ class MainWindow(QMainWindow):
     def _source_caption(self, path: Path) -> str:
         mark = {1: "♂", 0: "♀"}.get(self._source_genders.get(str(path)))
         extras = self._identity_paths.get(str(path)) or []
-        bits = [path.name]
+        total = 1 + len(extras)
+        bits = [path.name, f"Identity photos: {total}/{MAX_IDENTITY_PHOTOS}"]
         if mark:
             bits.append(mark)
-        if extras:
-            bits.append(f"+{len(extras)} photo(s)")
         return " ".join(bits)
 
     def _refresh_source_list(self) -> None:
@@ -1139,6 +1211,12 @@ class MainWindow(QMainWindow):
         self.source_list.blockSignals(False)
         if current:
             self._select_source_row(Path(current))
+        anchor = self._selected_source_path()
+        total = 0
+        if anchor is not None:
+            total = 1 + len(self._identity_paths.get(str(anchor)) or [])
+        if hasattr(self, "identity_count"):
+            self.identity_count.setText(f"Identity photos: {total}/{MAX_IDENTITY_PHOTOS}")
 
     def _select_source_row(self, path: Path) -> None:
         target = str(path)
@@ -1275,6 +1353,9 @@ class MainWindow(QMainWindow):
             color_match=self.color_slider.value() / 100.0,
             sharpen=self.sharpen_slider.value() / 100.0,
             restore_strength=self.restore_slider.value() / 100.0,
+            pixel_boost=int(self.pixel_boost.currentData()),
+            restorer=str(self.restorer.currentData()),
+            codeformer_fidelity=self.fidelity_slider.value() / 100.0,
         )
 
     def _preview_swap(self) -> None:
@@ -1357,30 +1438,32 @@ class MainWindow(QMainWindow):
         self._set_combo(self.execution, "cpu")
 
     def _on_quality_preset(self) -> None:
-        name = self.quality_preset.currentData()
-        if name == "fast":
-            self._apply_fast_draft()
-            return
-        self.object_mask.setChecked(True)
+        chosen = quality_preset(str(self.quality_preset.currentData() or "balanced"))
+        self.object_mask.setChecked(bool(chosen["object_mask"]))
         self._set_combo(self.coverage, "full")
+        self._set_combo(self.pixel_boost, int(chosen["pixel_boost"]))
+        self._set_combo(self.restorer, chosen["restorer"])
+        self.precise_edges.setChecked(bool(chosen["precise_edges"]))
+        self.fast_draft.setChecked(bool(chosen["fast_draft_preview"]))
+        self.detect_every.setChecked(bool(chosen["detect_every_other"]))
+        self.color_slider.setValue(int(chosen["color_match"]))
         self.min_face.setValue(0)
-        self.color_slider.setValue(60)
-        self.sharpen_slider.setValue(12)
+        self.sharpen_slider.setValue(int(chosen.get("sharpen", 12)))
         self.restore_slider.setValue(65)
-        if name == "quality":
-            self.precise_edges.setChecked(True)
-            self.fast_draft.setChecked(False)
-            self.detect_every.setChecked(False)
-        else:
-            self.precise_edges.setChecked(False)
-            self.fast_draft.setChecked(True)
-            self.detect_every.setChecked(True)
-        if gfpgan_install_tip() is None:
+        want_restore = bool(chosen["enhance"])
+        tip = self._restorer_tip() if want_restore else None
+        if want_restore and tip is None:
             self.enhance.setChecked(True)
         else:
             self.enhance.blockSignals(True)
             self.enhance.setChecked(False)
             self.enhance.blockSignals(False)
+        label = str(self.quality_preset.currentText())
+        self._set_status(
+            f"{label}: pixel boost {chosen['pixel_boost']}, "
+            f"precise edges {'on' if chosen['precise_edges'] else 'off'}, "
+            f"detect every {'2nd frame' if chosen['detect_every_other'] else 'frame'}."
+        )
 
     def _toggle_play(self) -> None:
         if self._playing:
@@ -1424,11 +1507,14 @@ class MainWindow(QMainWindow):
         self.compare_slider.setValue(0 if self.compare_slider.value() >= 50 else 100)
 
     def _apply_fast_draft(self) -> None:
+        self._set_combo(self.quality_preset, "fast")
         self.enhance.setChecked(False)
         self.precise_edges.setChecked(False)
         self.object_mask.setChecked(True)
         self.fast_draft.setChecked(True)
-        self._set_status("Fast draft: restore off, precise edges off, object mask on.")
+        self.detect_every.setChecked(True)
+        self._set_combo(self.pixel_boost, 128)
+        self._set_status("Fast draft: 128px swap, restore off, precise edges off, object mask on. Preview only.")
 
     def _add_rotation_source(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "Rotation source", "", _IMAGE_FILTER)
@@ -1493,6 +1579,9 @@ class MainWindow(QMainWindow):
                 "color_match": self.color_slider.value(),
                 "sharpen": self.sharpen_slider.value(),
                 "restore_strength": self.restore_slider.value(),
+                "pixel_boost": self.pixel_boost.currentData(),
+                "restorer": self.restorer.currentData(),
+                "codeformer_fidelity": self.fidelity_slider.value(),
                 "video_quality": self.video_quality.currentData(),
                 "fast_playback": self.fast_playback.isChecked(),
                 "source_genders": {key: value for key, value in self._source_genders.items()},
@@ -1540,7 +1629,7 @@ class MainWindow(QMainWindow):
             self.preset.setCurrentText(str(settings["preset"]))
         self.enhance.setChecked(bool(settings.get("enhance", False)))
         self.object_mask.setChecked(bool(settings.get("object_mask", True)))
-        self.precise_edges.setChecked(bool(settings.get("precise_edges", False)))
+        self.precise_edges.setChecked(bool(settings.get("precise_edges", True)))
         self.fast_draft.setChecked(bool(settings.get("fast_draft_preview", True)))
         self.detect_every.setChecked(bool(settings.get("detect_every_other", True)))
         self.apply_all.setChecked(bool(settings.get("apply_all", False)))
@@ -1560,6 +1649,10 @@ class MainWindow(QMainWindow):
             self.sharpen_slider.setValue(int(settings["sharpen"]))
         if settings.get("restore_strength") is not None:
             self.restore_slider.setValue(int(settings["restore_strength"]))
+        self._set_combo(self.pixel_boost, settings.get("pixel_boost", 256))
+        self._set_combo(self.restorer, settings.get("restorer", "gfpgan"))
+        if settings.get("codeformer_fidelity") is not None:
+            self.fidelity_slider.setValue(int(settings["codeformer_fidelity"]))
         if settings.get("video_quality") is not None:
             self._set_combo(self.video_quality, settings.get("video_quality"))
         self.fast_playback.setChecked(bool(settings.get("fast_playback", False)))
@@ -1715,9 +1808,15 @@ class MainWindow(QMainWindow):
 
 
 def main() -> int:
+    from faceswap.providers import register_windows_dll_directories
+
+    register_windows_dll_directories()
     app = QApplication.instance() or QApplication(sys.argv)
     app.setApplicationName("Videoswa")
     window = MainWindow()
+    problems = environment_problems()
+    if problems and os.environ.get("QT_QPA_PLATFORM") != "offscreen":
+        QMessageBox.critical(window, "Videoswa cannot detect faces", environment_message(problems))
     window.show()
     return app.exec()
 

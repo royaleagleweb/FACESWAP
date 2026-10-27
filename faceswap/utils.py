@@ -72,6 +72,14 @@ GFPGAN_URLS = [
     "https://huggingface.co/nlightcho/gfpgan_v14/resolve/main/GFPGANv1.4.pth",
 ]
 
+# Official CodeFormer v0.1.0 weights. PyTorch. SHA256 is the Hugging Face LFS
+# digest of the same release asset (376,637,898 bytes, 359.2 MiB).
+CODEFORMER_SHA256 = "1009e537e0c2a07d4cabce6355f53cb66767cd4b4297ec7a4a64ca4b8a5684b7"
+CODEFORMER_URLS = [
+    "https://github.com/sczhou/CodeFormer/releases/download/v0.1.0/codeformer.pth",
+    "https://huggingface.co/datasets/Gourieff/ReActor/resolve/main/models/facerestore_models/codeformer-v0.1.0.pth",
+]
+
 
 def _sha256(path: Path, chunk: int = 1 << 20) -> str:
     h = hashlib.sha256()
@@ -182,12 +190,19 @@ def ensure_gfpgan() -> Path:
     return download_file(GFPGAN_URLS, target, GFPGAN_SHA256)
 
 
+def ensure_codeformer() -> Path:
+    """Download the official CodeFormer v0.1.0 weights."""
+    target = MODELS_DIR / "codeformer.pth"
+    return download_file(CODEFORMER_URLS, target, CODEFORMER_SHA256)
+
+
 def optional_model_report() -> str:
     """Which extra weights are already on disk. Does not download anything."""
     rows = (
         ("XSeg", MODELS_DIR / "xseg.onnx", "downloads on the first swap"),
         ("BiSeNet", MODELS_DIR / "bisenet.onnx", "downloads when Precise edges is on"),
-        ("GFPGAN", MODELS_DIR / "GFPGANv1.4.pth", "downloads when sharpening is on"),
+        ("GFPGAN", MODELS_DIR / "GFPGANv1.4.pth", "downloads when Restore faces is on"),
+        ("CodeFormer", MODELS_DIR / "codeformer.pth", "downloads when CodeFormer is selected"),
     )
     parts = []
     for name, path, pending in rows:

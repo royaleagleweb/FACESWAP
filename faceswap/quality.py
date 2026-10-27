@@ -17,6 +17,52 @@ ROTATION_MODES = (ROTATION_PER_PERSON, ROTATION_SCENE, ROTATION_INTERVAL)
 _SCENE_BREAK = 0.35
 
 
+def quality_preset(name: str) -> dict:
+    """Knobs for the Quality, Balanced, and Fast buttons.
+
+    Quality is the export default: pixel boost 512, CodeFormer, precise edges,
+    a light sharpen, and a detector pass on every frame. Balanced is the 8 GB
+    compromise (pixel boost 256, detect every 2nd frame, fast draft preview).
+    Fast stays at one 128px pass.
+    """
+    key = (name or "balanced").strip().lower()
+    if key == "fast":
+        return {
+            "pixel_boost": 128,
+            "precise_edges": False,
+            "fast_draft_preview": True,
+            "detect_every_other": True,
+            "enhance": False,
+            "color_match": 60,
+            "object_mask": True,
+            "restorer": "gfpgan",
+            "sharpen": 0,
+        }
+    if key == "quality":
+        return {
+            "pixel_boost": 512,
+            "precise_edges": True,
+            "fast_draft_preview": False,
+            "detect_every_other": False,
+            "enhance": True,
+            "color_match": 60,
+            "object_mask": True,
+            "restorer": "codeformer",
+            "sharpen": 18,
+        }
+    return {
+        "pixel_boost": 256,
+        "precise_edges": True,
+        "fast_draft_preview": True,
+        "detect_every_other": True,
+        "enhance": True,
+        "color_match": 60,
+        "object_mask": True,
+        "restorer": "gfpgan",
+        "sharpen": 12,
+    }
+
+
 def resolve_quality(
     *,
     enhance: bool,
