@@ -1,0 +1,22 @@
+# NVIDIA Windows (RTX 4070 class). Do this AFTER requirements.txt, from an
+# activated virtualenv. onnxruntime and onnxruntime-gpu cannot both be installed.
+#
+#   pip uninstall -y onnxruntime onnxruntime-directml
+#   pip install -r requirements-windows-gpu.txt
+#
+# 1.22.0 is the CUDA 12.8 build that matches TensorRT 10.9 in the README.
+# onnxruntime-gpu 1.27 and newer publish CUDA 13 wheels instead — use those
+# only when CUDA 13 and a matching TensorRT build are what you installed.
+#
+# cuDNN 9's frontend (ORT 1.20 and newer) can create a CUDA session and then
+# fail inside buffalo_l's Conv node:
+#   CUDNN_FE failure 7: GRAPH_EXECUTION_FAILED
+# Videoswa sets ORT_DISABLE_CUDNN_FRONTEND=1 when that variable is unset, asks
+# CUDA for cudnn_conv_algo_search=DEFAULT, and if the graph still fails it
+# rebuilds on DirectML when that provider is installed, otherwise CPU.
+# For a GPU path that does not use CUDA, switch to
+# requirements-windows-directml.txt (do not install both packages).
+# onnxruntime-gpu==1.19.2 is the last build without that frontend conv path,
+# but it expects TensorRT 10.2, not 10.9. 1.20.1 still uses the frontend and
+# TensorRT 10.4. Stay on 1.22.0 when you want TensorRT 10.9.
+onnxruntime-gpu==1.22.0
