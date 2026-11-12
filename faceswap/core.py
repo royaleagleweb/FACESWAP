@@ -73,6 +73,8 @@ class SwapStats:
     faces_held: int = 0
     faces_skipped: int = 0
     faces_wiped: int = 0
+    detector_frames: int = 0
+    cached_frames: int = 0
     stage_ms: dict = field(default_factory=dict)
     miss_log: list = field(default_factory=list)
     miss_total: int = 0
@@ -84,7 +86,20 @@ class SwapStats:
         if not self.stage_ms:
             return "no stage timings"
         frames = max(1, int(self.frames))
-        parts = [f"{name} {ms / frames:.1f}ms/frame" for name, ms in self.stage_ms.items()]
+        parts = []
+        for name, ms in self.stage_ms.items():
+            if name.startswith("warmup"):
+                parts.append(f"{name} {ms:.0f}ms once")
+            else:
+                parts.append(f"{name} {ms / frames:.1f}ms/frame")
+        detail_names = (
+            "inswapper", "enhance", "xseg", "bisenet", "geom", "occlusion",
+            "mask", "blend", "sharpen", "gap",
+        )
+        detail = sum(self.stage_ms.get(name, 0.0) for name in detail_names)
+        wall = self.stage_ms.get("swap", 0.0)
+        if wall > 0:
+            parts.append(f"swap_parts {detail / frames:.1f}ms/frame")
         outer = sum(self.stage_ms.get(name, 0.0) for name in ("detect", "swap", "decode", "encode"))
         parts.append(f"pipeline {outer / frames:.1f}ms/frame")
         return " · ".join(parts)
@@ -248,9 +263,16 @@ class FaceSwapEngine:
             out = self.swapper.swap(
                 out, target_face=face, source_face=source, coverage=self.coverage
             )
-            self.stats.add_ms("swap", swap_started)
-            for name, ms in getattr(self.swapper, "stage_ms", {}).items():
+            wall_ms = (time.perf_counter() - swap_started) * 1000.0
+            detail = getattr(self.swapper, "stage_ms", {}) or {}
+            for name, ms in detail.items():
                 self.stats.stage_ms[name] = self.stats.stage_ms.get(name, 0.0) + ms
+            warmup = sum(float(ms) for key, ms in detail.items() if str(key).startswith("warmup"))
+            accounted = sum(float(ms) for key, ms in detail.items() if not str(key).startswith("warmup"))
+            gap = max(0.0, wall_ms - warmup - accounted)
+            self.stats.stage_ms["gap"] = self.stats.stage_ms.get("gap", 0.0) + gap
+            # Warm-up is reported once. It is not part of the per-frame swap time.
+            self.stats.stage_ms["swap"] = self.stats.stage_ms.get("swap", 0.0) + max(0.0, wall_ms - warmup)
             if hasattr(self.swapper, "stage_ms"):
                 self.swapper.stage_ms = {}
             if getattr(self.swapper, "paste_wiped", False):
@@ -294,8 +316,10 @@ class FaceSwapEngine:
         use_cache = stride > 1 and self._cached_faces and (self._detect_tick % stride != 1)
         if use_cache:
             self._from_detector = False
+            self.stats.cached_frames += 1
             return list(self._cached_faces)
         self._from_detector = True
+        self.stats.detector_frames += 1
         faces = self.analyzer.analyze(frame_bgr)
         self._cached_faces = list(faces)
         return faces

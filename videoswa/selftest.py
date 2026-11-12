@@ -87,9 +87,12 @@ def _run(photo: Path, video: Path, frames: int, out_dir: Path, lines: list[str])
     )
     swapper = FaceSwapper(use_gpu=True, enhance=False, execution="auto")
     swapper.pixel_boost = 256
+    swapper.precise_edges = False
     logger.info("inswapper providers: %s", getattr(swapper, "active_providers", None))
+    logger.info("enhance: off for selftest (device would be logged if GFPGAN were loaded)")
     lines.append(f"provider: {getattr(swapper, 'active_providers', None)}")
-    engine = FaceSwapEngine(analyzer=analyzer, swapper=swapper, detect_stride=2)
+    lines.append("enhance: off")
+    engine = FaceSwapEngine(analyzer=analyzer, swapper=swapper, detect_stride=1)
     if face is None:
         lines.append("swap: skipped, source photo had no face")
         return False
@@ -102,10 +105,18 @@ def _run(photo: Path, video: Path, frames: int, out_dir: Path, lines: list[str])
         face_mode="single",
         enhance=False,
         pixel_boost=256,
-        detect_every_other=True,
+        detect_every_other=False,
         fast_draft_preview=True,
     )
     mappings = build_mappings(engine, request)
+    import time as _time
+
+    from faceswap.swapper import warm_models
+
+    warm_started = _time.perf_counter()
+    warm_models(engine.swapper)
+    warmup_ms = (_time.perf_counter() - warm_started) * 1000.0
+    lines.append(f"warmup: {warmup_ms:.0f}ms once (InSwapper batch 4 + XSeg, not in per-frame swap)")
     end_s = 0.0
     if info.fps > 0:
         end_s = min(float(info.duration_s), frames / float(info.fps))
@@ -121,7 +132,8 @@ def _run(photo: Path, video: Path, frames: int, out_dir: Path, lines: list[str])
     stats = engine.stats
     lines.append(
         f"swap: frames={stats.frames} detected={stats.faces_detected} "
-        f"swapped={stats.faces_swapped} held={stats.faces_held} "
+        f"swapped={stats.faces_swapped} held_locks={stats.faces_held} "
+        f"detector_frames={stats.detector_frames} cached_frames={stats.cached_frames} "
         f"unmatched={stats.faces_unmatched} wiped={stats.faces_wiped} "
         f"coverage={stats.coverage_ratio:.2f}"
     )

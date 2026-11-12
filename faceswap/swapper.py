@@ -86,6 +86,7 @@ class FaceSwapper:
         )
         self.swapper, self.active_providers = loaded
         self.providers = providers
+        _enable_inswapper_batch(self.swapper, self.providers)
         self.execution = mode
         self._on_cpu = not uses_gpu(providers)
         logger.info("InSwapper active providers: %s", self.active_providers or "(unreported)")
@@ -244,8 +245,14 @@ class FaceSwapper:
         mode = normalize_coverage(coverage)
         alpha = None
         if self.object_mask:
+            load_started = time.perf_counter()
             models = self.occlusion_models()
+            if not getattr(self, "_mask_warm", False):
+                self._add_stage("warmup_mask", load_started)
+                self._mask_warm = True
+            geom_started = time.perf_counter()
             face_alpha = coverage_alpha(frame.shape[:2], align_kps, mode, yaw=yaw)
+            self._add_stage("geom", geom_started)
             xseg_started = time.perf_counter()
             neural = models.xseg_keepout(frame, matrix, face_alpha) if models.xseg is not None else None
             if models.xseg is not None:
@@ -255,6 +262,7 @@ class FaceSwapper:
                 precise_started = time.perf_counter()
                 precise = models.bisenet_keep(frame, matrix, face_alpha)
                 self._add_stage("bisenet", precise_started)
+            occ_started = time.perf_counter()
             alpha = _occ_mask(
                 frame,
                 align_kps,
@@ -262,7 +270,9 @@ class FaceSwapper:
                 neural=neural,
                 precise=precise,
                 yaw=yaw,
+                base_alpha=face_alpha,
             )
+            self._add_stage("occlusion", occ_started)
             alpha = self._shape_mask(alpha, align_kps)
             alpha = self._smooth_alpha(alpha)
             if alpha is None or float(np.max(alpha)) < 0.05:
@@ -292,7 +302,9 @@ class FaceSwapper:
             self.color_memory[self._color_key] = color_state["delta"]
         amount = float(getattr(self, "sharpen", 0.0) or 0.0)
         if amount > 0.0:
+            sharp_started = time.perf_counter()
             out = _sharpen_roi(out, target_face.bbox, amount)
+            self._add_stage("sharpen", sharp_started)
         if _box_mean_abs(frame, out, target_face.bbox) < 1.5:
             self._mark_wiped(
                 "The paste mask wiped this swap. The face region did not change. "
@@ -306,7 +318,22 @@ class FaceSwapper:
 
     def _restore_before_paste(self, canvas: np.ndarray, target_face: Face) -> np.ndarray:
         """Run GFPGAN or CodeFormer on the aligned swap, then paste that result."""
+        if self._enhancer is not None:
+            device = _gfpgan_device(self._enhancer)
+            if not getattr(self, "_enhance_logged", False):
+                logger.info("enhance device=%s cuda_required=yes", device)
+                self._enhance_logged = True
+            if "cpu" in device.lower():
+                logger.warning("GFPGAN is on CPU. Skipping it. A CPU restorer is hundreds of ms per frame.")
+                self._enhancer = None
+                self.allow_restore = False
+                self.stage_ms["enhance"] = self.stage_ms.get("enhance", 0.0)
+                return canvas
         if canvas is None or not self.allow_restore:
+            if not getattr(self, "_enhance_logged", False):
+                logger.info("enhance: off")
+                self._enhance_logged = True
+            self.stage_ms["enhance"] = self.stage_ms.get("enhance", 0.0)
             return canvas
         if face_span_px(target_face.bbox) < RESTORE_MIN_PX:
             return canvas
@@ -429,6 +456,124 @@ class _FaceShim:
         self.embedding = face.embedding
         self.normed_embedding = face.normed_embedding
         self.det_score = face.det_score
+
+
+def _enable_inswapper_batch(model, providers) -> None:
+    """Rebuild InSwapper so TensorRT can run 1, 4, or 16 tiles in one call.
+
+    The stock model is batch 1. Four sequential runs were about 50 ms/frame.
+    A dynamic batch keeps one cached FP16 engine.
+    """
+    if getattr(model, "_videoswa_batch_ready", False):
+        return
+    model_file = getattr(model, "model_file", None)
+    if not model_file or not getattr(model, "session", None):
+        return
+    try:
+        import onnx
+        import onnxruntime as ort
+
+        from .providers import TENSORRT, cuda_provider_options, tensorrt_provider_options
+        from .utils import MODELS_DIR
+
+        onnx_model = onnx.load(str(model_file))
+        for value in list(onnx_model.graph.input) + list(onnx_model.graph.output):
+            dims = value.type.tensor_type.shape.dim
+            if not dims:
+                continue
+            dims[0].dim_param = "batch"
+            dims[0].ClearField("dim_value")
+        image_name = model.input_names[0]
+        id_name = model.input_names[1]
+        id_dim = 512
+        id_shape = model.session.get_inputs()[1].shape
+        if id_shape and isinstance(id_shape[-1], int):
+            id_dim = int(id_shape[-1])
+        cache = MODELS_DIR / "trt_cache" / "inswapper_batch"
+        cache.mkdir(parents=True, exist_ok=True)
+        trt = tensorrt_provider_options(cache)
+        shape = (
+            f"{image_name}:{{n}}x3x128x128,{id_name}:{{n}}x{id_dim}"
+        )
+        trt["trt_profile_min_shapes"] = shape.format(n=1)
+        trt["trt_profile_opt_shapes"] = shape.format(n=4)
+        trt["trt_profile_max_shapes"] = shape.format(n=16)
+        active = list(model.session.get_providers())
+        chosen = []
+        options = []
+        for entry in providers or active:
+            name = entry[0] if isinstance(entry, tuple) else entry
+            if name not in active and name != TENSORRT:
+                continue
+            chosen.append(name)
+            if name == TENSORRT:
+                options.append(trt)
+            elif "CUDA" in name:
+                options.append(cuda_provider_options())
+            else:
+                options.append({})
+        if not chosen:
+            chosen = active
+            options = [{} for _ in chosen]
+        session = ort.InferenceSession(
+            onnx_model.SerializeToString(),
+            providers=chosen,
+            provider_options=options,
+        )
+        model.session = session
+        model._videoswa_batch_ready = True
+        model._videoswa_batch_ok = True
+        logger.info("InSwapper batch engine ready (batch 1–16) providers=%s", session.get_providers())
+    except Exception as exc:
+        model._videoswa_batch_ready = False
+        model._videoswa_batch_ok = False
+        logger.info("InSwapper stays on batch 1 (%s). Tiles run one after another.", exc)
+
+
+def warm_models(swapper) -> None:
+    """One forward so TensorRT compiles before the timed frames.
+
+    Balanced runs four 128px tiles. The warm-up uses that batch, then falls
+    back to a single tile if the engine is still batch 1.
+    """
+    model = getattr(swapper, "swapper", None)
+    if model is not None and hasattr(model, "session"):
+        try:
+            image = np.zeros((4, 3, 128, 128), dtype=np.float32)
+            latent = np.zeros((4, 512), dtype=np.float32)
+            model.session.run(
+                model.output_names,
+                {model.input_names[0]: image, model.input_names[1]: latent},
+            )
+            logger.info("Warmed InSwapper batch 4")
+        except Exception as exc:
+            logger.info("InSwapper batch-4 warmup skipped: %s", exc)
+            try:
+                image = np.zeros((1, 3, 128, 128), dtype=np.float32)
+                latent = np.zeros((1, 512), dtype=np.float32)
+                model.session.run(
+                    model.output_names,
+                    {model.input_names[0]: image, model.input_names[1]: latent},
+                )
+                logger.info("Warmed InSwapper batch 1")
+            except Exception as inner:
+                logger.info("InSwapper warmup skipped: %s", inner)
+    try:
+        models = swapper.occlusion_models()
+    except Exception as exc:
+        logger.info("Mask warmup skipped: %s", exc)
+        return
+    session = getattr(models, "xseg", None)
+    if session is None:
+        return
+    try:
+        from .occlusion import _model_input
+
+        blob = _model_input(session, np.zeros((64, 64, 3), dtype=np.uint8), imagenet=False)
+        session.run(None, {session.get_inputs()[0].name: blob})
+        logger.info("Warmed XSeg")
+    except Exception as exc:
+        logger.info("XSeg warmup skipped: %s", exc)
 
 
 def gfpgan_install_tip() -> Optional[str]:

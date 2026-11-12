@@ -33,6 +33,7 @@ def _occ_mask(
     neural: Optional[np.ndarray] = None,
     precise: Optional[np.ndarray] = None,
     yaw: float = 0.0,
+    base_alpha: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """Swap weight for one face. 1 replaces, 0 keeps the original.
 
@@ -40,13 +41,13 @@ def _occ_mask(
     ``neural`` and ``precise`` are optional face-sized maps (1 = occluder for
     neural, 1 = keep for precise) already warped into the frame.
     """
-    alpha = coverage_alpha(frame_bgr.shape[:2], kps, coverage, yaw=yaw)
+    alpha = base_alpha if base_alpha is not None else coverage_alpha(frame_bgr.shape[:2], kps, coverage, yaw=yaw)
     if float(alpha.max()) <= 0.0:
         return alpha
     keepout = _color_objects(frame_bgr, alpha, kps)
     if neural is not None and neural.shape[:2] == alpha.shape:
         neural_f = np.clip(neural.astype(np.float32), 0.0, 1.0)
-        keepout = np.maximum(keepout, neural_f * (alpha > 0.05))
+        keepout = np.maximum(keepout, neural_f)
     weight = alpha * (1.0 - np.clip(keepout, 0.0, 1.0))
     if precise is not None and precise.shape[:2] == alpha.shape:
         # Tighten only the soft rim. The beard interior stays put.

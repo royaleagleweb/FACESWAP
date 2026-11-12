@@ -219,34 +219,9 @@ class EngineWorker(QThread):
 
     def _warm_sessions(self, engine: FaceSwapEngine) -> None:
         """One dummy forward so the first real frame does not compile an engine."""
-        model = getattr(engine.swapper, "swapper", None)
-        if model is not None and hasattr(model, "session"):
-            try:
-                image = np.zeros((1, 3, 128, 128), dtype=np.float32)
-                latent = np.zeros((1, 512), dtype=np.float32)
-                model.session.run(
-                    model.output_names,
-                    {model.input_names[0]: image, model.input_names[1]: latent},
-                )
-                logger.info("Warmed InSwapper (%s)", getattr(model, "input_shape", ""))
-            except Exception as exc:
-                logger.info("InSwapper warmup skipped: %s", exc)
-        try:
-            models = engine.swapper.occlusion_models()
-        except Exception as exc:
-            logger.info("Mask warmup skipped: %s", exc)
-            return
-        session = getattr(models, "xseg", None)
-        if session is None:
-            return
-        try:
-            from faceswap.occlusion import _model_input
+        from faceswap.swapper import warm_models
 
-            blob = _model_input(session, np.zeros((64, 64, 3), dtype=np.uint8), imagenet=False)
-            session.run(None, {session.get_inputs()[0].name: blob})
-            logger.info("Warmed XSeg")
-        except Exception as exc:
-            logger.info("XSeg warmup skipped: %s", exc)
+        warm_models(engine.swapper)
 
     def _engine_for(self, execution: str, enhance: bool) -> FaceSwapEngine:
         if self._engine is not None and self._engine_key == execution:

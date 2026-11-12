@@ -654,7 +654,7 @@ class MainWindow(QMainWindow):
             "On for a final render. Fast draft preview skips BiSeNet and keeps the object mask. "
             "The jaw and beard edge is feathered."
         )
-        self.beard = QCheckBox("Male has a beard (extend to jaw)")
+        self.beard = QCheckBox("Full face coverage")
         self.beard.setChecked(True)
         self.beard.toggled.connect(self._on_beard)
         form.addWidget(self.object_mask)
@@ -663,9 +663,11 @@ class MainWindow(QMainWindow):
 
         form.addWidget(QLabel("Face coverage"))
         self.coverage = QComboBox()
-        self.coverage.addItem("Full, including beard", "full")
+        self.coverage.addItem("Full face (no beard spike)", "full")
         self.coverage.addItem("Normal (tight face)", "normal")
-        self.coverage.setToolTip("Full replaces the jaw, cheeks, and beard.")
+        self.coverage.setToolTip(
+            "Full is the feathered face hull plus a short chin. It does not paint a shape down the chest."
+        )
         self.coverage.currentIndexChanged.connect(self._sync_beard_from_coverage)
         form.addWidget(self.coverage)
 

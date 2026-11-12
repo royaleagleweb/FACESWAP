@@ -60,6 +60,33 @@ def test_windows_dll_candidates_include_torch_nvidia_and_tensorrt(tmp_path: Path
     assert register_windows_dll_directories() == []
 
 
+def test_four_tiles_are_one_inswapper_call() -> None:
+    from faceswap.pixel_boost import forward_bgr_tiles
+
+    calls = []
+
+    class _Session:
+        def run(self, names, feeds):
+            image = feeds["target"]
+            calls.append(tuple(image.shape))
+            count = image.shape[0]
+            return [np.zeros((count, 3, 128, 128), dtype=np.float32)]
+
+    class _Model:
+        session = _Session()
+        input_names = ["target", "source"]
+        output_names = ["output"]
+        input_std = 255.0
+        input_mean = 0.0
+        _videoswa_batch_ok = True
+
+    tiles = [np.zeros((128, 128, 3), dtype=np.uint8) for _ in range(4)]
+    latent = np.zeros((1, 512), dtype=np.float32)
+    swapped = forward_bgr_tiles(_Model(), tiles, latent)
+    assert len(swapped) == 4
+    assert calls == [(4, 3, 128, 128)]
+
+
 def test_pixel_boost_tile_counts_and_reassembly() -> None:
     assert pixel_boost_tiles(128) == 1
     assert pixel_boost_tiles(256) == 4

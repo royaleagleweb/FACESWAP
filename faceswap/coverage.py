@@ -149,45 +149,87 @@ def coverage_polygon(
     return pts
 
 
+def _hull_points(kps: np.ndarray, yaw: float = 0.0) -> Optional[np.ndarray]:
+    """Face oval around the landmarks. The chin stops just under the mouth.
+
+    This is not the old beard polygon. That shape ran two eye-to-mouth
+    lengths down the chest and pasted a hard triangle there.
+    """
+    axes = face_axes(kps)
+    if axes is None:
+        return None
+    eye_c, mouth_c, down_u, side_u, em, eye_dist = axes
+    profile = float(np.clip(abs(float(yaw)) / 0.75, 0.0, 1.0))
+    shift = side_u * (float(np.clip(yaw, -1.0, 1.0)) * 0.2 * profile * eye_dist)
+    chin = mouth_c + down_u * (0.36 * em)
+    cheeks = [
+        mouth_c + side_u * (sign * (0.95 + 0.35 * profile) * eye_dist) + down_u * (0.05 * em)
+        for sign in (-1.0, 1.0)
+    ]
+    temples = [
+        eye_c + side_u * (sign * (0.85 + 0.25 * profile) * eye_dist) - down_u * (0.15 * em)
+        for sign in (-1.0, 1.0)
+    ]
+    forehead = eye_c - down_u * (0.85 * em)
+    pts = np.vstack([
+        np.asarray(kps, dtype=np.float64).reshape(-1, 2),
+        chin,
+        forehead,
+        *cheeks,
+        *temples,
+    ])
+    return pts + shift
+
+
 def coverage_alpha(
     shape: tuple[int, int],
     kps: np.ndarray,
     coverage: str = DEFAULT_COVERAGE,
     yaw: float = 0.0,
 ) -> np.ndarray:
-    """Float mask in ``[0, 1]``. The beard interior is 1; only the rim is soft."""
+    """Feathered face mask. The rim is soft. Nothing hard is drawn below the chin.
+
+    ``full`` and ``normal`` both use the landmark hull. ``normal`` is a tighter
+    margin. A long beard polygon used to paste a hard triangle onto the chest.
+    """
     height, width = shape
     alpha = np.zeros((height, width), dtype=np.float32)
-    polygon = coverage_polygon(kps, coverage, yaw=yaw)
+    mode = normalize_coverage(coverage)
+    points = _hull_points(kps, yaw=yaw) if mode == COVERAGE_FULL else None
+    if points is None:
+        polygon = coverage_polygon(kps, COVERAGE_NORMAL, yaw=yaw)
+        axes = face_axes(kps)
+        if polygon is None or axes is None:
+            return alpha
+        points = polygon
     axes = face_axes(kps)
-    if polygon is None or axes is None:
+    if axes is None:
         return alpha
     _eye_c, _mouth_c, _down_u, _side_u, _em, eye_dist = axes
-    mode = normalize_coverage(coverage)
-    # Full coverage keeps a short rim. A wide feather mixes two skin colors
-    # and looks muddy; the beard interior stays fully replaced.
-    feather = max(4.0, (0.11 if mode == COVERAGE_FULL else 0.10) * eye_dist)
-
-    # Distance transform only inside the face box. A full-frame pass was the
-    # slow part of every paste on a 1080p frame.
+    # Soft margin. Full is the face plus a little chin. Normal stays tighter.
+    feather = max(10.0, (0.28 if mode == COVERAGE_FULL else 0.16) * eye_dist)
+    hull = cv2.convexHull(np.round(points).astype(np.int32))
+    xs = hull[:, 0, 0]
+    ys = hull[:, 0, 1]
     margin = int(np.ceil(feather)) + 3
-    xs = polygon[:, 0]
-    ys = polygon[:, 1]
-    x0 = max(0, int(np.floor(float(xs.min()))) - margin)
-    y0 = max(0, int(np.floor(float(ys.min()))) - margin)
-    x1 = min(width, int(np.ceil(float(xs.max()))) + margin + 1)
-    y1 = min(height, int(np.ceil(float(ys.max()))) + margin + 1)
+    x0 = max(0, int(xs.min()) - margin)
+    y0 = max(0, int(ys.min()) - margin)
+    x1 = min(width, int(xs.max()) + margin + 1)
+    y1 = min(height, int(ys.max()) + margin + 1)
     if x1 <= x0 or y1 <= y0:
         return alpha
     local = np.zeros((y1 - y0, x1 - x0), dtype=np.uint8)
-    shifted = np.round(polygon).astype(np.int32)
-    shifted[:, 0] -= x0
-    shifted[:, 1] -= y0
-    cv2.fillPoly(local, [shifted], 255)
+    shifted = hull.copy()
+    shifted[:, 0, 0] -= x0
+    shifted[:, 0, 1] -= y0
+    cv2.fillConvexPoly(local, shifted, 255)
+    grow = max(1, int(round(feather * 0.35)))
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (grow * 2 + 1, grow * 2 + 1))
+    local = cv2.dilate(local, kernel)
     if not np.any(local):
         return alpha
     dist = cv2.distanceTransform(local, cv2.DIST_L2, 5)
-    t = np.clip(dist / (feather * 0.55), 0.0, 1.0)
+    t = np.clip(dist / feather, 0.0, 1.0)
     soft = (t * t * (3.0 - 2.0 * t)).astype(np.float32)
     alpha[y0:y1, x0:x1] = soft
     return alpha
@@ -200,26 +242,10 @@ def _sample_maps(cx: np.ndarray, cy: np.ndarray, size: int, coverage: str) -> tu
     landmarks. Past the crop, full coverage replays the chin band downward
     across the beard instead of stopping.
     """
+    # Stay inside the swapped crop. Replaying the chin band below the crop
+    # painted a hard skin wedge onto the chest.
     sx = np.clip(cx, 1.0, size - 2.0)
-    if normalize_coverage(coverage) != COVERAGE_FULL:
-        sy = np.clip(cy, 1.0, size - 2.0)
-        return sx.astype(np.float32), sy.astype(np.float32)
-
-    mouth_y, eye_mouth = _mouth_metrics()
-    # Pixel boost pastes a 256 or 512 crop. Scale the 128px mouth so the
-    # beard stretch still starts at the crop edge instead of inside the face.
-    scale = float(size) / 128.0
-    mouth_y *= scale
-    eye_mouth *= scale
-    cy_end = mouth_y + FULL_BEARD_DEPTH_EM * eye_mouth
-    chin0 = 0.78 * (size - 1)
-    chin1 = 0.96 * (size - 1)
     sy = np.clip(cy, 1.0, size - 2.0)
-    below = cy > (size - 1)
-    if np.any(below):
-        span = max(cy_end - (size - 1), 1.0)
-        u = np.clip((cy[below] - (size - 1)) / span, 0.0, 1.0)
-        sy[below] = chin0 + u * (chin1 - chin0)
     return sx.astype(np.float32), sy.astype(np.float32)
 
 

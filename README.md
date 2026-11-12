@@ -381,7 +381,7 @@ python run.py swap -t party.mp4 --pair alice.jpg=ref_alice.jpg --pair bob.jpg=re
 | `--execution cuda` | CUDA, then DirectML on Windows, then CPU. Skips TensorRT |
 | `--execution directml` | DirectML, then CPU |
 | `--cpu` | CPU only |
-| `--coverage full` | Jaw and beard replacement (default) |
+| `--coverage full` | Feathered face hull plus a short chin (default) |
 | `--coverage normal` | Tight inner-face oval |
 | `--similarity 0.32` | First-lock cosine threshold. A tracked face is kept below this |
 | `--enhance` | GFPGAN on faces at least 96px across, if that extra is installed |
@@ -394,22 +394,15 @@ python run.py swap -t party.mp4 --pair alice.jpg=ref_alice.jpg --pair bob.jpg=re
 
 Videos longer than 5 minutes are rejected here too, before models load.
 
-## Beard and jaw coverage
+## Face coverage
 
-InSwapper's own paste is a tight oval. It erodes the 128×128 crop, and the
-mouth already sits near the bottom of that crop, so the chin and beard stay
-on the original person.
+InSwapper's own paste is a tight oval. Videoswa's default is **full coverage**:
+the feathered convex hull of the landmarks, plus a short chin (about a third
+of the eye-to-mouth length) and a soft margin. The paste stops at that hull.
+It does not draw a polygon down the chest.
 
-Videoswa's default is **full coverage**. The eyes, nose, and mouth still come
-from the aligned InSwapper crop. Below that crop, the swapped chin is stretched
-over a landmark footprint that runs about **two eye-to-mouth lengths below the
-mouth** and about **one eye-to-eye width out to each side of the jaw**. Inside
-that footprint the replacement is complete (mask value 1). The soft rim is a
-thin band, and only a light color correction is applied there, so the original
-face does not show back through the cheeks, jaw, or beard.
-
-The desktop control is **Face coverage**. **Full, including beard** is
-selected when the window opens. **Normal (tight face)** is the smaller oval.
+The desktop control is **Face coverage**. **Full face (no beard spike)** is
+selected when the window opens. **Normal (tight face)** is a smaller margin.
 The CLI flag is `--coverage full` (default) or `--coverage normal`.
 
 ## Quality tips
@@ -419,7 +412,7 @@ frame, including when the head turns a little.
 
 - Use a sharp, frontal source photo. The face should be unobstructed.
 - Sample a video frame where that person's face is clear and large.
-- Leave **Face coverage** on **Full, including beard**.
+- Leave **Face coverage** on **Full face**.
 - The match threshold starts at **32%**. Raise it if the wrong person is
   swapped. Lower it only if the right person is left as the original.
 - Videoswa locks a face to its source while the box still overlaps and the
@@ -435,7 +428,7 @@ frame, including when the head turns a little.
   widens the cheek and jaw on that side. A person who turns their head keeps
   the same source.
 - **Object mask** stays on. It punches out a lollipop or food that does not
-  match the face color, and it leaves a wide beard under the mouth in place.
+  match the face color. The paste itself never extends below the chin as a hard shape.
   Gender is locked from the first five detections of each person, so one
   wrong frame does not flip the ♂/♀ tag.
 

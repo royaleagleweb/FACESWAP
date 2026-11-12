@@ -82,7 +82,10 @@ def test_occ_mask_keeps_a_lollipop_and_a_beard() -> None:
     weight = _occ_mask(frame, kps, "full")
     assert weight[0, 0] == 0.0
     assert weight[cy + 6, cx + 6] < 0.05
-    assert weight[y0 + 10, int(beard[0])] > 0.9
+    # A dark band well below the chin is outside the face hull, so it is not pasted.
+    assert weight[y0 + 10, int(beard[0])] < 0.05
+    skin = mouth - down_u * (0.2 * em)
+    assert weight[int(skin[1]), int(skin[0])] > 0.9
 
 
 def test_occ_mask_leaves_a_uniform_face_intact() -> None:

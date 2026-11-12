@@ -61,28 +61,22 @@ def test_full_mask_covers_beard_and_jaw_normal_does_not() -> None:
     full = coverage_alpha(shape, kps, "full")
     normal = coverage_alpha(shape, kps, "normal")
 
-    beard_x, beard_y = _beard_pixel(kps, 1.55)
-    jaw_x, jaw_y = _beard_pixel(kps, 0.35, lateral_eyes=0.80)
-    cheek_x, cheek_y = _beard_pixel(kps, -0.25, lateral_eyes=0.70)
+    chest_x, chest_y = _beard_pixel(kps, 1.55)
+    chin_x, chin_y = _beard_pixel(kps, 0.15)
+    cheek_x, cheek_y = _beard_pixel(kps, -0.25, lateral_eyes=0.55)
 
-    assert full[beard_y, beard_x] > 0.95
-    assert normal[beard_y, beard_x] < 0.05
-    assert full[jaw_y, jaw_x] > 0.90
-    assert normal[jaw_y, jaw_x] < 0.15
-    assert full[cheek_y, cheek_x] > 0.90
+    # The old beard polygon reached the chest as a hard wedge. It must not.
+    assert full[chest_y, chest_x] < 0.05
+    assert normal[chest_y, chest_x] < 0.05
+    assert full[chin_y, chin_x] > 0.5
+    assert full[cheek_y, cheek_x] > 0.5
 
     _eye_c, mouth_c, down_u, _side, em, _eye = face_axes(kps)
-    yy, xx = np.mgrid[0:shape[0], 0:shape[1]]
-    along = (xx - mouth_c[0]) * down_u[0] + (yy - mouth_c[1]) * down_u[1]
-    below = along > 0
-    full_below = int(np.count_nonzero((full > 0.5) & below))
-    normal_below = int(np.count_nonzero((normal > 0.5) & below))
-    assert normal_below > 0
-    assert full_below >= 2.5 * normal_below
-
     reach = mask_reach_below_mouth(full, kps)
-    assert reach >= 1.7 * em
+    assert reach < 0.85 * em
     assert mask_reach_below_mouth(normal, kps) < 0.7 * em
+    # The rim is feathered, not a hard polygon edge.
+    assert np.any((full > 0.15) & (full < 0.85))
 
 
 def test_full_paste_replaces_beard_pixels_normal_leaves_them() -> None:
@@ -105,10 +99,9 @@ def test_full_paste_replaces_beard_pixels_normal_leaves_them() -> None:
     normal = paste_swapped_face(frame, swapped, matrix, kps, "normal")
 
     bx, by = _beard_pixel(kps, 1.5)
-    # Full replacement: the green beard is gone at the beard center.
-    assert full[by, bx, 1] < 40
-    assert full[by, bx, 2] > 200
-    # Normal stops short, so that same pixel is still the original green.
+    # Chest stays the original green. The swap does not paint a wedge there.
+    assert full[by, bx, 1] > 150
+    assert full[by, bx, 2] < 40
     assert normal[by, bx, 1] > 150
     assert normal[by, bx, 2] < 40
 
@@ -140,8 +133,7 @@ def test_inverted_matrix_is_reoriented_before_paste() -> None:
 
     corrected = paste_swapped_face(frame, swapped, inverse, kps, "full")
     bx, by = _beard_pixel(kps, 1.5)
-    assert corrected[by, bx, 2] > 200
-    assert corrected[by, bx, 1] < 40
+    assert corrected[by, bx, 1] > 150
     left_eye = kps[0].astype(int)
     assert corrected[left_eye[1], left_eye[0], 0] > 200
 
