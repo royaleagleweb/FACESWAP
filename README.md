@@ -18,6 +18,14 @@ python -m videoswa
 `python run.py` opens the same window. The command-line swap tool is still
 there for scripts (`python run.py swap ...`).
 
+The main screen is three steps: drop face photos, drop a video (or a photo),
+press Swap. Drag and drop works for both. Presets, the enhancer, the mask,
+trim, and output size are under **Advanced**. The default preset is **Laptop**
+so an 8 GB GPU stays usable. Models load once in the background ("Warming up
+GPU"). Scrubbing the timeline previews at half resolution. A finished swap
+can open the output folder. Audio is copied when the file allows it, and the
+frame rate, size, and length stay the same unless you trim or pick 720p/1080p.
+
 A new clip, in order:
 
 1. **Add face(s)**. JPG, PNG, and HEIC work. A photo with no face is rejected
@@ -534,12 +542,13 @@ requirements-windows-directml.txt
   DirectML when that provider is installed, otherwise on CPU. The banner
   names the provider. Install `requirements-windows-directml.txt` for a GPU
   that does not use CUDA. Launch with the project `.venv\Scripts\python.exe`.
-- **The swap is slow.** Read the provider banner. CPU is the slow path.
-  Half resolution is the faster export. DirectML is the Windows GPU
-  alternative when CUDA is unhealthy. The window opens on **Quality**
-  (pixel boost 512, CodeFormer, precise edges, every frame). On an 8 GB GPU
-  switch to **Balanced** (pixel boost 256, detect every 2nd frame) if the
-  export runs out of memory. **Fast** is the 128px preview path.
+- **The swap is slow.** The window opens on **Laptop**: one 128px swap,
+  enhancer off, detect every 2nd frame, fast preview while you scrub.
+  **Balanced** is 256. **Quality** is the slow one (512, CodeFormer, every
+  frame). The log prints per-stage times (decode, detect, swap, mask,
+  enhance, encode) and any frame that missed a face. Half resolution is
+  still there under Advanced. DirectML is the Windows GPU path when CUDA
+  is unhealthy.
 - **The swap flickers.** Landmarks and the paste mask are smoothed per
   person. A missed detection keeps the last good face for a few frames
   instead of flashing the original. A scene cut resets that smoothing.

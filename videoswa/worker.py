@@ -23,7 +23,7 @@ from faceswap.swapper import FaceSwapper
 from faceswap.utils import logger
 from faceswap.video import SwapCancelled, process_video, read_frame_at, read_frame_index, reset_stats, swap_frame
 from videoswa.images import crop_face
-from videoswa.jobs import MIN_ROI_CHANGE, SwapRequest, build_mappings, read_image, roi_mean_change
+from videoswa.jobs import IMAGE_SUFFIXES, MIN_ROI_CHANGE, SwapRequest, build_mappings, read_image, roi_mean_change
 
 
 def _quality_note(stats: SwapStats) -> str:
@@ -111,6 +111,7 @@ class SourceCheckRequest:
     det_size: int = 640
     det_thresh: float = 0.30
     role: str = "library"
+    crop: Optional[tuple] = None
 
 
 @dataclass
@@ -148,6 +149,10 @@ class EngineWorker(QThread):
         self._engine: Optional[FaceSwapEngine] = None
         self._engine_key: Optional[tuple] = None
 
+    def request_warmup(self, execution: str = "auto") -> None:
+        """Load models once, off the UI thread. Safe to call before the first swap."""
+        self._queue.put(("warmup", execution))
+
     def request_detect(self, job: DetectRequest) -> None:
         self._queue.put(("detect", job))
 
@@ -175,7 +180,9 @@ class EngineWorker(QThread):
                 return
             kind, job = item
             try:
-                if kind == "detect":
+                if kind == "warmup":
+                    self._warmup(str(job))
+                elif kind == "detect":
                     self._detect(job)
                 elif kind == "preview":
                     self._preview(job)
@@ -196,6 +203,15 @@ class EngineWorker(QThread):
                     self.source_ready.emit(str(getattr(job, "path", "")), False, message, getattr(job, "role", "library"))
                 else:
                     self.swap_failed.emit(message)
+
+    def _warmup(self, execution: str) -> None:
+        self.status.emit("Warming up GPU… models load once, and TensorRT engines stay cached.")
+        try:
+            self._engine_for(execution or "auto", enhance=False)
+        except Exception as exc:
+            self.status.emit(f"Models will load on the first swap. {exc}")
+            return
+        self.status.emit("GPU is ready. Drop a face photo and a video, then press Swap.")
 
     def _engine_for(self, execution: str, enhance: bool) -> FaceSwapEngine:
         if self._engine is not None and self._engine_key == execution:
@@ -256,6 +272,17 @@ class EngineWorker(QThread):
         engine = self._engine_for(job.execution, enhance=False)
         self._apply_detector(engine, job.det_size, job.det_thresh)
         self.status.emit("Detecting faces…")
+        if Path(job.video_path).suffix.lower() in IMAGE_SUFFIXES:
+            frame = read_image(Path(job.video_path))
+            faces = engine.analyzer.analyze(frame)
+            people = [
+                DetectedPerson(crop_bgr=crop_face(frame, face), face=face, index=index)
+                for index, face in enumerate(faces)
+            ]
+            note = "" if people else "No faces in this photo. Drag a box around the face if it is small or turned."
+            self.detect_ready.emit({"people": people, "time_s": 0.0, "note": note, "found": bool(people)})
+            self.status.emit(note or f"Detected {len(people)} face(s).")
+            return
         fps = max(1.0, float(job.fps or 30.0))
         times = (
             seek_times(job.timestamp_s, job.duration_s, fps=fps)
@@ -315,6 +342,16 @@ class EngineWorker(QThread):
         self._apply_detector(engine, job.det_size, job.det_thresh)
         path = Path(job.path)
         image = read_image(path)
+        crop = getattr(job, "crop", None)
+        if crop:
+            x1, y1, x2, y2 = [int(v) for v in crop]
+            height, width = image.shape[:2]
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(width, x2), min(height, y2)
+            if x2 - x1 > 8 and y2 - y1 > 8:
+                pad_x = int((x2 - x1) * 0.35)
+                pad_y = int((y2 - y1) * 0.35)
+                image = image[max(0, y1 - pad_y):min(height, y2 + pad_y), max(0, x1 - pad_x):min(width, x2 + pad_x)]
         finder = getattr(engine.analyzer, "best_source_face", None) or engine.analyzer.best_face
         face = finder(image)
         if face is None:
@@ -363,6 +400,10 @@ class EngineWorker(QThread):
             boost = 128
         swapper.pixel_boost = boost
         swapper.restorer = str(getattr(job, "restorer", "gfpgan") or "gfpgan")
+        swapper.enhance_every = max(1, int(getattr(job, "enhance_every", 1) or 1))
+        swapper.keep_mouth = bool(getattr(job, "keep_mouth", False))
+        swapper.mask_blur = int(getattr(job, "mask_blur", 0) or 0)
+        swapper.mask_padding = int(getattr(job, "mask_padding", 0) or 0)
         self._apply_detector(engine, int(getattr(job, "det_size", 640)), float(getattr(job, "det_thresh", 0.30)))
         if hasattr(swapper, "prepare_restorer"):
             tip = swapper.prepare_restorer(enhance, swapper.restorer)
@@ -435,19 +476,31 @@ class EngineWorker(QThread):
         def _progress(done: int, total: int) -> None:
             self.swap_progress.emit(done, total)
 
-        output = process_video(
-            engine,
-            mappings,
-            input_path=Path(job.video_path),
-            output_path=Path(job.output_path),
-            progress=_progress,
-            keep_audio=job.keep_audio,
-            crf=job.crf,
-            preset=job.preset,
-            cancel_event=self._cancel,
-            scale=job.scale,
-            encoder=getattr(job, "encoder", "auto"),
-        )
+        target = Path(job.video_path)
+        if target.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".heic", ".heif"}:
+            from faceswap.video import process_image
+
+            output = process_image(engine, mappings, target, Path(job.output_path))
+        else:
+            output = process_video(
+                engine,
+                mappings,
+                input_path=target,
+                output_path=Path(job.output_path),
+                progress=_progress,
+                keep_audio=job.keep_audio,
+                crf=job.crf,
+                preset=job.preset,
+                cancel_event=self._cancel,
+                scale=job.scale,
+                encoder=getattr(job, "encoder", "auto"),
+                start_s=float(getattr(job, "start_s", 0.0) or 0.0),
+                end_s=float(getattr(job, "end_s", 0.0) or 0.0),
+                output_height=int(getattr(job, "output_height", 0) or 0),
+            )
+        stage_line = getattr(engine.stats, "stage_line", None)
+        if callable(stage_line):
+            self.status.emit("Timings: " + stage_line())
         stats = engine.stats
         summary = (
             f"Frames {stats.frames} · faces detected {stats.faces_detected} · "

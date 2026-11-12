@@ -85,6 +85,15 @@ def test_pixel_boost_tile_counts_and_reassembly() -> None:
     assert int(canvas[0, 0, 0]) == 7
 
 
+def test_laptop_preset_is_the_fast_default() -> None:
+    laptop = quality_preset("laptop")
+    assert laptop["pixel_boost"] == 128
+    assert laptop["enhance"] is False
+    assert laptop["detect_every_other"] is True
+    assert laptop["fast_draft_preview"] is True
+    assert quality_preset("quality")["pixel_boost"] == 512
+
+
 def test_quality_presets_cover_fast_balanced_and_quality() -> None:
     fast = quality_preset("fast")
     balanced = quality_preset("balanced")

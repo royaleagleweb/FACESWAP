@@ -167,16 +167,28 @@ def coverage_alpha(
     # and looks muddy; the beard interior stays fully replaced.
     feather = max(4.0, (0.11 if mode == COVERAGE_FULL else 0.10) * eye_dist)
 
-    binary = np.zeros((height, width), dtype=np.uint8)
-    cv2.fillPoly(binary, [np.round(polygon).astype(np.int32)], 255)
-    if not np.any(binary):
+    # Distance transform only inside the face box. A full-frame pass was the
+    # slow part of every paste on a 1080p frame.
+    margin = int(np.ceil(feather)) + 3
+    xs = polygon[:, 0]
+    ys = polygon[:, 1]
+    x0 = max(0, int(np.floor(float(xs.min()))) - margin)
+    y0 = max(0, int(np.floor(float(ys.min()))) - margin)
+    x1 = min(width, int(np.ceil(float(xs.max()))) + margin + 1)
+    y1 = min(height, int(np.ceil(float(ys.max()))) + margin + 1)
+    if x1 <= x0 or y1 <= y0:
         return alpha
-    dist = cv2.distanceTransform(binary, cv2.DIST_L2, 5)
-    # Reach full replacement a short distance inside the outline. A wide
-    # ramp leaves the original face showing through the cheeks and jaw.
+    local = np.zeros((y1 - y0, x1 - x0), dtype=np.uint8)
+    shifted = np.round(polygon).astype(np.int32)
+    shifted[:, 0] -= x0
+    shifted[:, 1] -= y0
+    cv2.fillPoly(local, [shifted], 255)
+    if not np.any(local):
+        return alpha
+    dist = cv2.distanceTransform(local, cv2.DIST_L2, 5)
     t = np.clip(dist / (feather * 0.55), 0.0, 1.0)
-    # Smoothstep: flat 0 outside, flat 1 once `feather` px inside the outline.
-    alpha = (t * t * (3.0 - 2.0 * t)).astype(np.float32)
+    soft = (t * t * (3.0 - 2.0 * t)).astype(np.float32)
+    alpha[y0:y1, x0:x1] = soft
     return alpha
 
 

@@ -9,6 +9,7 @@ fires using the corresponding source identity.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field, replace
 from typing import Iterable, List, Optional, Sequence
 
@@ -72,6 +73,29 @@ class SwapStats:
     faces_held: int = 0
     faces_skipped: int = 0
     faces_wiped: int = 0
+    stage_ms: dict = field(default_factory=dict)
+    miss_log: list = field(default_factory=list)
+    miss_total: int = 0
+
+    def add_ms(self, name: str, started: float) -> None:
+        self.stage_ms[name] = self.stage_ms.get(name, 0.0) + (time.perf_counter() - started) * 1000.0
+
+    def stage_line(self) -> str:
+        if not self.stage_ms:
+            return "no stage timings"
+        parts = [f"{name} {ms:.0f}ms" for name, ms in self.stage_ms.items()]
+        frames = max(1, int(self.frames))
+        total = sum(self.stage_ms.values())
+        parts.append(f"about {total / frames:.1f}ms/frame")
+        return " · ".join(parts)
+
+    @property
+    def coverage_ratio(self) -> float:
+        """Share of face chances that received a swap, including held frames."""
+        chances = self.faces_swapped + self.faces_unmatched + self.faces_wiped + self.faces_skipped
+        if chances <= 0:
+            return 1.0 if self.frames and self.faces_swapped else 0.0
+        return self.faces_swapped / chances
 
 
 @dataclass
@@ -114,6 +138,7 @@ class FaceSwapEngine:
         self.rotation = SourceRotation()
         self.match_gender = False
         self.last_boxes: List[np.ndarray] = []
+        self._frame_index = 0
         for member in (self.analyzer, self.swapper):
             if hasattr(member, "adopt_cpu"):
                 self.cuda_guard.attach(member)
@@ -170,7 +195,9 @@ class FaceSwapEngine:
         if not mappings:
             return frame_bgr
 
+        started = time.perf_counter()
         faces = self._faces_for_frame(frame_bgr)
+        self.stats.add_ms("detect", started)
         self.stats.frames += 1
         self.stats.faces_detected += len(faces)
         if self.min_face_px > 0:
@@ -178,6 +205,7 @@ class FaceSwapEngine:
             for face in faces:
                 if face_span_px(face.bbox) < self.min_face_px:
                     self.stats.faces_skipped += 1
+                    self._miss("face smaller than the minimum size")
                     continue
                 kept.append(face)
             faces = kept
@@ -188,6 +216,7 @@ class FaceSwapEngine:
                 self.stats.faces_swapped += 1
                 self.stats.faces_held += 1
                 return held
+            self._miss("no face detected and no tracked face to hold")
             return frame_bgr
 
         wildcard = [m for m in mappings if m.reference_face is None]
@@ -200,6 +229,7 @@ class FaceSwapEngine:
             decision = decisions.get(id(face))
             if decision is None:
                 self.stats.faces_unmatched += 1
+                self._miss("face did not match the chosen person")
                 continue
             mapping, held = decision
             track = self._touch_track(face, mapping)
@@ -209,13 +239,20 @@ class FaceSwapEngine:
             source = self.rotation.choose(pinned, face, time_s)
             if self._gender_blocks(source, face):
                 self.stats.faces_unmatched += 1
+                self._miss("gender filter blocked this face")
                 continue
             begin = getattr(self.swapper, "begin_face", None)
             if callable(begin):
                 begin(id(track))
+            swap_started = time.perf_counter()
             out = self.swapper.swap(
                 out, target_face=face, source_face=source, coverage=self.coverage
             )
+            self.stats.add_ms("swap", swap_started)
+            for name, ms in getattr(self.swapper, "stage_ms", {}).items():
+                self.stats.stage_ms[name] = self.stats.stage_ms.get(name, 0.0) + ms
+            if hasattr(self.swapper, "stage_ms"):
+                self.swapper.stage_ms = {}
             if getattr(self.swapper, "paste_wiped", False):
                 replay = self._paste_held(out, track, face)
                 if replay is not None:
@@ -225,6 +262,7 @@ class FaceSwapEngine:
                     self.last_boxes.append(np.asarray(face.bbox, dtype=np.float32).copy())
                     continue
                 self.stats.faces_wiped += 1
+                self._miss("paste mask removed the swap")
                 logger.warning(
                     getattr(self.swapper, "last_paste_note", "")
                     or "The paste mask wiped a swapped face."
@@ -237,6 +275,17 @@ class FaceSwapEngine:
                 self.stats.faces_held += 1
         self._age_tracks(touched)
         return out
+
+    def note_frame(self, index: int) -> None:
+        self._frame_index = int(index)
+
+    def _miss(self, reason: str) -> None:
+        self.stats.miss_total += 1
+        if len(self.stats.miss_log) >= 40:
+            return
+        line = f"frame {self._frame_index}: {reason}"
+        self.stats.miss_log.append(line)
+        logger.info("Missed face — %s", line)
 
     def _faces_for_frame(self, frame_bgr: np.ndarray) -> List[Face]:
         """Detect on every Nth frame and reuse the last landmarks between them."""

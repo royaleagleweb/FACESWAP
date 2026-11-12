@@ -7,15 +7,17 @@ import logging
 import os
 import shutil
 import sys
+import time
 from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import Qt, QTimer, Signal
-from PySide6.QtGui import QFont
+from PySide6.QtCore import QEvent, Qt, QTimer, QUrl, Signal
+from PySide6.QtGui import QDesktopServices, QFont
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDoubleSpinBox,
     QFileDialog,
     QFrame,
     QHBoxLayout,
@@ -43,7 +45,6 @@ from faceswap.runtime_check import environment_message, environment_problems
 from faceswap.utils import optional_model_report
 from faceswap.swapper import gfpgan_install_tip
 from faceswap.utils import logger
-from videoswa.jobs import MAX_IDENTITY_PHOTOS
 from faceswap.video import (
     VIDEO_SUFFIXES,
     VideoDurationUnknownError,
@@ -54,7 +55,16 @@ from faceswap.video import (
     read_frame_at,
 )
 from videoswa.images import bgr_to_qpixmap, wipe_preview
-from videoswa.jobs import FACE_MODE_MULTIPLE, FACE_MODE_SINGLE, FaceSource, SwapRequest, read_image, validate_request
+from videoswa.jobs import (
+    FACE_MODE_MULTIPLE,
+    FACE_MODE_SINGLE,
+    IMAGE_SUFFIXES,
+    MAX_IDENTITY_PHOTOS,
+    FaceSource,
+    SwapRequest,
+    read_image,
+    validate_request,
+)
 from videoswa.project import PROJECT_SUFFIX, gender_mark, load_project, save_project
 from videoswa.worker import DetectRequest, DetectedPerson, EngineWorker, PreviewRequest, SourceCheckRequest
 
@@ -205,6 +215,11 @@ class MainWindow(QMainWindow):
         self._source_order: list[Path] = []
         self._source_genders: dict[str, int] = {}
         self._identity_paths: dict[str, list[Path]] = {}
+        self._batch: list[Path] = []
+        self._draw_box = False
+        self._draw_origin = None
+        self._manual_crop: Optional[tuple] = None
+        self._progress_started = 0.0
 
         self.worker = EngineWorker()
         self.worker.detect_ready.connect(self._on_detected)
@@ -230,6 +245,9 @@ class MainWindow(QMainWindow):
         self._redetect_timer.timeout.connect(self._detect_after_slide)
         self._play_timer = QTimer(self)
         self._play_timer.timeout.connect(self._play_tick)
+        self._live_timer = QTimer(self)
+        self._live_timer.setSingleShot(True)
+        self._live_timer.timeout.connect(self._live_preview)
 
         self._build()
         self._apply_style()
@@ -247,16 +265,51 @@ class MainWindow(QMainWindow):
     def _build(self) -> None:
         root = QWidget()
         self.setCentralWidget(root)
+        self.setAcceptDrops(True)
         shell = QVBoxLayout(root)
         shell.setContentsMargins(12, 12, 12, 12)
         shell.setSpacing(10)
-        columns = QHBoxLayout()
-        columns.setSpacing(12)
-        columns.addWidget(self._build_source_column())
-        columns.addLayout(self._build_preview_column(), stretch=1)
-        columns.addWidget(self._build_quality_column())
-        shell.addLayout(columns, stretch=1)
+        source = self._build_source_column()
+        preview = self._build_preview_column()
+        quality = self._build_quality_column()
+        shell.addWidget(self._build_steps())
+        shell.addLayout(preview, stretch=1)
+        self.advanced_toggle = QCheckBox("Advanced")
+        self.advanced_toggle.setChecked(False)
+        self.advanced_toggle.setToolTip("Presets, mask, enhancer, and multi-face mapping. The defaults are ready to swap.")
+        self.advanced_box = QWidget()
+        advanced_row = QHBoxLayout(self.advanced_box)
+        advanced_row.setContentsMargins(0, 0, 0, 0)
+        advanced_row.addWidget(source)
+        advanced_row.addWidget(quality)
+        self.advanced_box.setVisible(False)
+        self.advanced_toggle.toggled.connect(self.advanced_box.setVisible)
+        shell.addWidget(self.advanced_toggle)
+        shell.addWidget(self.advanced_box)
         shell.addWidget(self._build_action_bar())
+        self.preview.installEventFilter(self)
+
+    def _build_steps(self) -> QFrame:
+        """The three actions that matter. Extra controls live under Advanced."""
+        bar = QFrame()
+        bar.setObjectName("Panel")
+        row = QHBoxLayout(bar)
+        row.setContentsMargins(10, 8, 10, 8)
+        one = QLabel("1. Face photos")
+        two = QLabel("2. Video")
+        three = QLabel("3. Swap")
+        for label in (one, two, three):
+            label.setObjectName("Title")
+        row.addWidget(one)
+        row.addWidget(self.single_btn)
+        row.addWidget(two)
+        row.addWidget(self.video_btn)
+        row.addWidget(three)
+        self.batch_label = QLabel("")
+        self.batch_label.setObjectName("Muted")
+        row.addWidget(self.batch_label)
+        row.addStretch(1)
+        return bar
 
     def _build_action_bar(self) -> QFrame:
         """Preview, Play, and Swap stay on screen. They are the whole job."""
@@ -268,9 +321,14 @@ class MainWindow(QMainWindow):
             widget.setMinimumHeight(40)
             row.addWidget(widget)
         self.run_btn.setMinimumHeight(52)
+        self.run_btn.setToolTip("Swap the video. Audio, frame rate, and length stay the same unless you set a trim.")
         self.cancel_btn.setMinimumHeight(40)
+        self.open_btn = QPushButton("Open output folder")
+        self.open_btn.setToolTip("Show the saved file in the file browser.")
+        self.open_btn.clicked.connect(self._open_output)
         row.addWidget(self.run_btn, stretch=1)
         row.addWidget(self.cancel_btn)
+        row.addWidget(self.open_btn)
         return bar
 
     def _scroll(self, widget: QWidget, width: int) -> QScrollArea:
@@ -303,7 +361,8 @@ class MainWindow(QMainWindow):
         self.source_list.currentRowChanged.connect(lambda _row: self._on_source_row())
         form.addWidget(self.source_list)
         add_row = QHBoxLayout()
-        self.single_btn = QPushButton("Add face(s)")
+        self.single_btn = QPushButton("Drop face photos")
+        self.single_btn.setToolTip("JPG, PNG, or HEIC. Drop several photos of the same person to average them.")
         self.single_btn.clicked.connect(self._pick_single_source)
         remove_btn = QPushButton("Remove")
         remove_btn.clicked.connect(self._remove_source)
@@ -399,7 +458,9 @@ class MainWindow(QMainWindow):
         target.setObjectName("Panel")
         target_layout = QVBoxLayout(target)
         browse_row = QHBoxLayout()
-        browse = QPushButton("Open target video")
+        browse = QPushButton("Drop a video")
+        browse.setToolTip("Or drop a video or photo anywhere on the window. Photos swap as a still image.")
+        self.video_btn = browse
         browse.clicked.connect(self._pick_video)
         self.video_label = QLabel("No video selected")
         self.video_label.setWordWrap(True)
@@ -443,10 +504,8 @@ class MainWindow(QMainWindow):
         self.fast_playback.setChecked(False)
         self.fast_playback.toggled.connect(self._on_fast_playback)
         self.fast_draft = QCheckBox("Fast draft in preview")
-        self.fast_draft.setChecked(False)
-        self.fast_draft.setToolTip(
-            "Preview and playback skip GFPGAN and BiSeNet. Object mask stays on. Swap uses the quality panel."
-        )
+        self.fast_draft.setChecked(True)
+        self.fast_draft.setToolTip("Preview skips the enhancer and uses a 128px swap so scrubbing stays quick.")
         self.loop = QCheckBox("Loop")
         self.loop.setChecked(True)
         flags.addWidget(self.fast_playback)
@@ -513,14 +572,16 @@ class MainWindow(QMainWindow):
 
         form.addWidget(QLabel("Quality preset"))
         self.quality_preset = QComboBox()
-        self.quality_preset.addItem("Quality", "quality")
+        self.quality_preset.addItem("Laptop (fast)", "laptop")
         self.quality_preset.addItem("Balanced", "balanced")
+        self.quality_preset.addItem("Quality", "quality")
         self.quality_preset.addItem("Fast", "fast")
         self.quality_preset.currentIndexChanged.connect(self._on_quality_preset)
         form.addWidget(self.quality_preset)
 
         self.enhance = QCheckBox("Restore faces")
-        self.enhance.setChecked(codeformer_install_tip() is None or gfpgan_install_tip() is None)
+        self.enhance.setChecked(False)
+        self.enhance.setToolTip("Off by default so an 8 GB laptop stays responsive. Turn it on in Advanced.")
         install_tip = gfpgan_install_tip()
         self.enhance.setToolTip(
             install_tip
@@ -529,8 +590,8 @@ class MainWindow(QMainWindow):
         self.enhance.toggled.connect(self._on_enhance_toggled)
         form.addWidget(self.enhance)
         self.restorer = QComboBox()
-        self.restorer.addItem("CodeFormer", "codeformer")
         self.restorer.addItem("GFPGAN", "gfpgan")
+        self.restorer.addItem("CodeFormer", "codeformer")
         self.restorer.setToolTip(
             "CodeFormer downloads codeformer.pth on first use. "
             "Fidelity 0 restores harder. Fidelity 1 stays closer to the swap."
@@ -538,8 +599,43 @@ class MainWindow(QMainWindow):
         form.addWidget(self.restorer)
         form.addWidget(self._percent_row("Restore blend", "restore_slider", 65))
         form.addWidget(self._percent_row("CodeFormer fidelity", "fidelity_slider", 50))
-        form.addWidget(self._percent_row("Sharpen", "sharpen_slider", 18))
+        form.addWidget(self._percent_row("Sharpen", "sharpen_slider", 8))
         form.addWidget(self._percent_row("Color match", "color_slider", 60))
+        self.keep_mouth = QCheckBox("Keep original mouth")
+        self.keep_mouth.setChecked(False)
+        self.keep_mouth.setToolTip("Leaves the teeth and mouth from the video, which looks better when someone is talking.")
+        form.addWidget(self.keep_mouth)
+        form.addWidget(self._percent_row("Mask blur", "mask_blur_slider", 8))
+        self.mask_pad = QSpinBox()
+        self.mask_pad.setRange(-20, 40)
+        self.mask_pad.setValue(0)
+        self.mask_pad.setPrefix("Pad ")
+        self.mask_pad.setToolTip("Grow or shrink the face mask. Positive covers more beard. Negative tightens it.")
+        form.addWidget(self.mask_pad)
+        self.enhance_every = QSpinBox()
+        self.enhance_every.setRange(1, 12)
+        self.enhance_every.setValue(3)
+        self.enhance_every.setPrefix("Enhance every ")
+        self.enhance_every.setSuffix(" frames")
+        self.enhance_every.setToolTip("Reuse the enhancer between these frames. 1 runs it every frame.")
+        form.addWidget(self.enhance_every)
+        self.output_height = QComboBox()
+        self.output_height.addItem("Original size", 0)
+        self.output_height.addItem("1080p", 1080)
+        self.output_height.addItem("720p", 720)
+        self.output_height.setToolTip("Original keeps the video's width, height, frame rate, and length.")
+        form.addWidget(self.output_height)
+        self.trim_start = QDoubleSpinBox()
+        self.trim_end = QDoubleSpinBox()
+        for spin in (self.trim_start, self.trim_end):
+            spin.setRange(0, 300)
+            spin.setDecimals(1)
+            spin.setSuffix(" s")
+        self.trim_start.setPrefix("Start ")
+        self.trim_end.setPrefix("End ")
+        self.trim_end.setToolTip("0 means the end of the video. The export keeps the original frame rate.")
+        form.addWidget(self.trim_start)
+        form.addWidget(self.trim_end)
 
         self.object_mask = QCheckBox("AI face mask + object preservation")
         self.object_mask.setChecked(True)
@@ -548,7 +644,7 @@ class MainWindow(QMainWindow):
             "XSeg downloads into models/xseg.onnx on the first swap."
         )
         self.precise_edges = QCheckBox("Precise edges (BiSeNet + XSeg)")
-        self.precise_edges.setChecked(True)
+        self.precise_edges.setChecked(False)
         self.precise_edges.setToolTip(
             "On for a final render. Fast draft preview skips BiSeNet and keeps the object mask. "
             "The jaw and beard edge is feathered."
@@ -602,7 +698,7 @@ class MainWindow(QMainWindow):
         self.pixel_boost.addItem("128 — fast", 128)
         self.pixel_boost.addItem("256 — 8 GB default", 256)
         self.pixel_boost.addItem("512 — sharpest", 512)
-        self.pixel_boost.setCurrentIndex(2)
+        self.pixel_boost.setCurrentIndex(0)
         self.pixel_boost.setToolTip(
             "InSwapper is 128px. 256 and 512 split the aligned face into 128 tiles, "
             "swap each one, and stitch them. Fast draft preview stays at 128."
@@ -670,7 +766,8 @@ class MainWindow(QMainWindow):
         min_row.addWidget(self.min_face)
         form.addLayout(min_row)
         self.detect_every = QCheckBox("Detect every 2nd frame")
-        self.detect_every.setChecked(False)
+        self.detect_every.setChecked(True)
+        self.detect_every.setToolTip("Tracks the face between detections so the swap does not flicker, and the export stays faster.")
         self.detect_every.setToolTip("Full export detects every other frame. Preview always detects the one frame.")
         form.addWidget(self.detect_every)
         form.addWidget(QLabel("Export speed"))
@@ -839,23 +936,52 @@ class MainWindow(QMainWindow):
         return self.time_slider.value() / 10.0
 
     def _pick_video(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(self, "Target video", "", _VIDEO_FILTER)
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Target video or photo", "", _VIDEO_FILTER + ";;" + _IMAGE_FILTER
+        )
         if not path:
             return
-        video = Path(path)
-        if video.suffix.lower() not in VIDEO_SUFFIXES:
-            QMessageBox.warning(self, "Not a video", "Choose an mp4, mov, avi, mkv, webm, or m4v file.")
+        self._open_target(Path(path))
+
+    def _open_target(self, path: Path) -> None:
+        if path.suffix.lower() in IMAGE_SUFFIXES:
+            try:
+                self.load_still(path)
+            except Exception as exc:
+                QMessageBox.critical(self, "Could not open photo", str(exc))
+            return
+        if path.suffix.lower() not in VIDEO_SUFFIXES:
+            QMessageBox.warning(self, "Not a video", "Choose an mp4, mov, avi, mkv, webm, m4v, or a photo.")
             return
         try:
-            self.load_video(video)
+            self.load_video(path)
         except VideoTooLongError as exc:
             QMessageBox.critical(self, "Video is too long", str(exc))
+            return
         except VideoDurationUnknownError as exc:
             QMessageBox.critical(self, "Duration unknown", str(exc))
+            return
         except Exception as exc:
             QMessageBox.critical(self, "Could not open video", str(exc))
             return
         QTimer.singleShot(0, self._auto_detect)
+
+    def load_still(self, path: Path) -> VideoInfo:
+        """A photo target is a one-frame swap. Audio and frame rate do not apply."""
+        image = read_image(path)
+        height, width = image.shape[:2]
+        info = VideoInfo(width=width, height=height, fps=1.0, frame_count=1, has_audio=False, duration_s=1.0)
+        self._video = path
+        self._info = info
+        self.video_label.setText(f"{path.name} (photo)")
+        self.duration_label.setText(f"Photo  ·  {width}×{height}")
+        self.time_slider.setEnabled(False)
+        self.output_edit.setText(str(path.with_name(f"{path.stem}_videoswa.png")))
+        self._clear_faces()
+        self._paint_preview(image)
+        self._set_status(f"Loaded photo {path.name}.")
+        self._update_preview_button()
+        return info
 
     def load_video(self, video: Path) -> VideoInfo:
         """Probe a video and keep it only when it is within the 5-minute limit."""
@@ -895,9 +1021,10 @@ class MainWindow(QMainWindow):
             return
         self._showing_swap = False
         self.compare_slider.setEnabled(False)
-        self._preview_timer.start(120)
+        self._preview_timer.start(80)
         if not self._playing:
-            self._redetect_timer.start(450)
+            self._redetect_timer.start(350)
+            self._live_timer.start(160)
 
     def _paint_preview(self, frame) -> None:
         pix = bgr_to_qpixmap(frame, max_edge=960)
@@ -1130,7 +1257,7 @@ class MainWindow(QMainWindow):
         for path in paths:
             self._queue_source(Path(path), "identity")
 
-    def _queue_source(self, path: Path, role: str) -> None:
+    def _queue_source(self, path: Path, role: str, crop: Optional[tuple] = None) -> None:
         self._set_status(f"Checking {path.name} for a face…")
         self.worker.request_source(
             SourceCheckRequest(
@@ -1139,6 +1266,7 @@ class MainWindow(QMainWindow):
                 det_size=int(self.detector_size.value()),
                 det_thresh=self._det_thresh(),
                 role=role,
+                crop=crop,
             )
         )
 
@@ -1151,10 +1279,17 @@ class MainWindow(QMainWindow):
                 self._paint_preview(preview)
             except Exception:
                 preview = None
+            self._draw_box = preview is not None
+            self._manual_path = Path(path)
             QMessageBox.warning(
                 self,
                 "Source photo has no face",
-                message + ("\n\nThe photo is shown in the preview so you can see what was read." if preview is not None else ""),
+                message
+                + (
+                    "\n\nThe photo is in the preview. Drag a box around the face, then release the mouse."
+                    if preview is not None
+                    else ""
+                ),
             )
             return
         photo = Path(path)
@@ -1356,14 +1491,32 @@ class MainWindow(QMainWindow):
             pixel_boost=int(self.pixel_boost.currentData()),
             restorer=str(self.restorer.currentData()),
             codeformer_fidelity=self.fidelity_slider.value() / 100.0,
+            enhance_every=int(self.enhance_every.value()) if self.enhance.isChecked() else 1,
+            keep_mouth=self.keep_mouth.isChecked(),
+            mask_blur=int(self.mask_blur_slider.value()),
+            mask_padding=int(self.mask_pad.value()),
+            start_s=float(self.trim_start.value()),
+            end_s=float(self.trim_end.value()),
+            output_height=int(self.output_height.currentData() or 0),
         )
 
-    def _preview_swap(self) -> None:
+    def _live_preview(self) -> None:
+        """Scrub shows a half-resolution swap without waiting on the enhancer."""
+        if self._busy or not self._preview_inputs_ready():
+            return
+        self._preview_swap(live=True)
+
+    def _preview_swap(self, live: bool = False) -> None:
         if self._busy:
             return
         request = self._compose_request(Path("preview-only.mp4"))
         if request is None:
             return
+        if live:
+            request.scale = min(float(request.scale), 0.5)
+            request.fast_draft_preview = True
+            request.enhance = False
+            request.pixel_boost = 128
         try:
             validate_request(request)
         except VideoTooLongError as exc:
@@ -1746,6 +1899,7 @@ class MainWindow(QMainWindow):
         self.progress.setRange(0, 100)
         self.progress.setValue(0)
         self.progress.setFormat("Starting…")
+        self._progress_started = 0.0
         self.worker.request_swap(request)
 
     def _cancel(self) -> None:
@@ -1758,9 +1912,15 @@ class MainWindow(QMainWindow):
             self.progress.setRange(0, 0)
             self.progress.setFormat(f"Frame {done}")
             return
+        now = time.perf_counter()
+        if done <= 1 or self._progress_started <= 0:
+            self._progress_started = now
+        elapsed = max(0.001, now - self._progress_started)
+        fps = done / elapsed
+        remain = max(0.0, (total - done) / fps) if fps else 0.0
         self.progress.setRange(0, total)
         self.progress.setValue(done)
-        self.progress.setFormat(f"%v / %m frames")
+        self.progress.setFormat(f"{done}/{total}   {fps:.1f} fps   ~{remain:.0f}s left")
 
     def _on_swap_finished(self, path: str, summary: str) -> None:
         self.progress.setRange(0, 100)
@@ -1799,7 +1959,86 @@ class MainWindow(QMainWindow):
         self.execution.setEnabled(not busy)
         self._update_preview_button()
 
+    def _open_output(self) -> None:
+        folder = Path(self.output_edit.text().strip() or ".").expanduser().parent
+        folder.mkdir(parents=True, exist_ok=True)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
+
+    def dragEnterEvent(self, event) -> None:  # noqa: N802 - Qt API
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+
+    def dropEvent(self, event) -> None:  # noqa: N802 - Qt API
+        paths = []
+        for url in event.mimeData().urls():
+            if url.isLocalFile():
+                paths.append(Path(url.toLocalFile()))
+        self._accept_paths(paths)
+
+    def _accept_paths(self, paths: list[Path]) -> None:
+        photos = [path for path in paths if path.suffix.lower() in IMAGE_SUFFIXES]
+        videos = [path for path in paths if path.suffix.lower() in VIDEO_SUFFIXES]
+        for photo in photos:
+            self._queue_source(photo, "library")
+        if not videos:
+            return
+        self._batch = videos[1:]
+        self.batch_label.setText(f"{len(videos)} videos queued" if len(videos) > 1 else "")
+        self._open_target(videos[0])
+
+    def eventFilter(self, obj, event) -> bool:  # noqa: N802 - Qt API
+        if obj is getattr(self, "preview", None) and self._draw_box and self._preview_bgr is not None:
+            kind = event.type()
+            if kind == QEvent.Type.MouseButtonPress:
+                self._draw_origin = event.position().toPoint()
+                return True
+            if kind == QEvent.Type.MouseButtonRelease and self._draw_origin is not None:
+                end = event.position().toPoint()
+                self._finish_box(self._draw_origin, end)
+                self._draw_origin = None
+                return True
+        return super().eventFilter(obj, event)
+
+    def _finish_box(self, start, end) -> None:
+        image = self._preview_bgr
+        if image is None or not hasattr(self, "_manual_path"):
+            self._draw_box = False
+            return
+        height, width = image.shape[:2]
+        pix = self.preview.pixmap()
+        if pix is None or pix.width() < 2 or pix.height() < 2:
+            return
+        ox = max(0, (self.preview.width() - pix.width()) // 2)
+        oy = max(0, (self.preview.height() - pix.height()) // 2)
+
+        def _to_image(point) -> tuple[int, int]:
+            x = int((point.x() - ox) / pix.width() * width)
+            y = int((point.y() - oy) / pix.height() * height)
+            return max(0, min(width - 1, x)), max(0, min(height - 1, y))
+
+        x1, y1 = _to_image(start)
+        x2, y2 = _to_image(end)
+        box = (min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2))
+        if box[2] - box[0] < 12 or box[3] - box[1] < 12:
+            self._set_status("Draw a larger box around the face.")
+            return
+        self._draw_box = False
+        self._manual_crop = box
+        self._set_status("Looking again inside the box you drew.")
+        self._queue_source(self._manual_path, "library", crop=box)
+
+    def _save_last_settings(self) -> None:
+        if os.environ.get("QT_QPA_PLATFORM") == "offscreen":
+            return
+        try:
+            path = Path.home() / ".videoswa" / "last_settings.json"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(self._project_payload().get("settings") or {}), indent=2)
+        except Exception:
+            return
+
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt API
+        self._save_last_settings()
         logger.removeHandler(self._log_handler)
         self.worker.request_cancel()
         self.worker.shutdown()
@@ -1818,6 +2057,7 @@ def main() -> int:
     if problems and os.environ.get("QT_QPA_PLATFORM") != "offscreen":
         QMessageBox.critical(window, "Videoswa cannot detect faces", environment_message(problems))
     window.show()
+    window.worker.request_warmup(str(window.execution.currentData() or "auto"))
     return app.exec()
 
 

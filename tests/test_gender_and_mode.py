@@ -192,6 +192,7 @@ def test_window_defaults_to_single_face_and_labels_gender(tmp_path: Path) -> Non
         assert window.face_mode.currentData() == FACE_MODE_SINGLE
         assert window.face_mode.currentText() == "Single face"
         assert window.apply_all.isChecked() is False
+        window.advanced_toggle.setChecked(True)
         assert window.apply_all.isVisible()
         assert window.coverage.currentData() == "full"
         window._on_detected(

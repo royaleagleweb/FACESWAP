@@ -71,6 +71,14 @@ class SwapRequest:
     pixel_boost: int = 128
     restorer: str = "gfpgan"
     codeformer_fidelity: float = 0.5
+    enhance_every: int = 1
+    keep_mouth: bool = False
+    mask_blur: int = 0
+    mask_padding: int = 0
+    start_s: float = 0.0
+    end_s: float = 0.0
+    output_height: int = 0
+    source_crop: Optional[tuple] = None
 
 
 MAX_IDENTITY_PHOTOS = 5
@@ -195,14 +203,19 @@ def validate_request(request: SwapRequest) -> None:
     video = Path(request.video_path)
     if not video.exists():
         raise ValueError(f"Video not found: {video}")
-    if video.suffix.lower() not in VIDEO_SUFFIXES:
-        raise ValueError("Choose a video file (mp4, mov, avi, mkv, webm, or m4v).")
+    still = video.suffix.lower() in IMAGE_SUFFIXES
+    if video.suffix.lower() not in VIDEO_SUFFIXES and not still:
+        raise ValueError("Choose a video (mp4, mov, avi, mkv, webm, m4v) or a photo (jpg, png, webp).")
 
     output = Path(request.output_path)
-    if output.suffix.lower() != ".mp4":
+    if still:
+        if output.suffix.lower() not in {".png", ".jpg", ".jpeg", ".webp"}:
+            raise ValueError("A photo swap saves a PNG or JPG.")
+    elif output.suffix.lower() != ".mp4":
         raise ValueError("The output file must be an .mp4.")
 
-    assert_duration_allowed(video, limit_s=MAX_VIDEO_SECONDS)
+    if not still:
+        assert_duration_allowed(video, limit_s=MAX_VIDEO_SECONDS)
 
     if request.face_mode == FACE_MODE_SINGLE:
         if request.single_source is None:

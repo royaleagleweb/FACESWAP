@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional, Sequence
@@ -301,6 +302,9 @@ def process_video(
     limit_s: Optional[float] = None,
     scale: float = 1.0,
     encoder: str = "auto",
+    start_s: float = 0.0,
+    end_s: float = 0.0,
+    output_height: int = 0,
 ) -> Path:
     """Apply face swaps frame-by-frame and re-mux original audio.
 
@@ -324,6 +328,13 @@ def process_video(
     expected = info.frame_count
     if expected <= 0 and info.fps > 0:
         expected = max(1, int(round(info.duration_s * info.fps)))
+    fps = info.fps if info.fps else 30.0
+    start_frame = max(0, int(round(float(start_s or 0.0) * fps)))
+    end_frame = expected
+    if end_s and float(end_s) > float(start_s or 0.0):
+        end_frame = min(expected, max(start_frame + 1, int(round(float(end_s) * fps))))
+    span = max(0, end_frame - start_frame)
+    out_w, out_h = _output_size(info.width, info.height, output_height)
     reset_tracks = getattr(engine, "reset_tracks", None)
     if callable(reset_tracks):
         reset_tracks()
@@ -336,7 +347,7 @@ def process_video(
     with tempfile.TemporaryDirectory(dir=TEMP_DIR) as tmpdir:
         tmp_video = Path(tmpdir) / "swapped_silent.mp4"
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        writer = cv2.VideoWriter(str(tmp_video), fourcc, info.fps, (info.width, info.height))
+        writer = cv2.VideoWriter(str(tmp_video), fourcc, info.fps, (out_w, out_h))
         if not writer.isOpened():
             cap.release()
             raise RuntimeError("Could not open video writer (mp4v)")
@@ -360,8 +371,11 @@ def process_video(
                 scale=scale,
                 cancel_event=cancel_event,
                 progress=progress,
-                expected=expected,
+                expected=span or expected,
                 bar=bar,
+                start_frame=start_frame,
+                end_frame=end_frame,
+                out_size=(out_w, out_h),
             )
         finally:
             cap.release()
@@ -375,7 +389,23 @@ def process_video(
 
         chosen = resolve_encoder(encoder)
         if keep_audio and info.has_audio and shutil.which("ffmpeg"):
-            _mux_audio(tmp_video, input_path, output_path, crf=crf, preset=preset, encoder=chosen)
+            _mux_audio(
+                tmp_video,
+                input_path,
+                output_path,
+                crf=crf,
+                preset=preset,
+                encoder=chosen,
+                copy_audio=start_frame == 0 and end_frame >= expected,
+                start_s=start_frame / fps,
+                duration_s=span / fps if span else None,
+            )
+        stages = getattr(getattr(engine, "stats", None), "stage_line", None)
+        if callable(stages):
+            logger.info("Stage times: %s", stages())
+        misses = getattr(getattr(engine, "stats", None), "miss_log", None)
+        if misses:
+            logger.info("Missed faces (%s): %s", getattr(engine.stats, "miss_total", len(misses)), "; ".join(misses[:12]))
         elif shutil.which("ffmpeg"):
             _reencode(tmp_video, output_path, crf=crf, preset=preset, encoder=chosen)
         else:
@@ -420,6 +450,18 @@ def _video_encode_args(encoder: str, crf: int, preset: str) -> list[str]:
     return ["-c:v", "libx264", "-crf", str(crf), "-preset", preset, "-pix_fmt", "yuv420p"]
 
 
+def _output_size(width: int, height: int, output_height: int) -> tuple[int, int]:
+    """Even width and height. 0 keeps the source resolution exactly."""
+    if output_height <= 0 or output_height >= height:
+        even_w = width - (width % 2)
+        even_h = height - (height % 2)
+        return max(2, even_w), max(2, even_h)
+    out_h = int(output_height) - (int(output_height) % 2)
+    out_w = int(round(width * (out_h / float(height))))
+    out_w -= out_w % 2
+    return max(2, out_w), max(2, out_h)
+
+
 def _pipeline_frames(
     cap,
     writer,
@@ -432,6 +474,9 @@ def _pipeline_frames(
     progress: Optional[Callable[[int, int], None]],
     expected: int,
     bar,
+    start_frame: int = 0,
+    end_frame: int = 0,
+    out_size: Optional[tuple[int, int]] = None,
 ) -> tuple[Optional[BaseException], bool]:
     """Overlap decode and encode around a single swap thread.
 
@@ -444,6 +489,9 @@ def _pipeline_frames(
     stop = threading.Event()
     errors: list[BaseException] = []
     cancelled = {"value": False}
+    clocks = {"decode": 0.0, "swap": 0.0, "encode": 0.0}
+    clock_lock = threading.Lock()
+    limit = end_frame if end_frame else 10**9
 
     def _put(target: queue.Queue, item) -> bool:
         while not stop.is_set():
@@ -462,8 +510,16 @@ def _pipeline_frames(
                     cancelled["value"] = True
                     stop.set()
                     break
+                started = time.perf_counter()
                 ok, frame = cap.read()
+                with clock_lock:
+                    clocks["decode"] += time.perf_counter() - started
                 if not ok:
+                    break
+                if index < start_frame:
+                    index += 1
+                    continue
+                if index >= limit:
                     break
                 time_s = (index / info.fps) if info.fps else 0.0
                 if not _put(decode_q, (index, time_s, frame)):
@@ -487,9 +543,16 @@ def _pipeline_frames(
                 if item is None:
                     break
                 index, time_s, frame = item
+                note = getattr(engine, "note_frame", None)
+                if callable(note):
+                    note(index)
+                started = time.perf_counter()
                 out = swap_frame(engine, frame, mappings, scale=scale, time_s=time_s)
-                if out.shape[1] != info.width or out.shape[0] != info.height:
-                    out = cv2.resize(out, (info.width, info.height))
+                with clock_lock:
+                    clocks["swap"] += time.perf_counter() - started
+                target = out_size or (info.width, info.height)
+                if out.shape[1] != target[0] or out.shape[0] != target[1]:
+                    out = cv2.resize(out, target)
                 if not _put(encode_q, (index, out)):
                     break
         except Exception as exc:
@@ -511,7 +574,10 @@ def _pipeline_frames(
                 if item is None:
                     break
                 _index, out = item
+                started = time.perf_counter()
                 writer.write(out)
+                with clock_lock:
+                    clocks["encode"] += time.perf_counter() - started
                 written += 1
                 bar.update(1)
                 if progress is not None:
@@ -542,6 +608,10 @@ def _pipeline_frames(
     except queue.Full:
         stop.set()
     workers[2].join()
+    stats = getattr(engine, "stats", None)
+    if stats is not None and hasattr(stats, "stage_ms"):
+        for name, seconds in clocks.items():
+            stats.stage_ms[name] = stats.stage_ms.get(name, 0.0) + seconds * 1000.0
     error = errors[0] if errors else None
     return error, bool(cancelled["value"] and error is None)
 
@@ -557,24 +627,44 @@ def _mux_audio(
     crf: int,
     preset: str,
     encoder: str = "libx264",
+    copy_audio: bool = True,
+    start_s: float = 0.0,
+    duration_s: Optional[float] = None,
 ) -> None:
-    def _cmd(enc: str) -> list[str]:
-        return [
+    def _cmd(enc: str, audio: str) -> list[str]:
+        cmd = [
             "ffmpeg", "-y", "-loglevel", "error",
-            "-i", str(silent_video), "-i", str(original),
-            "-map", "0:v:0", "-map", "1:a:0?",
-            *_video_encode_args(enc, crf, preset),
-            "-c:a", "aac", "-b:a", "192k", "-shortest",
-            str(dest),
+            "-i", str(silent_video),
         ]
+        if start_s > 0:
+            cmd.extend(["-ss", f"{start_s:.3f}"])
+        cmd.extend(["-i", str(original), "-map", "0:v:0", "-map", "1:a:0?"])
+        cmd.extend(_video_encode_args(enc, crf, preset))
+        if audio == "copy":
+            cmd.extend(["-c:a", "copy"])
+        else:
+            cmd.extend(["-c:a", "aac", "-b:a", "192k"])
+        if duration_s:
+            cmd.extend(["-t", f"{duration_s:.3f}"])
+        cmd.extend(["-shortest", str(dest)])
+        return cmd
 
+    audio = "copy" if copy_audio else "aac"
     try:
-        _run_ffmpeg(_cmd(encoder))
+        _run_ffmpeg(_cmd(encoder, audio))
     except subprocess.CalledProcessError:
+        if audio == "copy":
+            logger.warning("Could not copy the audio track. Re-encoding it to AAC.")
+            try:
+                _run_ffmpeg(_cmd(encoder, "aac"))
+                return
+            except subprocess.CalledProcessError:
+                if encoder == "libx264":
+                    raise
         if encoder == "libx264":
             raise
         logger.warning("Encoder %s failed. Falling back to libx264.", encoder)
-        _run_ffmpeg(_cmd("libx264"))
+        _run_ffmpeg(_cmd("libx264", "aac"))
 
 
 def _reencode(src: Path, dest: Path, crf: int, preset: str, encoder: str = "libx264") -> None:

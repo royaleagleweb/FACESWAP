@@ -5,6 +5,7 @@ Optionally enhances results with GFPGAN if installed.
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -51,6 +52,13 @@ class FaceSwapper:
         self._matrix_memory: dict[int, np.ndarray] = {}
         self.last_canvas = None
         self.last_matrix = None
+        self.stage_ms: dict[str, float] = {}
+        self.enhance_every = 1
+        self._enhance_tick = 0
+        self.keep_mouth = False
+        self.mask_blur = 0
+        self.mask_padding = 0
+        self._restore_cache = None
         self._color_key: Optional[int] = None
         self._occlusion = None
         self._load(use_gpu=use_gpu, execution=execution, enhance=enhance)
@@ -196,6 +204,7 @@ class FaceSwapper:
         """
         # InsightFace expects its own Face objects, but the swapper actually only
         # uses .kps and .normed_embedding. We pass a small shim.
+        self.stage_ms = {}
         src_shim = _FaceShim(source_face)
         tgt_shim = _FaceShim(target_face)
         # Profile landmarks collapse the far eye. Repair them before InSwapper
@@ -248,6 +257,7 @@ class FaceSwapper:
                 precise=precise,
                 yaw=yaw,
             )
+            alpha = self._shape_mask(alpha, align_kps)
             alpha = self._smooth_alpha(alpha)
             if alpha is None or float(np.max(alpha)) < 0.05:
                 self._mark_wiped(
@@ -292,6 +302,14 @@ class FaceSwapper:
             return canvas
         if face_span_px(target_face.bbox) < RESTORE_MIN_PX:
             return canvas
+        every = max(1, int(getattr(self, "enhance_every", 1) or 1))
+        self._enhance_tick += 1
+        if every > 1 and (self._enhance_tick % every) != 1:
+            cached = getattr(self, "_restore_cache", None)
+            if cached is not None and getattr(cached, "shape", None) == canvas.shape:
+                return cached
+            return canvas
+        started = time.perf_counter()
         import cv2
 
         from .codeformer import blend_restored
@@ -322,10 +340,43 @@ class FaceSwapper:
                 logger.debug("GFPGAN failed before paste: %s", exc)
                 restored = None
         if restored is None:
+            self._add_stage("enhance", started)
             return canvas
         if restored.shape[0] != side or restored.shape[1] != side:
             restored = cv2.resize(restored, (side, side), interpolation=cv2.INTER_CUBIC)
-        return blend_restored(canvas, restored, float(getattr(self, "restore_strength", 1.0)))
+        blended = blend_restored(canvas, restored, float(getattr(self, "restore_strength", 1.0)))
+        self._restore_cache = blended
+        self._add_stage("enhance", started)
+        return blended
+
+    def _add_stage(self, name: str, started: float) -> None:
+        self.stage_ms[name] = self.stage_ms.get(name, 0.0) + (time.perf_counter() - started) * 1000.0
+
+    def _shape_mask(self, alpha: Optional[np.ndarray], kps: np.ndarray) -> Optional[np.ndarray]:
+        """Blur, pad, or cut the mouth out of the paste mask. Defaults leave it unchanged."""
+        if alpha is None:
+            return None
+        import cv2
+
+        started = time.perf_counter()
+        out = np.asarray(alpha, dtype=np.float32)
+        pad = int(getattr(self, "mask_padding", 0) or 0)
+        if pad != 0:
+            size = abs(pad) * 2 + 1
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (size, size))
+            out = cv2.dilate(out, kernel) if pad > 0 else cv2.erode(out, kernel)
+        blur = int(getattr(self, "mask_blur", 0) or 0)
+        if blur > 0:
+            ksize = blur * 2 + 1
+            out = cv2.GaussianBlur(out, (ksize, ksize), 0)
+        if getattr(self, "keep_mouth", False):
+            pts = np.asarray(kps, dtype=np.float32).reshape(-1, 2)
+            if pts.shape[0] >= 5:
+                center = pts[3:5].mean(axis=0)
+                radius = max(4.0, float(np.linalg.norm(pts[4] - pts[3])) * 0.45)
+                cv2.circle(out, (int(round(center[0])), int(round(center[1]))), int(round(radius)), 0.0, -1)
+        self._add_stage("mask", started)
+        return out
 
     def _smooth_matrix(self, matrix: np.ndarray) -> np.ndarray:
         from .smooth import smooth_pair
