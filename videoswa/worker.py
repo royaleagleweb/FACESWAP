@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+import numpy as np
 from PySide6.QtCore import QThread, Signal
 
 from faceswap.core import FaceSwapEngine, SwapStats
@@ -135,6 +136,7 @@ class EngineWorker(QThread):
     preview_ready = Signal(object, object, str, bool)
     preview_failed = Signal(str)
     source_ready = Signal(str, bool, str, str)
+    source_choices = Signal(str, object)
     swap_progress = Signal(int, int)
     swap_finished = Signal(str, str)
     swap_failed = Signal(str)
@@ -207,11 +209,44 @@ class EngineWorker(QThread):
     def _warmup(self, execution: str) -> None:
         self.status.emit("Warming up GPU… models load once, and TensorRT engines stay cached.")
         try:
-            self._engine_for(execution or "auto", enhance=False)
+            engine = self._engine_for(execution or "auto", enhance=False)
+            self._warm_sessions(engine)
         except Exception as exc:
+            logger.exception("GPU warmup failed")
             self.status.emit(f"Models will load on the first swap. {exc}")
             return
-        self.status.emit("GPU is ready. Drop a face photo and a video, then press Swap.")
+        self.status.emit("GPU is ready. TensorRT engines are cached. Add a face photo and a video, then press Swap.")
+
+    def _warm_sessions(self, engine: FaceSwapEngine) -> None:
+        """One dummy forward so the first real frame does not compile an engine."""
+        model = getattr(engine.swapper, "swapper", None)
+        if model is not None and hasattr(model, "session"):
+            try:
+                image = np.zeros((1, 3, 128, 128), dtype=np.float32)
+                latent = np.zeros((1, 512), dtype=np.float32)
+                model.session.run(
+                    model.output_names,
+                    {model.input_names[0]: image, model.input_names[1]: latent},
+                )
+                logger.info("Warmed InSwapper (%s)", getattr(model, "input_shape", ""))
+            except Exception as exc:
+                logger.info("InSwapper warmup skipped: %s", exc)
+        try:
+            models = engine.swapper.occlusion_models()
+        except Exception as exc:
+            logger.info("Mask warmup skipped: %s", exc)
+            return
+        session = getattr(models, "xseg", None)
+        if session is None:
+            return
+        try:
+            from faceswap.occlusion import _model_input
+
+            blob = _model_input(session, np.zeros((64, 64, 3), dtype=np.uint8), imagenet=False)
+            session.run(None, {session.get_inputs()[0].name: blob})
+            logger.info("Warmed XSeg")
+        except Exception as exc:
+            logger.info("XSeg warmup skipped: %s", exc)
 
     def _engine_for(self, execution: str, enhance: bool) -> FaceSwapEngine:
         if self._engine is not None and self._engine_key == execution:
@@ -366,21 +401,44 @@ class EngineWorker(QThread):
                 False,
                 note
                 or (
-                    f"No face found in {path.name}. Videoswa checked EXIF rotation, "
-                    "transparent PNGs, and detector sizes 640, 320, and 1024. "
-                    "Use a clearer photo of one person (JPG, PNG, or HEIC)."
+                    f"No face found in {path.name}. Videoswa checked rotation and tried "
+                    "the current detector, then one padded retry. "
+                    "Drag a box around the face, or use a clearer photo."
                 ),
                 job.role,
             )
             return
         span = int(max(face.bbox[2] - face.bbox[0], face.bbox[3] - face.bbox[1]))
-        logger.info("source ready %s score=%.3f size=%dpx", path.name, float(face.det_score), span)
+        faces = list(getattr(engine.analyzer, "last_source_faces", []) or [])
+        logger.info("source ready %s score=%.3f size=%dpx faces=%d", path.name, float(face.det_score), span, len(faces))
+        self._emit_source_choices(str(path))
+        extra = ""
+        if len(faces) > 1:
+            extra = f" {len(faces)} faces in the photo. Using the strongest. Click a thumbnail to pick another."
         self.source_ready.emit(
             str(path),
             True,
-            f"Source ready: {path.name} (face score {face.det_score:.2f}, about {span}px)",
+            f"Source ready: {path.name} (face score {face.det_score:.2f}, about {span}px).{extra}",
             job.role,
         )
+
+    def _emit_source_choices(self, path: str) -> None:
+        engine = self._engine
+        if engine is None:
+            return
+        faces = list(getattr(engine.analyzer, "last_source_faces", []) or [])
+        image = getattr(engine.analyzer, "last_source_image", None)
+        payload = []
+        if image is not None:
+            for index, face in enumerate(faces):
+                span = int(max(face.bbox[2] - face.bbox[0], face.bbox[3] - face.bbox[1]))
+                payload.append({
+                    "index": index,
+                    "score": float(face.det_score),
+                    "span": span,
+                    "crop": crop_face(image, face),
+                })
+        self.source_choices.emit(path, payload)
 
     def _configure(self, engine: FaceSwapEngine, job: SwapRequest, *, preview: bool) -> None:
         enhance, precise, object_mask = resolve_quality(

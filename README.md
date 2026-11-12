@@ -33,7 +33,9 @@ python -m videoswa --selftest face.jpg clip.mp4
 ```
 
 It detects the photo, swaps about 30 frames, and writes `preview.png` plus
-`selftest.mp4` next to the log. The last line is `PASS` or `FAIL`.
+`selftest.mp4` next to the log. The timings line splits the swap into
+`inswapper`, `xseg`, `enhance`, and `blend` milliseconds per frame. The last
+line is `PASS` or `FAIL`.
 
 A new clip, in order:
 

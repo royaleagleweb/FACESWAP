@@ -85,6 +85,36 @@ def test_pixel_boost_tile_counts_and_reassembly() -> None:
     assert int(canvas[0, 0, 0]) == 7
 
 
+def test_source_rank_prefers_the_clearer_face() -> None:
+    from faceswap.face_analyzer import Face, choose_source_face
+
+    larger = Face(
+        bbox=np.array([0, 0, 136, 136], dtype=np.float32),
+        kps=np.zeros((5, 2), dtype=np.float32),
+        embedding=np.ones(4, dtype=np.float32),
+        det_score=0.734,
+    )
+    clearer = Face(
+        bbox=np.array([0, 0, 124, 124], dtype=np.float32),
+        kps=np.zeros((5, 2), dtype=np.float32),
+        embedding=np.ones(4, dtype=np.float32),
+        det_score=0.865,
+    )
+    assert choose_source_face([larger, clearer], None) is clearer
+    assert choose_source_face([larger, clearer], 0) is larger
+
+
+def test_paste_rejects_a_degenerate_matrix() -> None:
+    from faceswap.coverage import paste_swapped_face
+
+    frame = np.full((80, 80, 3), 20, dtype=np.uint8)
+    swapped = np.full((128, 128, 3), 255, dtype=np.uint8)
+    kps = np.zeros((5, 2), dtype=np.float32)
+    bad = np.array([[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]], dtype=np.float64)
+    out = paste_swapped_face(frame, swapped, bad, kps, "full")
+    assert np.array_equal(out, frame)
+
+
 def test_laptop_preset_is_the_fast_default() -> None:
     laptop = quality_preset("laptop")
     assert laptop["pixel_boost"] == 128
@@ -106,7 +136,7 @@ def test_quality_presets_cover_fast_balanced_and_quality() -> None:
     assert balanced["pixel_boost"] == 256
     assert balanced["precise_edges"] is True
     assert balanced["fast_draft_preview"] is True
-    assert balanced["detect_every_other"] is True
+    assert balanced["detect_every_other"] is False
     assert quality["pixel_boost"] == 512
     assert quality["precise_edges"] is True
     assert quality["fast_draft_preview"] is False

@@ -83,10 +83,10 @@ class SwapStats:
     def stage_line(self) -> str:
         if not self.stage_ms:
             return "no stage timings"
-        parts = [f"{name} {ms:.0f}ms" for name, ms in self.stage_ms.items()]
         frames = max(1, int(self.frames))
-        total = sum(self.stage_ms.values())
-        parts.append(f"about {total / frames:.1f}ms/frame")
+        parts = [f"{name} {ms / frames:.1f}ms/frame" for name, ms in self.stage_ms.items()]
+        outer = sum(self.stage_ms.get(name, 0.0) for name in ("detect", "swap", "decode", "encode"))
+        parts.append(f"pipeline {outer / frames:.1f}ms/frame")
         return " · ".join(parts)
 
     @property
@@ -473,11 +473,18 @@ class FaceSwapEngine:
             track.last_matrix = np.asarray(matrix, dtype=np.float64).reshape(2, 3).copy()
 
     def _paste_held(self, frame: np.ndarray, track: _FaceTrack, face: Face) -> Optional[np.ndarray]:
+        """Replay the last swapped crop with a matrix rebuilt from the current landmarks.
+
+        The stored matrix belongs to the frame it was computed on. Reusing it
+        paints a triangle of the crop onto the body.
+        """
         if track.last_canvas is None or track.kps_smooth is None:
             return None
-        matrix = track.last_matrix
+        from .pixel_boost import frame_to_crop_matrix
+
+        matrix = frame_to_crop_matrix(track.kps_smooth, int(track.last_canvas.shape[0]))
         if matrix is None:
-            matrix = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float64)
+            return None
         try:
             return paste_swapped_face(
                 frame,
@@ -490,18 +497,12 @@ class FaceSwapEngine:
             return None
 
     def _replay_tracks(self, frame: np.ndarray) -> Optional[np.ndarray]:
-        """Keep the last good face in place when detection misses for a frame or two."""
+        """Keep the last good face where it was. Do not walk it with stale velocity."""
         out = frame
         used = False
         for track in self._tracks:
             if track.last_canvas is None or track.kps_smooth is None:
                 continue
-            if track.velocity is not None:
-                track.kps_smooth = track.kps_smooth + track.velocity
-                shift = track.velocity.mean(axis=0)
-                track.bbox = np.asarray(track.bbox, dtype=np.float32).copy()
-                track.bbox[0::2] += float(shift[0])
-                track.bbox[1::2] += float(shift[1])
             face = Face(
                 bbox=np.asarray(track.bbox, dtype=np.float32),
                 kps=np.asarray(track.kps_smooth, dtype=np.float32),

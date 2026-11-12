@@ -225,6 +225,8 @@ class MainWindow(QMainWindow):
         self.worker.detect_ready.connect(self._on_detected)
         self.worker.detect_failed.connect(self._on_detect_failed)
         self.worker.source_ready.connect(self._on_source_ready)
+        self.worker.source_choices.connect(self._show_source_faces)
+        self._source_face_index: dict[str, int] = {}
         self.worker.preview_ready.connect(self._on_preview_ready)
         self.worker.preview_failed.connect(self._on_preview_failed)
         self.worker.swap_progress.connect(self._on_progress)
@@ -353,8 +355,13 @@ class MainWindow(QMainWindow):
         self.source_list = QListWidget()
         self.source_list.setMinimumHeight(180)
         self.source_list.setIconSize(QSize(56, 56))
+        self.pick_host = QWidget()
+        self.pick_layout = QHBoxLayout(self.pick_host)
+        self.pick_layout.setContentsMargins(0, 0, 0, 0)
+        self.pick_host.setVisible(False)
         self.source_list.currentRowChanged.connect(lambda _row: self._on_source_row())
         form.addWidget(self.source_list)
+        form.addWidget(self.pick_host)
         add_row = QHBoxLayout()
         self.single_btn = QPushButton("Drop face photos")
         self.single_btn.setToolTip("JPG, PNG, or HEIC. Drop several photos of the same person to average them.")
@@ -764,7 +771,7 @@ class MainWindow(QMainWindow):
         min_row.addWidget(self.min_face)
         form.addLayout(min_row)
         self.detect_every = QCheckBox("Detect every 2nd frame")
-        self.detect_every.setChecked(True)
+        self.detect_every.setChecked(False)
         self.detect_every.setToolTip("Tracks the face between detections so the swap does not flicker, and the export stays faster.")
         self.detect_every.setToolTip("Full export detects every other frame. Preview always detects the one frame.")
         form.addWidget(self.detect_every)
@@ -1268,6 +1275,39 @@ class MainWindow(QMainWindow):
             )
         )
 
+    def _show_source_faces(self, path: str, payload: object) -> None:
+        while self.pick_layout.count():
+            item = self.pick_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        faces = list(payload or [])
+        if len(faces) < 2:
+            self.pick_host.setVisible(False)
+            return
+        best = max(faces, key=lambda item: item["span"] * max(item["score"], 0.05))
+        self._source_face_index[path] = int(best["index"])
+        self.pick_host.setVisible(True)
+        self._set_status(
+            f"{len(faces)} faces in this photo. Using the strongest "
+            f"(score {best['score']:.2f}, about {best['span']}px). Click a thumbnail to choose another."
+        )
+        for item in faces:
+            button = QPushButton()
+            button.setIcon(QIcon(bgr_to_qpixmap(item["crop"], max_edge=96)))
+            button.setIconSize(QSize(72, 72))
+            button.setToolTip(f"Score {item['score']:.2f}, about {item['span']}px")
+            if item["index"] == best["index"]:
+                button.setStyleSheet("border: 2px solid #2f6fed;")
+            button.clicked.connect(
+                lambda _checked=False, index=item["index"], photo=path: self._pick_source_face(photo, index)
+            )
+            self.pick_layout.addWidget(button)
+
+    def _pick_source_face(self, path: str, index: int) -> None:
+        self._source_face_index[path] = int(index)
+        self._set_status(f"Using face {index + 1} from this photo.")
+
     def _on_source_ready(self, path: str, ok: bool, message: str, role: str) -> None:
         if not ok:
             self._set_status(message)
@@ -1482,6 +1522,7 @@ class MainWindow(QMainWindow):
             rotation_paths=list(self._rotation_paths) if self.rotation_enabled.isChecked() else [],
             identity_paths=list(self._identity_paths.get(str(single), [])) if single else [],
             source_gender=self._source_genders.get(str(single)) if single else None,
+            source_face_index=self._source_face_index.get(str(single)) if single else None,
             match_gender=self.match_gender.isChecked(),
             det_size=int(self.detector_size.value()),
             det_thresh=self._det_thresh(),
@@ -1824,7 +1865,7 @@ class MainWindow(QMainWindow):
         self.object_mask.setChecked(bool(settings.get("object_mask", True)))
         self.precise_edges.setChecked(bool(settings.get("precise_edges", True)))
         self.fast_draft.setChecked(bool(settings.get("fast_draft_preview", True)))
-        self.detect_every.setChecked(bool(settings.get("detect_every_other", True)))
+        self.detect_every.setChecked(bool(settings.get("detect_every_other", False)))
         self.apply_all.setChecked(bool(settings.get("apply_all", False)))
         self.keep_audio.setChecked(bool(settings.get("keep_audio", True)))
         if hasattr(self, "match_gender"):

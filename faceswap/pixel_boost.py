@@ -91,6 +91,62 @@ def aligned_crop(frame: np.ndarray, kps: np.ndarray, size: int) -> tuple[np.ndar
     return crop, np.asarray(matrix, dtype=np.float64)
 
 
+def source_latent(model, source_face) -> np.ndarray:
+    """InSwapper identity: normed embedding, then the model's emap, then renorm."""
+    latent = np.asarray(source_face.normed_embedding, dtype=np.float32).reshape(1, -1)
+    emap = getattr(model, "emap", None)
+    if emap is not None:
+        latent = np.dot(latent, np.asarray(emap, dtype=np.float32))
+    norm = float(np.linalg.norm(latent)) + 1e-8
+    return (latent / norm).astype(np.float32)
+
+
+def forward_bgr_tiles(model, tiles: list[np.ndarray], latent: np.ndarray) -> list[np.ndarray]:
+    """Run InSwapper on 128px BGR tiles. One batched call when the engine allows it.
+
+    Tiles are already aligned. This does not warp them again.
+    """
+    session = model.session
+    blobs = [
+        cv2.dnn.blobFromImage(
+            tile,
+            1.0 / float(getattr(model, "input_std", 255.0)),
+            (MODEL_SIZE, MODEL_SIZE),
+            (
+                float(getattr(model, "input_mean", 0.0)),
+                float(getattr(model, "input_mean", 0.0)),
+                float(getattr(model, "input_mean", 0.0)),
+            ),
+            swapRB=True,
+        )
+        for tile in tiles
+    ]
+    batch = np.concatenate(blobs, axis=0)
+    repeated = np.repeat(latent, batch.shape[0], axis=0)
+    names = model.output_names
+    feeds_image = model.input_names[0]
+    feeds_id = model.input_names[1]
+    pred = None
+    if batch.shape[0] > 1 and getattr(model, "_videoswa_batch_ok", True):
+        try:
+            pred = session.run(names, {feeds_image: batch, feeds_id: repeated})[0]
+            model._videoswa_batch_ok = True
+        except Exception:
+            model._videoswa_batch_ok = False
+            pred = None
+    if pred is None:
+        parts = []
+        for blob in blobs:
+            parts.append(session.run(names, {feeds_image: blob, feeds_id: latent})[0])
+        pred = np.concatenate(parts, axis=0)
+    images = []
+    for index in range(pred.shape[0]):
+        rgb = pred[index].transpose(1, 2, 0)
+        bgr = np.clip(255.0 * rgb, 0, 255).astype(np.uint8)[:, :, ::-1]
+        images.append(np.ascontiguousarray(bgr))
+    return images
+
+
 def run_pixel_boost(
     frame: np.ndarray,
     kps: np.ndarray,

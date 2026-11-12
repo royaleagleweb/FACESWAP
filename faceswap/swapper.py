@@ -215,40 +215,46 @@ class FaceSwapper:
         tgt_shim.kps = align_kps
         # paste_back=False returns the 128px swap plus the frame→crop matrix.
         # Videoswa composites that itself so the beard is not cropped off.
-        from .pixel_boost import normalize_pixel_boost, run_pixel_boost
+        from .pixel_boost import (
+            aligned_crop,
+            forward_bgr_tiles,
+            join_tiles,
+            normalize_pixel_boost,
+            source_latent,
+            split_tiles,
+        )
 
         boost = normalize_pixel_boost(getattr(self, "pixel_boost", 128))
-        if boost <= 128:
-            swapped, matrix = run_with_cuda_fallback(
-                getattr(self, "cuda_guard", None),
-                lambda: self.swapper.get(frame, tgt_shim, src_shim, paste_back=False),
-            )
-        else:
-            def _swap_tile(tile: np.ndarray, _src=_FaceShim(source_face)) -> np.ndarray:
-                tile_face = _FaceShim(target_face)
-                tile_face.kps = np.asarray(template_128(), dtype=np.float32)
-                out, _matrix = run_with_cuda_fallback(
-                    getattr(self, "cuda_guard", None),
-                    lambda: self.swapper.get(tile, tile_face, _src, paste_back=False),
-                )
-                return out
+        infer_started = time.perf_counter()
+        latent = source_latent(self.swapper, source_face)
 
-            swapped, matrix = run_pixel_boost(frame, align_kps, boost, _swap_tile)
+        def _swap_tile_batch(tiles: list[np.ndarray]) -> list[np.ndarray]:
+            return forward_bgr_tiles(self.swapper, tiles, latent)
+
+        crop, matrix = aligned_crop(frame, align_kps, boost)
+        tiles = [crop] if boost <= 128 else split_tiles(crop)
+        outputs = _swap_tile_batch(tiles)
+        swapped = outputs[0] if boost <= 128 else join_tiles(outputs, boost)
+        self._add_stage("inswapper", infer_started)
         swapped = self._restore_before_paste(swapped, target_face)
         if not paste_back:
             return swapped
         self.paste_wiped = False
         self.last_paste_note = ""
-        matrix = self._smooth_matrix(matrix)
         mode = normalize_coverage(coverage)
         alpha = None
         if self.object_mask:
             models = self.occlusion_models()
             face_alpha = coverage_alpha(frame.shape[:2], align_kps, mode, yaw=yaw)
+            xseg_started = time.perf_counter()
             neural = models.xseg_keepout(frame, matrix, face_alpha) if models.xseg is not None else None
+            if models.xseg is not None:
+                self._add_stage("xseg", xseg_started)
             precise = None
             if self.precise_edges and models.bisenet is not None:
+                precise_started = time.perf_counter()
                 precise = models.bisenet_keep(frame, matrix, face_alpha)
+                self._add_stage("bisenet", precise_started)
             alpha = _occ_mask(
                 frame,
                 align_kps,
@@ -268,6 +274,7 @@ class FaceSwapper:
                 return frame
         previous = self.color_memory.get(self._color_key) if self._color_key is not None else None
         color_state: dict = {}
+        blend_started = time.perf_counter()
         out = paste_swapped_face(
             frame,
             swapped,
@@ -280,6 +287,7 @@ class FaceSwapper:
             color_state=color_state,
             color_match=getattr(self, "color_match", None),
         )
+        self._add_stage("blend", blend_started)
         if self._color_key is not None and "delta" in color_state:
             self.color_memory[self._color_key] = color_state["delta"]
         amount = float(getattr(self, "sharpen", 0.0) or 0.0)
@@ -316,8 +324,8 @@ class FaceSwapper:
 
         side = int(canvas.shape[0])
         view = canvas
-        if side < 512:
-            view = cv2.resize(canvas, (512, 512), interpolation=cv2.INTER_CUBIC)
+        if side < 256:
+            view = cv2.resize(canvas, (256, 256), interpolation=cv2.INTER_CUBIC)
         restored = None
         if getattr(self, "restorer", "gfpgan") == "codeformer" and self._codeformer is not None:
             from .codeformer import restore_bgr
@@ -445,8 +453,19 @@ def _try_load_gfpgan(use_gpu: bool):
         return None
     try:
         weight_path = _ensure_gfpgan_weights()
-        device = "cuda" if use_gpu else "cpu"
-        return GFPGANer(
+        try:
+            import torch
+
+            cuda = bool(use_gpu and torch.cuda.is_available())
+        except Exception:
+            cuda = False
+        device = "cuda" if cuda else "cpu"
+        logger.info(
+            "GFPGAN device=%s cuda_available=%s (torch must stay on cuda; a CPU restorer costs hundreds of ms per frame)",
+            device,
+            cuda,
+        )
+        enhancer = GFPGANer(
             model_path=str(weight_path),
             upscale=1,
             arch="clean",
@@ -454,9 +473,21 @@ def _try_load_gfpgan(use_gpu: bool):
             bg_upsampler=None,
             device=device,
         )
+        logger.info("GFPGAN parameters are on %s", _gfpgan_device(enhancer))
+        return enhancer
     except Exception as exc:
         logger.warning("Failed to initialize GFPGAN: %s", exc)
         return None
+
+
+def _gfpgan_device(enhancer) -> str:
+    try:
+        model = getattr(enhancer, "gfpgan", None)
+        if model is None:
+            return "unknown"
+        return str(next(model.parameters()).device)
+    except Exception:
+        return "unknown"
 
 
 def _ensure_gfpgan_weights() -> Path:

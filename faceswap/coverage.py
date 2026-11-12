@@ -134,7 +134,8 @@ def coverage_polygon(
             _pt(eye_c, down_u, side_u, 0.55 * em, -cheek),
             _pt(mouth_c, down_u, side_u, 0.20 * em, -jaw),
             _pt(mouth_c, down_u, side_u, 0.55 * depth, -beard_w),
-            _pt(mouth_c, down_u, side_u, depth, 0.0),
+            _pt(mouth_c, down_u, side_u, 0.96 * depth, -0.42 * beard_w),
+            _pt(mouth_c, down_u, side_u, 0.96 * depth, 0.42 * beard_w),
             _pt(mouth_c, down_u, side_u, 0.55 * depth, beard_w),
             _pt(mouth_c, down_u, side_u, 0.20 * em, jaw),
             _pt(eye_c, down_u, side_u, 0.55 * em, cheek),
@@ -241,7 +242,10 @@ def paste_swapped_face(
     mode = normalize_coverage(coverage)
     if swapped_bgr is None or swapped_bgr.size == 0 or matrix is None:
         return frame_bgr
-    matrix = orient_paste_matrix(matrix, kps, size=int(swapped_bgr.shape[0]))
+    size = int(swapped_bgr.shape[0])
+    matrix = orient_paste_matrix(matrix, kps, size=size)
+    if not _paste_matrix_ok(matrix, kps, size):
+        return frame_bgr
     if alpha is None:
         alpha = coverage_alpha(frame_bgr.shape[:2], kps, mode, yaw=yaw)
     if float(alpha.max()) <= 0.0:
@@ -318,6 +322,20 @@ def match_edge_color(
     strength = np.clip((1.0 - alpha) * gain, 0.0, 1.0).astype(np.float32)[..., None]
     shifted = warped.astype(np.float32) + delta.astype(np.float32) * strength
     return np.clip(shifted, 0.0, 255.0)
+
+
+def _paste_matrix_ok(matrix: np.ndarray, kps: np.ndarray, size: int) -> bool:
+    """Refuse a collapsed or sheared warp. That paints a triangle off the face."""
+    del kps, size
+    linear = np.asarray(matrix, dtype=np.float64).reshape(2, 3)[:, :2]
+    if not np.isfinite(linear).all():
+        return False
+    singular = np.linalg.svd(linear, compute_uv=False)
+    if not np.isfinite(singular).all() or float(singular.min()) < 1e-3:
+        return False
+    if float(singular.max()) > float(singular.min()) * 6.0:
+        return False
+    return True
 
 
 def orient_paste_matrix(matrix: np.ndarray, kps: np.ndarray, size: int = 128) -> np.ndarray:

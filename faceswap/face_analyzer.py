@@ -263,14 +263,14 @@ class FaceAnalyzer:
             faces = self._detect_logged(scaled, saved_size, saved_thresh, "photo")
             if faces:
                 self.last_detect_note = ""
-                return max(faces, key=lambda item: item.area)
+                return self._keep_source_faces(scaled, faces)
             padded = pad_to_square(_scale_max_side(scaled, 960))
             faces = self._detect_logged(
                 padded, saved_size, min(saved_thresh, 0.20), "padded"
             )
             if faces:
                 self.last_detect_note = "Found the face after padding the photo and lowering the threshold."
-                return max(faces, key=lambda item: item.area)
+                return self._keep_source_faces(padded, faces)
         finally:
             if tuple(self.det_size) != saved_size or abs(float(self.det_thresh) - saved_thresh) > 1e-6:
                 self.set_detection(saved_size, saved_thresh)
@@ -280,8 +280,25 @@ class FaceAnalyzer:
             "then one padded retry at a lower threshold. "
             "Drag a box around the face in the preview, or use a clearer photo of one person."
         )
+        self.last_source_faces = []
+        self.last_source_image = None
         logger.info("source detect failed: %s", self.last_detect_note)
         return None
+
+    def _keep_source_faces(self, image: np.ndarray, faces: List[Face]) -> Face:
+        self.last_source_faces = list(faces)
+        self.last_source_image = image
+        winner = choose_source_face(faces, None)
+        index = faces.index(winner)
+        span = int(max(winner.bbox[2] - winner.bbox[0], winner.bbox[3] - winner.bbox[1]))
+        logger.info(
+            "source pick %d face(s), default index %d score=%.3f size=%dpx (largest score x size)",
+            len(faces),
+            index,
+            float(winner.det_score),
+            span,
+        )
+        return winner
 
     def _detect_logged(self, image: np.ndarray, size: tuple[int, int], thresh: float, label: str) -> List[Face]:
         if tuple(self.det_size) != tuple(size) or abs(float(self.det_thresh) - float(thresh)) > 1e-6:
@@ -306,6 +323,19 @@ class FaceAnalyzer:
 
     def best_source_face(self, image_bgr: np.ndarray) -> Optional[Face]:
         return self.best_face(image_bgr)
+
+
+def source_rank(face: Face) -> float:
+    """Prefer a big, confident face over a slightly bigger blurry one."""
+    box = np.asarray(face.bbox, dtype=np.float32).reshape(-1)
+    span = max(float(box[2] - box[0]), float(box[3] - box[1]), 1.0)
+    return span * max(float(face.det_score), 0.05)
+
+
+def choose_source_face(faces: List[Face], index: Optional[int]) -> Face:
+    if index is not None and 0 <= int(index) < len(faces):
+        return faces[int(index)]
+    return max(faces, key=source_rank)
 
 
 def _scale_max_side(image: np.ndarray, max_side: int) -> np.ndarray:

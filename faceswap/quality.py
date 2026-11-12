@@ -20,9 +20,9 @@ _SCENE_BREAK = 0.35
 def quality_preset(name: str) -> dict:
     """Knobs for the Quality, Balanced, and Fast buttons.
 
-    Laptop is the default on an 8 GB GPU: 128px swap, enhancer off, detect
-    every 2nd frame, fast preview. Balanced raises the swap to 256. Quality
-    uses a 512 boost, CodeFormer, and every frame. Fast matches Laptop.
+    Balanced is the default: pixel boost 256, enhancer on, detect every frame.
+    Laptop is the fast option (128, enhancer off, detect every 2nd frame).
+    Quality uses a 512 boost and CodeFormer. Fast matches Laptop.
     """
     key = (name or "laptop").strip().lower()
     if key in {"fast", "laptop"}:
@@ -53,7 +53,7 @@ def quality_preset(name: str) -> dict:
         "pixel_boost": 256,
         "precise_edges": True,
         "fast_draft_preview": True,
-        "detect_every_other": True,
+        "detect_every_other": False,
         "enhance": True,
         "color_match": 60,
         "object_mask": True,

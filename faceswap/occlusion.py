@@ -65,12 +65,21 @@ def _color_objects(frame_bgr: np.ndarray, alpha: np.ndarray, kps: np.ndarray) ->
     """
     keepout = np.zeros(alpha.shape, dtype=np.float32)
     core = alpha > 0.85
-    count = int(np.count_nonzero(core))
+    ys, xs = np.nonzero(alpha > 0.2)
+    if ys.size < 32:
+        return keepout
+    y0, y1 = int(ys.min()), int(ys.max()) + 1
+    x0, x1 = int(xs.min()), int(xs.max()) + 1
+    core_roi = core[y0:y1, x0:x1]
+    count = int(np.count_nonzero(core_roi))
     if count < 32:
         return keepout
-    median = np.median(frame_bgr[core].astype(np.float32), axis=0)
-    distance = np.linalg.norm(frame_bgr.astype(np.float32) - median, axis=2)
-    odd = (distance > _COLOR_DISTANCE) & (alpha > 0.4)
+    median = np.median(frame_bgr[y0:y1, x0:x1][core_roi].astype(np.float32), axis=0)
+    roi = frame_bgr[y0:y1, x0:x1].astype(np.float32)
+    distance = np.linalg.norm(roi - median, axis=2)
+    odd_roi = (distance > _COLOR_DISTANCE) & (alpha[y0:y1, x0:x1] > 0.4)
+    odd = np.zeros(alpha.shape, dtype=bool)
+    odd[y0:y1, x0:x1] = odd_roi
     odd = _spare_beard(odd, kps)
     if int(np.count_nonzero(odd)) > _MAX_OBJECT_FRACTION * count:
         return keepout

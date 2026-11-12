@@ -71,6 +71,7 @@ class SwapRequest:
     pixel_boost: int = 128
     restorer: str = "gfpgan"
     codeformer_fidelity: float = 0.5
+    source_face_index: Optional[int] = None
     enhance_every: int = 1
     keep_mouth: bool = False
     mask_blur: int = 0
@@ -252,10 +253,15 @@ def build_mappings(engine: FaceSwapEngine, request: SwapRequest) -> list[FaceMap
                     Path(request.single_source),
                     request.identity_paths,
                     request.source_gender,
+                    request.source_face_index,
                 )
                 return [FaceMapping(source_face=source_face, reference_face=None, label="all")]
             image = read_image(Path(request.single_source))
-            return [engine.build_mapping(image, reference_image_bgr=None, label="all")]
+            mapping = engine.build_mapping(image, reference_image_bgr=None, label="all")
+            chosen = _face_at_index(engine, request.source_face_index)
+            if chosen is not None:
+                mapping = FaceMapping(source_face=chosen, reference_face=None, label="all")
+            return [mapping]
         if request.selected_face is None:
             raise ValueError("Detect faces, then select the face to replace.")
         source_face = _source_face(
@@ -263,6 +269,7 @@ def build_mappings(engine: FaceSwapEngine, request: SwapRequest) -> list[FaceMap
             Path(request.single_source),
             request.identity_paths,
             request.source_gender,
+            request.source_face_index,
         )
         return [
             FaceMapping(
@@ -292,7 +299,22 @@ def build_mappings(engine: FaceSwapEngine, request: SwapRequest) -> list[FaceMap
     return mappings
 
 
-def _source_face(engine: FaceSwapEngine, path: Path, identity_paths: list[Path], gender: Optional[int]) -> Face:
+def _face_at_index(engine: FaceSwapEngine, index: Optional[int]) -> Optional[Face]:
+    if index is None:
+        return None
+    faces = getattr(engine.analyzer, "last_source_faces", None) or []
+    if 0 <= int(index) < len(faces):
+        return faces[int(index)]
+    return None
+
+
+def _source_face(
+    engine: FaceSwapEngine,
+    path: Path,
+    identity_paths: list[Path],
+    gender: Optional[int],
+    face_index: Optional[int] = None,
+) -> Face:
     image = read_image(path)
     face = engine.analyzer.best_face(image)
     if face is None:
@@ -300,6 +322,9 @@ def _source_face(engine: FaceSwapEngine, path: Path, identity_paths: list[Path],
             f"No face found in '{path.name}'. Use a clear photo of one person "
             "(JPG, PNG, or HEIC), or lower Min face size if the face is small."
         )
+    picked = _face_at_index(engine, face_index)
+    if picked is not None:
+        face = picked
     embeddings = [np.asarray(face.normed_embedding, dtype=np.float32)]
     extras = list(identity_paths or [])[: MAX_IDENTITY_PHOTOS - 1]
     for extra in extras:
