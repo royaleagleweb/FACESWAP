@@ -120,12 +120,10 @@ def _run(photo: Path, video: Path, frames: int, out_dir: Path, lines: list[str])
 
     warm_started = _time.perf_counter()
     warm_models(engine.swapper)
-    det_started = _time.perf_counter()
     try:
-        engine.analyzer.set_detection(320)
-        det_ms = (_time.perf_counter() - det_started) * 1000.0
+        det_ms = engine.analyzer.warm_size(320)
         kind = "cache hit" if det_ms < 8000 else "built"
-        lines.append(f"warmup_det320: {det_ms:.0f}ms once ({kind})")
+        lines.append(f"warmup_det320: {det_ms:.0f}ms once ({kind}, includes one forward)")
         logger.info("video detector 320 %s in %.1fs", kind, det_ms / 1000.0)
     except Exception as exc:
         logger.info("detector 320 warmup skipped: %s", exc)

@@ -166,8 +166,44 @@ def test_pipeline_clock_is_not_added_to_swap() -> None:
     assert stats.stage_ms["frame_wall"] == 200.0
     line = stats.stage_line()
     assert "swap_parts 50.0ms/frame" in line
-    assert "book 30.0ms/frame" in line
+    # Detect is overlapped on its own thread, so book is the swap thread minus swap.
+    assert "book 50.0ms/frame" in line
     assert "pipeline 80.0ms/frame" in line
+
+
+def test_source_photo_stays_at_640_when_video_detection_is_320() -> None:
+    from faceswap.face_analyzer import Face, FaceAnalyzer
+
+    analyzer = FaceAnalyzer.__new__(FaceAnalyzer)
+    analyzer.det_size = (320, 320)
+    analyzer.det_thresh = 0.30
+    analyzer.last_detect_note = ""
+    seen = []
+
+    def set_detection(size, thresh=None):
+        analyzer.det_size = (size, size) if isinstance(size, int) else tuple(size)
+        if thresh is not None:
+            analyzer.det_thresh = float(thresh)
+        seen.append(("set", analyzer.det_size))
+
+    def _detect_logged(image, size, thresh, label):
+        seen.append(("detect", tuple(size), label))
+        return [
+            Face(
+                bbox=np.array([0, 0, 40, 50], dtype=np.float32),
+                kps=np.zeros((5, 2), dtype=np.float32),
+                embedding=np.ones(4, dtype=np.float32),
+                det_score=0.9,
+            )
+        ]
+
+    analyzer.set_detection = set_detection
+    analyzer._detect_logged = _detect_logged
+    analyzer._keep_source_faces = lambda image, faces: faces[0]
+    face = FaceAnalyzer.best_face(analyzer, np.zeros((90, 80, 3), dtype=np.uint8))
+    assert face is not None
+    assert ("detect", (640, 640), "photo") in seen
+    assert analyzer.det_size == (320, 320)
 
 
 def test_laptop_preset_is_the_fast_default() -> None:

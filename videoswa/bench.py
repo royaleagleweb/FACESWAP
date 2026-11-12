@@ -51,7 +51,8 @@ def _run(photo: Path, video: Path, frames: int, presets: list[str]) -> int:
     warm_started = time.perf_counter()
     warm_models(swapper)
     try:
-        analyzer.set_detection(320)
+        det_ms = analyzer.warm_size(320)
+        print(f"detector 320 forward {det_ms:.0f}ms ({'cache hit' if det_ms < 8000 else 'built'})")
     except Exception as exc:
         print(f"detector 320 skipped: {exc}")
     warm_s = time.perf_counter() - warm_started

@@ -249,6 +249,21 @@ def _sample_maps(cx: np.ndarray, cy: np.ndarray, size: int, coverage: str) -> tu
     return sx.astype(np.float32), sy.astype(np.float32)
 
 
+def face_roi(kps: np.ndarray, shape: tuple[int, int], pad_scale: float = 0.7) -> tuple[int, int, int, int]:
+    """Tight box around the landmarks. Paste and masks stay inside it."""
+    height, width = shape
+    pts = np.asarray(kps, dtype=np.float32).reshape(-1, 2)
+    span = max(float(np.ptp(pts[:, 0])), float(np.ptp(pts[:, 1])), 8.0)
+    margin = max(4, int(round(span * pad_scale)))
+    x0 = max(0, int(np.floor(float(pts[:, 0].min()))) - margin)
+    y0 = max(0, int(np.floor(float(pts[:, 1].min()))) - margin)
+    x1 = min(width, int(np.ceil(float(pts[:, 0].max()))) + margin + 1)
+    y1 = min(height, int(np.ceil(float(pts[:, 1].max()))) + margin + 1)
+    if x1 <= x0 or y1 <= y0:
+        return 0, 0, width, height
+    return x0, y0, x1, y1
+
+
 def paste_swapped_face(
     frame_bgr: np.ndarray,
     swapped_bgr: np.ndarray,
@@ -274,34 +289,24 @@ def paste_swapped_face(
         return frame_bgr
     if alpha is None:
         alpha = coverage_alpha(frame_bgr.shape[:2], kps, mode, yaw=yaw)
-    if float(alpha.max()) <= 0.0:
+    x0, y0, x1, y1 = face_roi(kps, frame_bgr.shape[:2])
+    weight = np.asarray(alpha[y0:y1, x0:x1], dtype=np.float32)
+    if weight.size == 0 or float(weight.max()) <= 0.0:
         return frame_bgr
-
-    ys, xs = np.nonzero(alpha > 0.01)
-    if ys.size == 0:
-        return frame_bgr
-    pad = 2
-    y0 = max(0, int(ys.min()) - pad)
-    y1 = min(frame_bgr.shape[0], int(ys.max()) + 1 + pad)
-    x0 = max(0, int(xs.min()) - pad)
-    x1 = min(frame_bgr.shape[1], int(xs.max()) + 1 + pad)
-
-    grid_y, grid_x = np.mgrid[y0:y1, x0:x1]
-    m = np.asarray(matrix, dtype=np.float64)
-    cx = m[0, 0] * grid_x + m[0, 1] * grid_y + m[0, 2]
-    cy = m[1, 0] * grid_x + m[1, 1] * grid_y + m[1, 2]
-    map_x, map_y = _sample_maps(cx, cy, swapped_bgr.shape[0], mode)
-    warped = cv2.remap(
+    # OpenCV warpAffine maps source → dest. ``matrix`` is frame → crop, so invert it.
+    affine = cv2.invertAffineTransform(np.asarray(matrix, dtype=np.float32).reshape(2, 3))
+    affine[0, 2] -= x0
+    affine[1, 2] -= y0
+    warped = cv2.warpAffine(
         swapped_bgr,
-        map_x,
-        map_y,
-        interpolation=cv2.INTER_LINEAR,
+        affine,
+        (x1 - x0, y1 - y0),
+        flags=cv2.INTER_LINEAR,
         borderMode=cv2.BORDER_REPLICATE,
     )
-
     out = frame_bgr.copy()
     roi = out[y0:y1, x0:x1].astype(np.float32)
-    weight = alpha[y0:y1, x0:x1, None]
+    weight = weight[:, :, None]
     warped_f = warped.astype(np.float32)
     if mode == COVERAGE_FULL:
         warped_f = match_edge_color(

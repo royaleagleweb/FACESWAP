@@ -11,7 +11,14 @@ from typing import Optional
 
 import numpy as np
 
-from .coverage import DEFAULT_COVERAGE, coverage_alpha, normalize_coverage, paste_swapped_face, template_128
+from .coverage import (
+    DEFAULT_COVERAGE,
+    coverage_alpha,
+    face_roi,
+    normalize_coverage,
+    paste_swapped_face,
+    template_128,
+)
 from .face_analyzer import Face
 from .occlusion import _occ_mask
 from .pose import face_yaw, repair_landmarks
@@ -234,22 +241,23 @@ class FaceSwapper:
         # Videoswa composites that itself so the beard is not cropped off.
         from .pixel_boost import (
             aligned_crop,
+            cached_source_latent,
             forward_bgr_tiles,
             join_tiles,
             normalize_pixel_boost,
-            source_latent,
             split_tiles,
         )
 
         boost = normalize_pixel_boost(getattr(self, "pixel_boost", 128))
+        prep_started = time.perf_counter()
+        latent = cached_source_latent(self.swapper, source_face)
+        crop, matrix = aligned_crop(frame, align_kps, boost)
+        tiles = [crop] if boost <= 128 else split_tiles(crop)
+        self._add_stage("prep", prep_started)
         infer_started = time.perf_counter()
-        latent = source_latent(self.swapper, source_face)
 
         def _swap_tile_batch(tiles: list[np.ndarray]) -> list[np.ndarray]:
             return forward_bgr_tiles(self.swapper, tiles, latent)
-
-        crop, matrix = aligned_crop(frame, align_kps, boost)
-        tiles = [crop] if boost <= 128 else split_tiles(crop)
         outputs = _swap_tile_batch(tiles)
         swapped = outputs[0] if boost <= 128 else join_tiles(outputs, boost)
         self._add_stage("inswapper", infer_started)
@@ -297,7 +305,9 @@ class FaceSwapper:
             )
             self._add_stage("occlusion", occ_started)
             alpha = self._shape_mask(alpha, align_kps)
-            alpha = self._smooth_alpha(alpha)
+            smooth_started = time.perf_counter()
+            alpha = self._smooth_alpha(alpha, align_kps)
+            self._add_stage("smooth", smooth_started)
             if alpha is not None:
                 self._mask_cache[cache_key] = (
                     np.asarray(align_kps, dtype=np.float32).copy(),
@@ -457,7 +467,7 @@ class FaceSwapper:
         self._matrix_memory[key] = mixed
         return mixed
 
-    def _smooth_alpha(self, alpha: Optional[np.ndarray]) -> Optional[np.ndarray]:
+    def _smooth_alpha(self, alpha: Optional[np.ndarray], kps: np.ndarray) -> Optional[np.ndarray]:
         if alpha is None:
             return None
         from .smooth import smooth_pair
@@ -465,11 +475,14 @@ class FaceSwapper:
         key = self._color_key
         if key is None:
             return alpha
+        x0, y0, x1, y1 = face_roi(kps, alpha.shape[:2])
+        patch = np.asarray(alpha[y0:y1, x0:x1], dtype=np.float32)
         previous = self._alpha_memory.get(key)
-        mixed = smooth_pair(previous, np.asarray(alpha, dtype=np.float32), keep=0.65)
-        mixed = np.clip(mixed, 0.0, 1.0).astype(np.float32)
-        self._alpha_memory[key] = mixed
-        return mixed
+        prev = previous[y0:y1, x0:x1] if previous is not None and previous.shape == alpha.shape else None
+        mixed = np.clip(smooth_pair(prev, patch, keep=0.65), 0.0, 1.0).astype(np.float32)
+        alpha[y0:y1, x0:x1] = mixed
+        self._alpha_memory[key] = alpha
+        return alpha
 
     def _mark_wiped(self, note: str) -> None:
         self.paste_wiped = True
@@ -494,19 +507,26 @@ def _reuse_mask(old_kps: np.ndarray, alpha: np.ndarray, new_kps: np.ndarray, sha
         return None
     import cv2
 
-    matrix, _inliers = cv2.estimateAffinePartial2D(
-        np.asarray(old_kps, dtype=np.float32).reshape(-1, 1, 2),
-        np.asarray(new_kps, dtype=np.float32).reshape(-1, 1, 2),
-    )
-    if matrix is None:
-        return None
-    return cv2.warpAffine(
+    old = np.asarray(old_kps, dtype=np.float32).reshape(-1, 2)
+    new = np.asarray(new_kps, dtype=np.float32).reshape(-1, 2)
+    forward, _inliers = cv2.estimateAffinePartial2D(old.reshape(-1, 1, 2), new.reshape(-1, 1, 2))
+    if forward is None:
+        delta = new.mean(axis=0) - old.mean(axis=0)
+        forward = np.array([[1.0, 0.0, float(delta[0])], [0.0, 1.0, float(delta[1])]], dtype=np.float32)
+    x0, y0, x1, y1 = face_roi(new, shape)
+    shifted = np.asarray(forward, dtype=np.float32).copy()
+    shifted[0, 2] -= x0
+    shifted[1, 2] -= y0
+    patch = cv2.warpAffine(
         np.asarray(alpha, dtype=np.float32),
-        matrix,
-        (shape[1], shape[0]),
+        shifted,
+        (x1 - x0, y1 - y0),
         flags=cv2.INTER_LINEAR,
         borderValue=0,
     )
+    out = np.zeros(shape, dtype=np.float32)
+    out[y0:y1, x0:x1] = patch
+    return out
 
 
 def _enable_inswapper_batch(model, providers) -> None:

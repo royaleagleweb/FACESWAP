@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from typing import List, Optional
 
@@ -133,6 +134,17 @@ class FaceAnalyzer:
             self._force_det_size(cpu)
         live = getattr(getattr(self.app, "det_model", None), "input_size", None)
         logger.info("detector input_size=%s thresh=%.2f", live, self.det_thresh)
+
+    def warm_size(self, det_size: int) -> float:
+        """Run one detect at ``det_size`` so TensorRT builds that engine now.
+
+        ``set_detection`` only changes the input size. The engine is built on
+        the first real forward, which was landing inside the timed frames.
+        """
+        started = time.perf_counter()
+        self.set_detection(det_size)
+        self.analyze(np.zeros((480, 854, 3), dtype=np.uint8))
+        return (time.perf_counter() - started) * 1000.0
 
     def _force_det_size(self, app) -> None:
         if app is None:
@@ -278,26 +290,30 @@ class FaceAnalyzer:
             logger.info("source detect: empty image")
             return None
         scaled = _scale_max_side(image, 1280)
-        saved_size = tuple(self.det_size)
-        saved_thresh = float(self.det_thresh)
+        # Video frames use 320. A source photo always uses 640, then one padded retry.
+        video_size = tuple(self.det_size)
+        video_thresh = float(self.det_thresh)
+        photo_size = (640, 640)
         try:
-            faces = self._detect_logged(scaled, saved_size, saved_thresh, "photo")
+            if video_size != photo_size:
+                self.set_detection(photo_size, video_thresh)
+            faces = self._detect_logged(scaled, photo_size, video_thresh, "photo")
             if faces:
                 self.last_detect_note = ""
                 return self._keep_source_faces(scaled, faces)
             padded = pad_to_square(_scale_max_side(scaled, 960))
             faces = self._detect_logged(
-                padded, saved_size, min(saved_thresh, 0.20), "padded"
+                padded, photo_size, min(video_thresh, 0.20), "padded"
             )
             if faces:
                 self.last_detect_note = "Found the face after padding the photo and lowering the threshold."
                 return self._keep_source_faces(padded, faces)
         finally:
-            if tuple(self.det_size) != saved_size or abs(float(self.det_thresh) - saved_thresh) > 1e-6:
-                self.set_detection(saved_size, saved_thresh)
+            if tuple(self.det_size) != video_size or abs(float(self.det_thresh) - video_thresh) > 1e-6:
+                self.set_detection(video_size, video_thresh)
         self.last_detect_note = (
             "No face found in this photo. Videoswa read the rotation, tried the "
-            f"current detector ({saved_size[0]}px, threshold {saved_thresh:.2f}), "
+            f"photo detector ({photo_size[0]}px, threshold {video_thresh:.2f}), "
             "then one padded retry at a lower threshold. "
             "Drag a box around the face in the preview, or use a clearer photo of one person."
         )

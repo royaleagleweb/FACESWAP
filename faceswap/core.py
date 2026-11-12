@@ -89,6 +89,9 @@ class SwapStats:
     def add_ms(self, name: str, started: float) -> None:
         self.stage_ms[name] = self.stage_ms.get(name, 0.0) + (time.perf_counter() - started) * 1000.0
 
+    def note_ms(self, name: str, ms: float) -> None:
+        self.stage_ms[name] = self.stage_ms.get(name, 0.0) + float(ms)
+
     def stage_line(self) -> str:
         if not self.stage_ms:
             return "no stage timings"
@@ -101,7 +104,7 @@ class SwapStats:
                 parts.append(f"{name} {ms / frames:.1f}ms/frame")
         detail_names = (
             "inswapper", "enhance", "xseg", "bisenet", "geom", "occlusion",
-            "mask", "mask_reuse", "blend", "sharpen", "finish", "gap",
+            "prep", "mask", "mask_reuse", "blend", "sharpen", "smooth", "finish", "gap",
         )
         detail = sum(self.stage_ms.get(name, 0.0) for name in detail_names)
         wall = self.stage_ms.get("swap", 0.0)
@@ -109,7 +112,8 @@ class SwapStats:
             parts.append(f"swap_parts {detail / frames:.1f}ms/frame")
         frame_wall = self.stage_ms.get("frame_wall", 0.0)
         if frame_wall > 0:
-            book = max(0.0, frame_wall - self.stage_ms.get("detect", 0.0) - wall)
+            # Detect runs on its own thread, so it is not inside the swap-thread clock.
+            book = max(0.0, frame_wall - wall)
             parts.append(f"book {book / frames:.1f}ms/frame")
         outer = sum(self.stage_ms.get(name, 0.0) for name in ("detect", "swap", "decode", "encode"))
         parts.append(f"pipeline {outer / frames:.1f}ms/frame")
@@ -225,7 +229,22 @@ class FaceSwapEngine:
 
         started = time.perf_counter()
         faces = self._faces_for_frame(frame_bgr)
-        self.stats.add_ms("detect", started)
+        detect_ms = (time.perf_counter() - started) * 1000.0
+        return self.apply_detected(frame_bgr, faces, mappings, time_s, detect_ms=detect_ms)
+
+    def apply_detected(
+        self,
+        frame_bgr: np.ndarray,
+        faces: Sequence[Face],
+        mappings: Sequence[FaceMapping],
+        time_s: float = 0.0,
+        detect_ms: float = 0.0,
+    ) -> np.ndarray:
+        """Swap faces that were already detected, possibly on another thread."""
+        self.last_boxes = []
+        if not mappings:
+            return frame_bgr
+        self.stats.note_ms("detect", detect_ms)
         self.stats.frames += 1
         self.stats.faces_detected += len(faces)
         if self.min_face_px > 0:

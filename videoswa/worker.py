@@ -229,14 +229,18 @@ class EngineWorker(QThread):
         setter = getattr(engine.analyzer, "set_detection", None)
         if not callable(setter):
             return
-        started = time.perf_counter()
         try:
-            setter(320)
-            elapsed = time.perf_counter() - started
+            warmer = getattr(engine.analyzer, "warm_size", None)
+            if callable(warmer):
+                det_ms = warmer(320)
+            else:
+                started = time.perf_counter()
+                setter(320)
+                det_ms = (time.perf_counter() - started) * 1000.0
             logger.info(
                 "detector 320 %s in %.1fs",
-                "cache hit" if elapsed < 8.0 else "built",
-                elapsed,
+                "cache hit" if det_ms < 8000 else "built",
+                det_ms / 1000.0,
             )
             setter(640)
         except Exception as exc:

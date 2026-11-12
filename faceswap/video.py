@@ -484,8 +484,9 @@ def _pipeline_frames(
     swaps them. A cancel or a swap error does not leave the final MP4 behind;
     the caller raises before the ffmpeg mux.
     """
-    decode_q: queue.Queue = queue.Queue(maxsize=4)
-    encode_q: queue.Queue = queue.Queue(maxsize=4)
+    decode_q: queue.Queue = queue.Queue(maxsize=3)
+    detect_q: queue.Queue = queue.Queue(maxsize=2)
+    encode_q: queue.Queue = queue.Queue(maxsize=2)
     stop = threading.Event()
     errors: list[BaseException] = []
     cancelled = {"value": False}
@@ -528,6 +529,37 @@ def _pipeline_frames(
         except Exception as exc:
             errors.append(exc)
             stop.set()
+        _put(decode_q, None)
+
+    def _detect() -> None:
+        """Find faces while the previous frame is still swapping."""
+        finder = getattr(engine, "_faces_for_frame", None)
+        try:
+            while not stop.is_set():
+                try:
+                    item = decode_q.get(timeout=0.2)
+                except queue.Empty:
+                    continue
+                if item is None:
+                    _put(detect_q, None)
+                    break
+                index, time_s, frame = item
+                work = frame
+                if scale < 0.99 and frame.shape[1] >= 4 and frame.shape[0] >= 4:
+                    work = cv2.resize(
+                        frame,
+                        (max(2, int(round(frame.shape[1] * scale))), max(2, int(round(frame.shape[0] * scale)))),
+                        interpolation=cv2.INTER_AREA,
+                    )
+                started = time.perf_counter()
+                faces = finder(work) if callable(finder) else []
+                detect_ms = (time.perf_counter() - started) * 1000.0
+                if not _put(detect_q, (index, time_s, frame, work, faces, detect_ms)):
+                    break
+        except Exception as exc:
+            errors.append(exc)
+            stop.set()
+            _put(detect_q, None)
 
     def _swap() -> None:
         try:
@@ -537,17 +569,23 @@ def _pipeline_frames(
                     stop.set()
                     break
                 try:
-                    item = decode_q.get(timeout=0.2)
+                    item = detect_q.get(timeout=0.2)
                 except queue.Empty:
                     continue
                 if item is None:
                     break
-                index, time_s, frame = item
+                index, time_s, frame, work, faces, detect_ms = item
                 note = getattr(engine, "note_frame", None)
                 if callable(note):
                     note(index)
                 started = time.perf_counter()
-                out = swap_frame(engine, frame, mappings, scale=scale, time_s=time_s)
+                apply = getattr(engine, "apply_detected", None)
+                if callable(apply):
+                    out = apply(work, faces, mappings, time_s, detect_ms=detect_ms)
+                    if out.shape[0] != frame.shape[0] or out.shape[1] != frame.shape[1]:
+                        out = cv2.resize(out, (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_LINEAR)
+                else:
+                    out = swap_frame(engine, frame, mappings, scale=scale, time_s=time_s)
                 with clock_lock:
                     clocks["swap"] += time.perf_counter() - started
                 target = out_size or (info.width, info.height)
@@ -588,26 +626,21 @@ def _pipeline_frames(
 
     workers = (
         threading.Thread(target=_decode, name="videoswa-decode"),
+        threading.Thread(target=_detect, name="videoswa-detect"),
         threading.Thread(target=_swap, name="videoswa-swap"),
         threading.Thread(target=_encode, name="videoswa-encode"),
     )
     for worker in workers:
         worker.start()
-    # The decode thread ending is not enough: the swap thread waits on the
-    # queue. Close it with a sentinel once decode has joined.
     workers[0].join()
-    _put(decode_q, None)
-    if stop.is_set():
-        try:
-            decode_q.put(None, timeout=0.2)
-        except queue.Full:
-            pass
     workers[1].join()
+    _put(detect_q, None)
+    workers[2].join()
     try:
         encode_q.put(None, timeout=0.5)
     except queue.Full:
         stop.set()
-    workers[2].join()
+    workers[3].join()
     stats = getattr(engine, "stats", None)
     if stats is not None and hasattr(stats, "stage_ms"):
         merge_pipeline_clocks(stats, clocks)
