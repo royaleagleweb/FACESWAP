@@ -99,10 +99,11 @@ def test_window_loads_short_video(tmp_path: Path) -> None:
         assert window.speed.currentData() == 1.0
         assert window.execution.findData("tensorrt") >= 0
         assert window.object_mask.isChecked() is True
-        assert window.precise_edges.isChecked() is False
-        assert window.quality_preset.currentData() == "laptop"
-        assert window.pixel_boost.currentData() == 128
+        assert window.precise_edges.isChecked() is True
+        assert window.quality_preset.currentData() == "balanced"
+        assert window.pixel_boost.currentData() == 256
         assert window.restorer.currentData() == "gfpgan"
+        assert window.enhance.isChecked() is True
         assert window.advanced_toggle.isChecked() is False
         assert "photos of this person" in window.identity_btn.text()
         assert window.identity_count.text() == "Identity photos: 0/5"

@@ -11,8 +11,8 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import QEvent, Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import QDesktopServices, QFont
+from PySide6.QtCore import QEvent, QSize, Qt, QTimer, QUrl, Signal
+from PySide6.QtGui import QDesktopServices, QFont, QIcon
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -272,22 +272,16 @@ class MainWindow(QMainWindow):
         source = self._build_source_column()
         preview = self._build_preview_column()
         quality = self._build_quality_column()
-        shell.addWidget(self._build_steps())
-        shell.addLayout(preview, stretch=1)
-        self.advanced_toggle = QCheckBox("Advanced")
-        self.advanced_toggle.setChecked(False)
-        self.advanced_toggle.setToolTip("Presets, mask, enhancer, and multi-face mapping. The defaults are ready to swap.")
-        self.advanced_box = QWidget()
-        advanced_row = QHBoxLayout(self.advanced_box)
-        advanced_row.setContentsMargins(0, 0, 0, 0)
-        advanced_row.addWidget(source)
-        advanced_row.addWidget(quality)
-        self.advanced_box.setVisible(False)
-        self.advanced_toggle.toggled.connect(self.advanced_box.setVisible)
-        shell.addWidget(self.advanced_toggle)
-        shell.addWidget(self.advanced_box)
+        body = QHBoxLayout()
+        body.setSpacing(12)
+        body.addWidget(source)
+        body.addLayout(preview, stretch=1)
+        body.addWidget(quality)
+        shell.addLayout(body, stretch=1)
         shell.addWidget(self._build_action_bar())
         self.preview.installEventFilter(self)
+        self.advanced_toggle.toggled.connect(self._toggle_more)
+        self._toggle_more(False)
 
     def _build_steps(self) -> QFrame:
         """The three actions that matter. Extra controls live under Advanced."""
@@ -357,7 +351,8 @@ class MainWindow(QMainWindow):
         form = QVBoxLayout(box)
         form.addWidget(QLabel("Source faces"))
         self.source_list = QListWidget()
-        self.source_list.setMinimumHeight(140)
+        self.source_list.setMinimumHeight(180)
+        self.source_list.setIconSize(QSize(56, 56))
         self.source_list.currentRowChanged.connect(lambda _row: self._on_source_row())
         form.addWidget(self.source_list)
         add_row = QHBoxLayout()
@@ -481,7 +476,7 @@ class MainWindow(QMainWindow):
 
         self.preview = QLabel("Open a target to begin")
         self.preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.preview.setMinimumHeight(280)
+        self.preview.setMinimumHeight(420)
         self.preview.setObjectName("Preview")
         column.addWidget(self.preview, stretch=1)
 
@@ -554,6 +549,10 @@ class MainWindow(QMainWindow):
         box = QFrame()
         box.setObjectName("Panel")
         form = QVBoxLayout(box)
+        self.advanced_toggle = QCheckBox("More options")
+        self.advanced_toggle.setChecked(False)
+        self.advanced_toggle.setToolTip("Show mask, trim, detector, and output settings.")
+        form.addWidget(self.advanced_toggle)
 
         self.apply_all = QCheckBox("Swap every detected face with one source")
         self.apply_all.setChecked(False)
@@ -572,16 +571,15 @@ class MainWindow(QMainWindow):
 
         form.addWidget(QLabel("Quality preset"))
         self.quality_preset = QComboBox()
-        self.quality_preset.addItem("Laptop (fast)", "laptop")
         self.quality_preset.addItem("Balanced", "balanced")
+        self.quality_preset.addItem("Laptop (faster)", "laptop")
         self.quality_preset.addItem("Quality", "quality")
         self.quality_preset.addItem("Fast", "fast")
         self.quality_preset.currentIndexChanged.connect(self._on_quality_preset)
         form.addWidget(self.quality_preset)
 
         self.enhance = QCheckBox("Restore faces")
-        self.enhance.setChecked(False)
-        self.enhance.setToolTip("Off by default so an 8 GB laptop stays responsive. Turn it on in Advanced.")
+        self.enhance.setChecked(True)
         install_tip = gfpgan_install_tip()
         self.enhance.setToolTip(
             install_tip
@@ -644,7 +642,7 @@ class MainWindow(QMainWindow):
             "XSeg downloads into models/xseg.onnx on the first swap."
         )
         self.precise_edges = QCheckBox("Precise edges (BiSeNet + XSeg)")
-        self.precise_edges.setChecked(False)
+        self.precise_edges.setChecked(True)
         self.precise_edges.setToolTip(
             "On for a final render. Fast draft preview skips BiSeNet and keeps the object mask. "
             "The jaw and beard edge is feathered."
@@ -698,7 +696,7 @@ class MainWindow(QMainWindow):
         self.pixel_boost.addItem("128 — fast", 128)
         self.pixel_boost.addItem("256 — 8 GB default", 256)
         self.pixel_boost.addItem("512 — sharpest", 512)
-        self.pixel_boost.setCurrentIndex(0)
+        self.pixel_boost.setCurrentIndex(1)
         self.pixel_boost.setToolTip(
             "InSwapper is 128px. 256 and 512 split the aligned face into 128 tiles, "
             "swap each one, and stitch them. Fast draft preview stays at 128."
@@ -1342,7 +1340,10 @@ class MainWindow(QMainWindow):
         self.source_list.clear()
         for path in self._source_order:
             self.source_list.addItem(self._source_caption(path))
-            self.source_list.item(self.source_list.count() - 1).setData(Qt.ItemDataRole.UserRole, str(path))
+            item = self.source_list.item(self.source_list.count() - 1)
+            item.setData(Qt.ItemDataRole.UserRole, str(path))
+            if path.is_file():
+                item.setIcon(QIcon(str(path)))
         self.source_list.blockSignals(False)
         if current:
             self._select_source_row(Path(current))
@@ -1529,10 +1530,10 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Cannot preview", str(exc))
             self._set_status(str(exc))
             return
-        self._set_busy(True, cancellable=False)
-        self.progress.setRange(0, 0)
-        self.progress.setFormat("Previewing this frame…")
-        self._set_status("Swapping the sample frame…")
+        if not live:
+            self.progress.setRange(0, 0)
+            self.progress.setFormat("Previewing this frame…")
+        self._set_status("Previewing this frame… Swap stays available.")
         self.worker.request_preview(PreviewRequest(timestamp_s=self._timestamp(), swap=request))
 
     def _on_preview_ready(self, original, swapped, note: str, unchanged: bool) -> None:
@@ -1589,6 +1590,45 @@ class MainWindow(QMainWindow):
                 self._set_combo(self.execution, "auto")
             return
         self._set_combo(self.execution, "cpu")
+
+    def _toggle_more(self, checked: bool) -> None:
+        """Keep the right column to the choices that matter until asked."""
+        extras = (
+            self.object_mask,
+            self.precise_edges,
+            self.beard,
+            self.coverage,
+            self.similarity,
+            self.keep_audio,
+            self.video_quality,
+            self.crf,
+            self.encoder,
+            self.preset,
+            self.use_gpu,
+            self.execution,
+            self.provider_banner,
+            self.detector_size,
+            self.sensitivity,
+            self.min_face,
+            self.detect_every,
+            self.speed,
+            self.fast_draft_btn,
+            self.pixel_boost,
+            self.keep_mouth,
+            self.mask_pad,
+            self.mask_blur_slider,
+            self.enhance_every,
+            self.output_height,
+            self.trim_start,
+            self.trim_end,
+            self.restore_slider,
+            self.fidelity_slider,
+            self.sharpen_slider,
+            self.color_slider,
+            self.model_status,
+        )
+        for widget in extras:
+            widget.setVisible(bool(checked))
 
     def _on_quality_preset(self) -> None:
         chosen = quality_preset(str(self.quality_preset.currentData() or "balanced"))
@@ -2038,6 +2078,10 @@ class MainWindow(QMainWindow):
             return
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt API
+        for timer_name in ("_preview_timer", "_redetect_timer", "_play_timer", "_live_timer"):
+            timer = getattr(self, timer_name, None)
+            if timer is not None:
+                timer.stop()
         self._save_last_settings()
         logger.removeHandler(self._log_handler)
         self.worker.request_cancel()

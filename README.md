@@ -18,13 +18,22 @@ python -m videoswa
 `python run.py` opens the same window. The command-line swap tool is still
 there for scripts (`python run.py swap ...`).
 
-The main screen is three steps: drop face photos, drop a video (or a photo),
-press Swap. Drag and drop works for both. Presets, the enhancer, the mask,
-trim, and output size are under **Advanced**. The default preset is **Laptop**
-so an 8 GB GPU stays usable. Models load once in the background ("Warming up
-GPU"). Scrubbing the timeline previews at half resolution. A finished swap
-can open the output folder. Audio is copied when the file allows it, and the
-frame rate, size, and length stay the same unless you trim or pick 720p/1080p.
+The window is a source list on the left, the video in the center, and the
+preset plus face enhancer on the right. **Balanced** is the default: a 256
+pixel boost and the enhancer on the face, with detection every 2nd frame.
+**Laptop** is the faster option. Drag and drop works. More options holds the
+mask, trim, and output size.
+
+Crashes and detection attempts are written to
+`%LOCALAPPDATA%\Videoswa\videoswa.log` (on Linux,
+`~/.local/share/Videoswa/videoswa.log`). A headless check:
+
+```bat
+python -m videoswa --selftest face.jpg clip.mp4
+```
+
+It detects the photo, swaps about 30 frames, and writes `preview.png` plus
+`selftest.mp4` next to the log. The last line is `PASS` or `FAIL`.
 
 A new clip, in order:
 

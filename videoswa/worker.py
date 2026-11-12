@@ -227,6 +227,11 @@ class EngineWorker(QThread):
         use_gpu = execution != "cpu"
         analyzer = FaceAnalyzer(use_gpu=use_gpu, execution=execution)
         swapper = FaceSwapper(use_gpu=use_gpu, enhance=enhance, execution=execution)
+        logger.info(
+            "Models ready. detector providers=%s inswapper providers=%s",
+            getattr(analyzer, "active_providers", None),
+            getattr(swapper, "active_providers", None),
+        )
         self._engine = FaceSwapEngine(analyzer=analyzer, swapper=swapper)
         self._engine_key = execution
         self._bind_cuda_status(self._engine)
@@ -368,7 +373,14 @@ class EngineWorker(QThread):
                 job.role,
             )
             return
-        self.source_ready.emit(str(path), True, f"Source ready: {path.name}", job.role)
+        span = int(max(face.bbox[2] - face.bbox[0], face.bbox[3] - face.bbox[1]))
+        logger.info("source ready %s score=%.3f size=%dpx", path.name, float(face.det_score), span)
+        self.source_ready.emit(
+            str(path),
+            True,
+            f"Source ready: {path.name} (face score {face.det_score:.2f}, about {span}px)",
+            job.role,
+        )
 
     def _configure(self, engine: FaceSwapEngine, job: SwapRequest, *, preview: bool) -> None:
         enhance, precise, object_mask = resolve_quality(

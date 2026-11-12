@@ -244,49 +244,81 @@ class FaceAnalyzer:
         return faces
 
     def best_face(self, image_bgr: np.ndarray) -> Optional[Face]:
-        """Largest face in a source photo, after retries for size and padding.
+        """Largest face in a source photo.
 
-        Phone photos are often huge, tiny, or not square. SCRFD stretches the
-        whole image into ``det_size``, so a very wide frame hides the face.
-        This pads to a square, scales into a useful range, then tries detector
-        sizes 640, 320, and 1024 with a lower threshold.
+        The first pass uses the current detector size on the rotated photo.
+        Changing TensorRT's input size rebuilds an engine, so a miss retries
+        once at the same size with a lower threshold on a square pad. It does
+        not walk 320 and 1024.
         """
-        image = prepare_source_image(image_bgr)
+        image = prepare_detection_image(image_bgr)
         if image.size == 0:
             self.last_detect_note = "The source image was empty."
+            logger.info("source detect: empty image")
             return None
-        saved_size = self.det_size
+        scaled = _scale_max_side(image, 1280)
+        saved_size = tuple(self.det_size)
         saved_thresh = float(self.det_thresh)
-        sizes: list[int] = []
-        for side in (int(saved_size[0]), 640, 320, 1024):
-            if side > 0 and side not in sizes:
-                sizes.append(side)
         try:
-            for index, side in enumerate(sizes):
-                thresh = saved_thresh if index == 0 else min(saved_thresh, 0.20)
-                self.set_detection((side, side), thresh)
-                faces = self.analyze(image)
-                if faces:
-                    self.last_detect_note = ""
-                    return max(faces, key=lambda item: item.area)
-            padded = pad_detection_image(image, border=64)
-            self.set_detection((640, 640), min(saved_thresh, 0.15))
-            faces = self.analyze(padded)
+            faces = self._detect_logged(scaled, saved_size, saved_thresh, "photo")
             if faces:
                 self.last_detect_note = ""
                 return max(faces, key=lambda item: item.area)
+            padded = pad_to_square(_scale_max_side(scaled, 960))
+            faces = self._detect_logged(
+                padded, saved_size, min(saved_thresh, 0.20), "padded"
+            )
+            if faces:
+                self.last_detect_note = "Found the face after padding the photo and lowering the threshold."
+                return max(faces, key=lambda item: item.area)
         finally:
-            self.set_detection(saved_size, saved_thresh)
-        tried = ", ".join(str(side) for side in sizes)
+            if tuple(self.det_size) != saved_size or abs(float(self.det_thresh) - saved_thresh) > 1e-6:
+                self.set_detection(saved_size, saved_thresh)
         self.last_detect_note = (
-            "No face found in this photo. Videoswa applied rotation from the file, "
-            f"tried detector sizes {tried}, then a padded 640px pass at a lower threshold. "
-            "Use a clearer JPG or PNG of one person, with the face large enough to see."
+            "No face found in this photo. Videoswa read the rotation, tried the "
+            f"current detector ({saved_size[0]}px, threshold {saved_thresh:.2f}), "
+            "then one padded retry at a lower threshold. "
+            "Drag a box around the face in the preview, or use a clearer photo of one person."
         )
+        logger.info("source detect failed: %s", self.last_detect_note)
         return None
+
+    def _detect_logged(self, image: np.ndarray, size: tuple[int, int], thresh: float, label: str) -> List[Face]:
+        if tuple(self.det_size) != tuple(size) or abs(float(self.det_thresh) - float(thresh)) > 1e-6:
+            self.set_detection(size, thresh)
+        faces = self.analyze(image)
+        bits = []
+        for face in faces[:6]:
+            box = face.bbox
+            span = int(max(box[2] - box[0], box[3] - box[1]))
+            bits.append(f"score={face.det_score:.3f} {span}px")
+        logger.info(
+            "source detect %s %sx%s det=%s thresh=%.2f faces=%d %s",
+            label,
+            image.shape[1],
+            image.shape[0],
+            int(self.det_size[0]),
+            float(self.det_thresh),
+            len(faces),
+            ", ".join(bits) if bits else "none",
+        )
+        return faces
 
     def best_source_face(self, image_bgr: np.ndarray) -> Optional[Face]:
         return self.best_face(image_bgr)
+
+
+def _scale_max_side(image: np.ndarray, max_side: int) -> np.ndarray:
+    height, width = image.shape[:2]
+    long_side = max(height, width)
+    if long_side <= max_side or long_side <= 0:
+        return image
+    scale = max_side / float(long_side)
+    return cv2.resize(
+        image,
+        (max(1, int(round(width * scale))), max(1, int(round(height * scale)))),
+        interpolation=cv2.INTER_AREA,
+    )
 
 
 def prepare_source_image(image: np.ndarray, max_side: int = 1600, min_side: int = 640) -> np.ndarray:
