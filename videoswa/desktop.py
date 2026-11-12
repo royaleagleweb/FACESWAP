@@ -649,7 +649,7 @@ class MainWindow(QMainWindow):
             "XSeg downloads into models/xseg.onnx on the first swap."
         )
         self.precise_edges = QCheckBox("Precise edges (BiSeNet + XSeg)")
-        self.precise_edges.setChecked(True)
+        self.precise_edges.setChecked(False)
         self.precise_edges.setToolTip(
             "On for a final render. Fast draft preview skips BiSeNet and keeps the object mask. "
             "The jaw and beard edge is feathered."
@@ -702,10 +702,10 @@ class MainWindow(QMainWindow):
         form.addLayout(crf_row)
         form.addWidget(QLabel("Pixel boost"))
         self.pixel_boost = QComboBox()
-        self.pixel_boost.addItem("128 — fast", 128)
-        self.pixel_boost.addItem("256 — 8 GB default", 256)
+        self.pixel_boost.addItem("128 — one pass", 128)
+        self.pixel_boost.addItem("256 — four passes", 256)
         self.pixel_boost.addItem("512 — sharpest", 512)
-        self.pixel_boost.setCurrentIndex(1)
+        self.pixel_boost.setCurrentIndex(0)
         self.pixel_boost.setToolTip(
             "InSwapper is 128px. 256 and 512 split the aligned face into 128 tiles, "
             "swap each one, and stitch them. Fast draft preview stays at 128."
@@ -772,10 +772,11 @@ class MainWindow(QMainWindow):
         self.min_face.setToolTip("0 keeps every detection, including side faces. Try 64 in a crowd.")
         min_row.addWidget(self.min_face)
         form.addLayout(min_row)
-        self.detect_every = QCheckBox("Detect every 2nd frame")
-        self.detect_every.setChecked(False)
-        self.detect_every.setToolTip("Tracks the face between detections so the swap does not flicker, and the export stays faster.")
-        self.detect_every.setToolTip("Full export detects every other frame. Preview always detects the one frame.")
+        self.detect_every = QCheckBox("Track between detections (every 3rd frame)")
+        self.detect_every.setChecked(True)
+        self.detect_every.setToolTip(
+            "Detection runs every 3rd frame. Optical flow moves the landmarks in between. Preview still detects the one frame."
+        )
         form.addWidget(self.detect_every)
         form.addWidget(QLabel("Export speed"))
         self.speed = QComboBox()
@@ -1518,6 +1519,8 @@ class MainWindow(QMainWindow):
             object_mask=self.object_mask.isChecked(),
             fast_draft_preview=self.fast_draft.isChecked(),
             detect_every_other=self.detect_every.isChecked(),
+            detect_stride=3 if self.detect_every.isChecked() else 1,
+            video_det_size=320 if int(self.detector_size.value()) >= 640 else int(self.detector_size.value()),
             min_face_px=self.min_face.value(),
             rotation_mode=str(self.rotation.currentData()) if self.rotation_enabled.isChecked() else "per_person",
             rotation_seconds=float(self.rotation_seconds.value()),
@@ -1698,7 +1701,7 @@ class MainWindow(QMainWindow):
         self._set_status(
             f"{label}: pixel boost {chosen['pixel_boost']}, "
             f"precise edges {'on' if chosen['precise_edges'] else 'off'}, "
-            f"detect every {'2nd frame' if chosen['detect_every_other'] else 'frame'}."
+            f"detect every {chosen.get('detect_stride', 1)} frame(s)."
         )
 
     def _toggle_play(self) -> None:
@@ -1865,9 +1868,9 @@ class MainWindow(QMainWindow):
             self.preset.setCurrentText(str(settings["preset"]))
         self.enhance.setChecked(bool(settings.get("enhance", False)))
         self.object_mask.setChecked(bool(settings.get("object_mask", True)))
-        self.precise_edges.setChecked(bool(settings.get("precise_edges", True)))
+        self.precise_edges.setChecked(bool(settings.get("precise_edges", False)))
         self.fast_draft.setChecked(bool(settings.get("fast_draft_preview", True)))
-        self.detect_every.setChecked(bool(settings.get("detect_every_other", False)))
+        self.detect_every.setChecked(bool(settings.get("detect_every_other", True)))
         self.apply_all.setChecked(bool(settings.get("apply_all", False)))
         self.keep_audio.setChecked(bool(settings.get("keep_audio", True)))
         if hasattr(self, "match_gender"):
@@ -1885,7 +1888,7 @@ class MainWindow(QMainWindow):
             self.sharpen_slider.setValue(int(settings["sharpen"]))
         if settings.get("restore_strength") is not None:
             self.restore_slider.setValue(int(settings["restore_strength"]))
-        self._set_combo(self.pixel_boost, settings.get("pixel_boost", 256))
+        self._set_combo(self.pixel_boost, settings.get("pixel_boost", 128))
         self._set_combo(self.restorer, settings.get("restorer", "gfpgan"))
         if settings.get("codeformer_fidelity") is not None:
             self.fidelity_slider.setValue(int(settings["codeformer_fidelity"]))

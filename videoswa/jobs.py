@@ -55,6 +55,8 @@ class SwapRequest:
     object_mask: bool = True
     fast_draft_preview: bool = True
     detect_every_other: bool = True
+    detect_stride: int = 3
+    video_det_size: int = 320
     min_face_px: int = 0
     rotation_mode: str = "per_person"
     rotation_seconds: float = 10.0

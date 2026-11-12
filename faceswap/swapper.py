@@ -49,6 +49,8 @@ class FaceSwapper:
         self._codeformer = None
         self.color_memory: dict[int, np.ndarray] = {}
         self._alpha_memory: dict[int, np.ndarray] = {}
+        self._mask_cache: dict = {}
+        self._mask_tick = 0
         self._matrix_memory: dict[int, np.ndarray] = {}
         self.last_canvas = None
         self.last_matrix = None
@@ -86,10 +88,22 @@ class FaceSwapper:
         )
         self.swapper, self.active_providers = loaded
         self.providers = providers
-        _enable_inswapper_batch(self.swapper, self.providers)
         self.execution = mode
         self._on_cpu = not uses_gpu(providers)
-        logger.info("InSwapper active providers: %s", self.active_providers or "(unreported)")
+        session = getattr(self.swapper, "session", None)
+        shapes = []
+        live = list(self.active_providers or [])
+        if session is not None:
+            try:
+                live = list(session.get_providers())
+                shapes = [(item.name, list(item.shape)) for item in session.get_inputs()]
+            except Exception:
+                shapes = []
+        logger.info(
+            "InSwapper session providers=%s inputs=%s (stock batch-1; dynamic batch-4 was slower and is not built)",
+            live,
+            shapes,
+        )
         self._enhancer = None
         if enhance:
             self._enhancer = _try_load_gfpgan(use_gpu=uses_gpu(providers))
@@ -173,6 +187,8 @@ class FaceSwapper:
         self.color_memory.clear()
         self._alpha_memory.clear()
         self._matrix_memory.clear()
+        self._mask_cache = {}
+        self._mask_tick = 0
         self._color_key = None
         self.last_canvas = None
         self.last_matrix = None
@@ -244,7 +260,14 @@ class FaceSwapper:
         self.last_paste_note = ""
         mode = normalize_coverage(coverage)
         alpha = None
-        if self.object_mask:
+        self._mask_tick = int(getattr(self, "_mask_tick", 0)) + 1
+        cache_key = self._color_key if self._color_key is not None else 0
+        cached = self._mask_cache.get(cache_key)
+        if self.object_mask and cached is not None and (self._mask_tick % 3) != 1:
+            reuse_started = time.perf_counter()
+            alpha = _reuse_mask(cached[0], cached[1], align_kps, frame.shape[:2])
+            self._add_stage("mask_reuse", reuse_started)
+        if self.object_mask and alpha is None:
             load_started = time.perf_counter()
             models = self.occlusion_models()
             if not getattr(self, "_mask_warm", False):
@@ -275,6 +298,11 @@ class FaceSwapper:
             self._add_stage("occlusion", occ_started)
             alpha = self._shape_mask(alpha, align_kps)
             alpha = self._smooth_alpha(alpha)
+            if alpha is not None:
+                self._mask_cache[cache_key] = (
+                    np.asarray(align_kps, dtype=np.float32).copy(),
+                    np.asarray(alpha, dtype=np.float32),
+                )
             if alpha is None or float(np.max(alpha)) < 0.05:
                 self._mark_wiped(
                     "The face mask was empty, so the swapped face was not pasted. "
@@ -305,6 +333,7 @@ class FaceSwapper:
             sharp_started = time.perf_counter()
             out = _sharpen_roi(out, target_face.bbox, amount)
             self._add_stage("sharpen", sharp_started)
+        finish_started = time.perf_counter()
         if _box_mean_abs(frame, out, target_face.bbox) < 1.5:
             self._mark_wiped(
                 "The paste mask wiped this swap. The face region did not change. "
@@ -314,6 +343,7 @@ class FaceSwapper:
             return frame
         self.last_canvas = np.asarray(swapped).copy()
         self.last_matrix = np.asarray(matrix, dtype=np.float64).reshape(2, 3).copy()
+        self._add_stage("finish", finish_started)
         return out
 
     def _restore_before_paste(self, canvas: np.ndarray, target_face: Face) -> np.ndarray:
@@ -436,7 +466,7 @@ class FaceSwapper:
         if key is None:
             return alpha
         previous = self._alpha_memory.get(key)
-        mixed = smooth_pair(previous, np.asarray(alpha, dtype=np.float64), keep=0.65)
+        mixed = smooth_pair(previous, np.asarray(alpha, dtype=np.float32), keep=0.65)
         mixed = np.clip(mixed, 0.0, 1.0).astype(np.float32)
         self._alpha_memory[key] = mixed
         return mixed
@@ -456,6 +486,27 @@ class _FaceShim:
         self.embedding = face.embedding
         self.normed_embedding = face.normed_embedding
         self.det_score = face.det_score
+
+
+def _reuse_mask(old_kps: np.ndarray, alpha: np.ndarray, new_kps: np.ndarray, shape: tuple[int, int]) -> Optional[np.ndarray]:
+    """Move the last paste mask with the landmarks. Skips XSeg on in-between frames."""
+    if alpha.shape[:2] != shape:
+        return None
+    import cv2
+
+    matrix, _inliers = cv2.estimateAffinePartial2D(
+        np.asarray(old_kps, dtype=np.float32).reshape(-1, 1, 2),
+        np.asarray(new_kps, dtype=np.float32).reshape(-1, 1, 2),
+    )
+    if matrix is None:
+        return None
+    return cv2.warpAffine(
+        np.asarray(alpha, dtype=np.float32),
+        matrix,
+        (shape[1], shape[0]),
+        flags=cv2.INTER_LINEAR,
+        borderValue=0,
+    )
 
 
 def _enable_inswapper_batch(model, providers) -> None:
@@ -531,33 +582,31 @@ def _enable_inswapper_batch(model, providers) -> None:
 
 
 def warm_models(swapper) -> None:
-    """One forward so TensorRT compiles before the timed frames.
+    """One batch-1 forward so TensorRT compiles before the timed frames.
 
-    Balanced runs four 128px tiles. The warm-up uses that batch, then falls
-    back to a single tile if the engine is still batch 1.
+    A dynamic batch-4 engine was slower than the stock 128px pass (64 ms vs
+    about 7 ms) and took minutes to build. It is not warmed.
     """
     model = getattr(swapper, "swapper", None)
     if model is not None and hasattr(model, "session"):
         try:
-            image = np.zeros((4, 3, 128, 128), dtype=np.float32)
-            latent = np.zeros((4, 512), dtype=np.float32)
+            started = time.perf_counter()
+            image = np.zeros((1, 3, 128, 128), dtype=np.float32)
+            latent = np.zeros((1, 512), dtype=np.float32)
             model.session.run(
                 model.output_names,
                 {model.input_names[0]: image, model.input_names[1]: latent},
             )
-            logger.info("Warmed InSwapper batch 4")
+            elapsed = (time.perf_counter() - started) * 1000.0
+            shapes = [(item.name, list(item.shape)) for item in model.session.get_inputs()]
+            logger.info(
+                "Warmed InSwapper batch-1 in %.1f ms providers=%s inputs=%s",
+                elapsed,
+                model.session.get_providers(),
+                shapes,
+            )
         except Exception as exc:
-            logger.info("InSwapper batch-4 warmup skipped: %s", exc)
-            try:
-                image = np.zeros((1, 3, 128, 128), dtype=np.float32)
-                latent = np.zeros((1, 512), dtype=np.float32)
-                model.session.run(
-                    model.output_names,
-                    {model.input_names[0]: image, model.input_names[1]: latent},
-                )
-                logger.info("Warmed InSwapper batch 1")
-            except Exception as inner:
-                logger.info("InSwapper warmup skipped: %s", inner)
+            logger.info("InSwapper warmup skipped: %s", exc)
     try:
         models = swapper.occlusion_models()
     except Exception as exc:

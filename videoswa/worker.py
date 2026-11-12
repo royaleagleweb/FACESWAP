@@ -207,7 +207,9 @@ class EngineWorker(QThread):
                     self.swap_failed.emit(message)
 
     def _warmup(self, execution: str) -> None:
-        self.status.emit("Warming up GPU… models load once, and TensorRT engines stay cached.")
+        self.status.emit(
+            "Preparing GPU, first time only. TensorRT can take several minutes. Later runs use the cache."
+        )
         try:
             engine = self._engine_for(execution or "auto", enhance=False)
             self._warm_sessions(engine)
@@ -219,9 +221,26 @@ class EngineWorker(QThread):
 
     def _warm_sessions(self, engine: FaceSwapEngine) -> None:
         """One dummy forward so the first real frame does not compile an engine."""
+        import time
+
         from faceswap.swapper import warm_models
 
         warm_models(engine.swapper)
+        setter = getattr(engine.analyzer, "set_detection", None)
+        if not callable(setter):
+            return
+        started = time.perf_counter()
+        try:
+            setter(320)
+            elapsed = time.perf_counter() - started
+            logger.info(
+                "detector 320 %s in %.1fs",
+                "cache hit" if elapsed < 8.0 else "built",
+                elapsed,
+            )
+            setter(640)
+        except Exception as exc:
+            logger.info("detector 320 warmup skipped: %s", exc)
 
     def _engine_for(self, execution: str, enhance: bool) -> FaceSwapEngine:
         if self._engine is not None and self._engine_key == execution:
@@ -427,7 +446,10 @@ class EngineWorker(QThread):
         engine.similarity_threshold = job.similarity
         engine.coverage = job.coverage
         engine.min_face_px = int(job.min_face_px)
-        engine.detect_stride = 1 if preview else (2 if job.detect_every_other else 1)
+        if preview or not job.detect_every_other:
+            engine.detect_stride = 1
+        else:
+            engine.detect_stride = max(1, int(getattr(job, "detect_stride", 3) or 3))
         engine.rotation.mode = job.rotation_mode
         engine.rotation.seconds = float(job.rotation_seconds)
         engine.rotation.sources = [] if job.rotation_mode == "per_person" else self._rotation_faces(engine, job)
@@ -449,7 +471,25 @@ class EngineWorker(QThread):
         swapper.keep_mouth = bool(getattr(job, "keep_mouth", False))
         swapper.mask_blur = int(getattr(job, "mask_blur", 0) or 0)
         swapper.mask_padding = int(getattr(job, "mask_padding", 0) or 0)
-        self._apply_detector(engine, int(getattr(job, "det_size", 640)), float(getattr(job, "det_thresh", 0.30)))
+        photo_det = int(getattr(job, "det_size", 640))
+        video_det = int(getattr(job, "video_det_size", 0) or 0)
+        if preview or video_det <= 0 or video_det == photo_det:
+            self._apply_detector(engine, photo_det, float(getattr(job, "det_thresh", 0.30)))
+        else:
+            import time
+
+            self.status.emit(
+                "Preparing GPU, first time only. TensorRT can take several minutes. Later runs use the cache."
+            )
+            started = time.perf_counter()
+            self._apply_detector(engine, video_det, float(getattr(job, "det_thresh", 0.30)))
+            elapsed = time.perf_counter() - started
+            logger.info(
+                "video detector %s %s in %.1fs",
+                video_det,
+                "cache hit" if elapsed < 8.0 else "built",
+                elapsed,
+            )
         if hasattr(swapper, "prepare_restorer"):
             tip = swapper.prepare_restorer(enhance, swapper.restorer)
             if tip:

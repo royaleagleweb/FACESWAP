@@ -60,28 +60,35 @@ def _occ_mask(
 def _color_objects(frame_bgr: np.ndarray, alpha: np.ndarray, kps: np.ndarray) -> np.ndarray:
     """1 on compact regions whose color is far from the face median.
 
-    A wide dark band under the mouth is a beard, not a lollipop, so it stays
-    in the swap. A small blob (food, a stick, a hand of a different color)
-    is punched out.
+    The work happens on the face crop, scaled so the long side is at most
+    128. A full-frame connected-component pass was about 50 ms at 480p.
     """
     keepout = np.zeros(alpha.shape, dtype=np.float32)
-    core = alpha > 0.85
     ys, xs = np.nonzero(alpha > 0.2)
     if ys.size < 32:
         return keepout
     y0, y1 = int(ys.min()), int(ys.max()) + 1
     x0, x1 = int(xs.min()), int(xs.max()) + 1
-    core_roi = core[y0:y1, x0:x1]
-    count = int(np.count_nonzero(core_roi))
-    if count < 32:
+    roi_alpha = alpha[y0:y1, x0:x1]
+    roi_bgr = frame_bgr[y0:y1, x0:x1]
+    long_side = max(roi_alpha.shape[:2])
+    scale = 1.0 if long_side <= 128 else 128.0 / float(long_side)
+    if scale < 1.0:
+        size = (max(1, int(round(roi_alpha.shape[1] * scale))), max(1, int(round(roi_alpha.shape[0] * scale))))
+        small_alpha = cv2.resize(roi_alpha, size, interpolation=cv2.INTER_AREA)
+        small_bgr = cv2.resize(roi_bgr, size, interpolation=cv2.INTER_AREA)
+    else:
+        small_alpha = roi_alpha
+        small_bgr = roi_bgr
+    core = small_alpha > 0.85
+    count = int(np.count_nonzero(core))
+    if count < 16:
         return keepout
-    median = np.median(frame_bgr[y0:y1, x0:x1][core_roi].astype(np.float32), axis=0)
-    roi = frame_bgr[y0:y1, x0:x1].astype(np.float32)
-    distance = np.linalg.norm(roi - median, axis=2)
-    odd_roi = (distance > _COLOR_DISTANCE) & (alpha[y0:y1, x0:x1] > 0.4)
-    odd = np.zeros(alpha.shape, dtype=bool)
-    odd[y0:y1, x0:x1] = odd_roi
-    odd = _spare_beard(odd, kps)
+    median = np.median(small_bgr[core].astype(np.float32), axis=0)
+    distance = np.linalg.norm(small_bgr.astype(np.float32) - median, axis=2)
+    odd = (distance > _COLOR_DISTANCE) & (small_alpha > 0.4)
+    local_kps = (np.asarray(kps, dtype=np.float32).reshape(-1, 2) - np.array([x0, y0], dtype=np.float32)) * scale
+    odd = _spare_beard(odd, local_kps)
     if int(np.count_nonzero(odd)) > _MAX_OBJECT_FRACTION * count:
         return keepout
     speckle = cv2.morphologyEx(
@@ -89,7 +96,9 @@ def _color_objects(frame_bgr: np.ndarray, alpha: np.ndarray, kps: np.ndarray) ->
         cv2.MORPH_OPEN,
         np.ones((3, 3), np.uint8),
     )
-    keepout[speckle > 0] = 1.0
+    if scale < 1.0:
+        speckle = cv2.resize(speckle, (x1 - x0, y1 - y0), interpolation=cv2.INTER_NEAREST)
+    keepout[y0:y1, x0:x1] = (speckle > 0).astype(np.float32)
     return keepout
 
 
@@ -107,8 +116,8 @@ def _spare_beard(odd: np.ndarray, kps: np.ndarray) -> np.ndarray:
         ys, xs = np.nonzero(labels == label)
         if xs.size < 8:
             continue
-        px = xs.astype(np.float64)
-        py = ys.astype(np.float64)
+        px = xs.astype(np.float32)
+        py = ys.astype(np.float32)
         along = (px - mouth_c[0]) * down_u[0] + (py - mouth_c[1]) * down_u[1]
         lateral = (px - mouth_c[0]) * side_u[0] + (py - mouth_c[1]) * side_u[1]
         below_mouth = float(np.mean(along > 0.15 * em)) > 0.7
@@ -126,17 +135,27 @@ def warp_into_face(
 ) -> np.ndarray:
     """Warp a crop mask into the frame and zero it outside the face."""
     height, width = frame_shape
+    out = np.zeros((height, width), dtype=np.float32)
+    ys, xs = np.nonzero(face_alpha > 0.05)
+    if ys.size == 0:
+        return out
+    y0 = max(0, int(ys.min()) - 2)
+    x0 = max(0, int(xs.min()) - 2)
+    y1 = min(height, int(ys.max()) + 3)
+    x1 = min(width, int(xs.max()) + 3)
     inverse = cv2.invertAffineTransform(np.asarray(frame_to_crop, dtype=np.float64))
+    inverse = inverse.copy()
+    inverse[0, 2] -= x0
+    inverse[1, 2] -= y0
     warped = cv2.warpAffine(
         crop_mask.astype(np.float32),
         inverse,
-        (width, height),
+        (x1 - x0, y1 - y0),
         flags=cv2.INTER_LINEAR,
         borderValue=0,
     )
-    if warped.shape != face_alpha.shape:
-        warped = cv2.resize(warped, (face_alpha.shape[1], face_alpha.shape[0]))
-    return warped * (face_alpha > 0.05).astype(np.float32)
+    out[y0:y1, x0:x1] = warped * (face_alpha[y0:y1, x0:x1] > 0.05)
+    return out
 
 
 class OcclusionModels:

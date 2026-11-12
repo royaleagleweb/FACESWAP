@@ -85,14 +85,17 @@ def _run(photo: Path, video: Path, frames: int, out_dir: Path, lines: list[str])
         f"video: {info.width}x{info.height} @ {info.fps:.2f}fps "
         f"{info.frame_count} frames audio={info.has_audio}"
     )
+    print("Preparing GPU, first time only. TensorRT can take several minutes. Later runs use the cache.")
+    lines.append("Preparing GPU, first time only. TensorRT can take several minutes. Later runs use the cache.")
     swapper = FaceSwapper(use_gpu=True, enhance=False, execution="auto")
-    swapper.pixel_boost = 256
+    swapper.pixel_boost = 128
     swapper.precise_edges = False
     logger.info("inswapper providers: %s", getattr(swapper, "active_providers", None))
     logger.info("enhance: off for selftest (device would be logged if GFPGAN were loaded)")
     lines.append(f"provider: {getattr(swapper, 'active_providers', None)}")
     lines.append("enhance: off")
-    engine = FaceSwapEngine(analyzer=analyzer, swapper=swapper, detect_stride=1)
+    lines.append("preset: balanced (128px, detect every 3rd frame, video det 320)")
+    engine = FaceSwapEngine(analyzer=analyzer, swapper=swapper, detect_stride=3)
     if face is None:
         lines.append("swap: skipped, source photo had no face")
         return False
@@ -104,8 +107,10 @@ def _run(photo: Path, video: Path, frames: int, out_dir: Path, lines: list[str])
         apply_to_all=True,
         face_mode="single",
         enhance=False,
-        pixel_boost=256,
-        detect_every_other=False,
+        pixel_boost=128,
+        detect_every_other=True,
+        detect_stride=3,
+        video_det_size=320,
         fast_draft_preview=True,
     )
     mappings = build_mappings(engine, request)
@@ -115,8 +120,18 @@ def _run(photo: Path, video: Path, frames: int, out_dir: Path, lines: list[str])
 
     warm_started = _time.perf_counter()
     warm_models(engine.swapper)
+    det_started = _time.perf_counter()
+    try:
+        engine.analyzer.set_detection(320)
+        det_ms = (_time.perf_counter() - det_started) * 1000.0
+        kind = "cache hit" if det_ms < 8000 else "built"
+        lines.append(f"warmup_det320: {det_ms:.0f}ms once ({kind})")
+        logger.info("video detector 320 %s in %.1fs", kind, det_ms / 1000.0)
+    except Exception as exc:
+        logger.info("detector 320 warmup skipped: %s", exc)
+        lines.append(f"warmup_det320: skipped ({exc})")
     warmup_ms = (_time.perf_counter() - warm_started) * 1000.0
-    lines.append(f"warmup: {warmup_ms:.0f}ms once (InSwapper batch 4 + XSeg, not in per-frame swap)")
+    lines.append(f"warmup: {warmup_ms:.0f}ms once (InSwapper batch-1 + XSeg + det 320, not in per-frame swap)")
     end_s = 0.0
     if info.fps > 0:
         end_s = min(float(info.duration_s), frames / float(info.fps))

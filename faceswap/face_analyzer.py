@@ -121,12 +121,29 @@ class FaceAnalyzer:
         if det_thresh is not None:
             self.det_thresh = float(np.clip(det_thresh, 0.05, 0.9))
         ctx = -1 if self._on_cpu else 0
+        # InsightFace ignores a second prepare() once input_size is set, so the
+        # video size has to be written onto the detector itself.
+        self._force_det_size(self.app)
         prepare = getattr(self.app, "prepare", None)
-        if callable(prepare):
+        if callable(prepare) and getattr(getattr(self.app, "det_model", None), "input_size", None) is None:
             prepare(ctx_id=ctx, det_size=self.det_size, det_thresh=self.det_thresh)
+        self._force_det_size(self.app)
         cpu = getattr(self, "_cpu_app", None)
-        if cpu is not None and callable(getattr(cpu, "prepare", None)):
-            cpu.prepare(ctx_id=-1, det_size=self.det_size, det_thresh=self.det_thresh)
+        if cpu is not None:
+            self._force_det_size(cpu)
+        live = getattr(getattr(self.app, "det_model", None), "input_size", None)
+        logger.info("detector input_size=%s thresh=%.2f", live, self.det_thresh)
+
+    def _force_det_size(self, app) -> None:
+        if app is None:
+            return
+        det = getattr(app, "det_model", None)
+        if det is None:
+            return
+        det.input_size = self.det_size
+        det.det_thresh = self.det_thresh
+        app.det_size = self.det_size
+        app.det_thresh = self.det_thresh
 
     def adopt_cpu(self) -> None:
         """Drop a GPU session that failed while the graph was running."""

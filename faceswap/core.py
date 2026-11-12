@@ -13,6 +13,7 @@ import time
 from dataclasses import dataclass, field, replace
 from typing import Iterable, List, Optional, Sequence
 
+import cv2
 import numpy as np
 
 from .coverage import DEFAULT_COVERAGE, paste_swapped_face
@@ -28,6 +29,12 @@ from .utils import logger
 # used to drop the swap and show the original face again. 0.32 still rejects
 # a clearly different person; raise it when the wrong face is selected.
 DEFAULT_SIMILARITY = 0.32
+
+
+def _gray(frame_bgr: np.ndarray) -> np.ndarray:
+    if frame_bgr.ndim == 2:
+        return frame_bgr
+    return cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
 # Once a face is locked, keep it down to this floor when the box still overlaps.
 _HOLD_FLOOR = 0.22
 _HOLD_MARGIN = 0.15
@@ -94,12 +101,16 @@ class SwapStats:
                 parts.append(f"{name} {ms / frames:.1f}ms/frame")
         detail_names = (
             "inswapper", "enhance", "xseg", "bisenet", "geom", "occlusion",
-            "mask", "blend", "sharpen", "gap",
+            "mask", "mask_reuse", "blend", "sharpen", "finish", "gap",
         )
         detail = sum(self.stage_ms.get(name, 0.0) for name in detail_names)
         wall = self.stage_ms.get("swap", 0.0)
         if wall > 0:
             parts.append(f"swap_parts {detail / frames:.1f}ms/frame")
+        frame_wall = self.stage_ms.get("frame_wall", 0.0)
+        if frame_wall > 0:
+            book = max(0.0, frame_wall - self.stage_ms.get("detect", 0.0) - wall)
+            parts.append(f"book {book / frames:.1f}ms/frame")
         outer = sum(self.stage_ms.get(name, 0.0) for name in ("detect", "swap", "decode", "encode"))
         parts.append(f"pipeline {outer / frames:.1f}ms/frame")
         return " · ".join(parts)
@@ -150,6 +161,7 @@ class FaceSwapEngine:
         self._cached_faces: List[Face] = []
         self._detect_tick = 0
         self._from_detector = True
+        self._track_gray: Optional[np.ndarray] = None
         self.rotation = SourceRotation()
         self.match_gender = False
         self.last_boxes: List[np.ndarray] = []
@@ -189,6 +201,7 @@ class FaceSwapEngine:
         self._tracks = []
         self._cached_faces = []
         self._detect_tick = 0
+        self._track_gray = None
         self.rotation.reset()
         reset_color = getattr(self.swapper, "reset_color_memory", None)
         if callable(reset_color):
@@ -310,19 +323,56 @@ class FaceSwapEngine:
         logger.info("Missed face — %s", line)
 
     def _faces_for_frame(self, frame_bgr: np.ndarray) -> List[Face]:
-        """Detect on every Nth frame and reuse the last landmarks between them."""
+        """Detect every Nth frame. In between, optical flow moves the landmarks."""
         self._detect_tick += 1
         stride = max(1, int(self.detect_stride))
         use_cache = stride > 1 and self._cached_faces and (self._detect_tick % stride != 1)
         if use_cache:
             self._from_detector = False
             self.stats.cached_frames += 1
-            return list(self._cached_faces)
+            tracked = self._flow_landmarks(frame_bgr)
+            return tracked if tracked is not None else list(self._cached_faces)
         self._from_detector = True
         self.stats.detector_frames += 1
         faces = self.analyzer.analyze(frame_bgr)
         self._cached_faces = list(faces)
+        self._track_gray = _gray(frame_bgr)
         return faces
+
+    def _flow_landmarks(self, frame_bgr: np.ndarray) -> Optional[List[Face]]:
+        """Move the last five landmarks with pyramidal Lucas-Kanade."""
+        gray = _gray(frame_bgr)
+        previous = self._track_gray
+        self._track_gray = gray
+        if previous is None or previous.shape != gray.shape or not self._cached_faces:
+            return None
+        moved: List[Face] = []
+        for face in self._cached_faces:
+            old = np.asarray(face.kps, dtype=np.float32).reshape(-1, 2)
+            if old.shape != (5, 2) or not np.isfinite(old).all():
+                return None
+            nxt, status, _err = cv2.calcOpticalFlowPyrLK(
+                previous,
+                gray,
+                old.reshape(-1, 1, 2),
+                None,
+                winSize=(21, 21),
+                maxLevel=3,
+                criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 12, 0.03),
+            )
+            if nxt is None or status is None or int(status.reshape(-1).sum()) < 4:
+                return None
+            kps = nxt.reshape(-1, 2)
+            shift = kps - old
+            if float(np.median(np.linalg.norm(shift, axis=1))) > 64.0:
+                return None
+            delta = shift.mean(axis=0)
+            bbox = np.asarray(face.bbox, dtype=np.float32).copy()
+            bbox[0::2] += float(delta[0])
+            bbox[1::2] += float(delta[1])
+            moved.append(replace(face, kps=kps.astype(np.float32), bbox=bbox))
+        self._cached_faces = moved
+        return moved
 
     def _assign(
         self,

@@ -14,6 +14,10 @@ def main(argv: list[str] | None = None) -> int:
         from videoswa.selftest import run_selftest
 
         return run_selftest(args[1:])
+    if args and args[0] == "--bench":
+        from videoswa.bench import run_bench
+
+        return run_bench(args[1:])
     install_exception_hooks()
     from videoswa.desktop import main as desktop_main
 

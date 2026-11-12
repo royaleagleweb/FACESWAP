@@ -136,6 +136,46 @@ def test_weak_match_without_overlap_does_not_hold() -> None:
     assert engine.stats.faces_unmatched == 1
 
 
+def test_optical_flow_moves_landmarks_without_another_detect() -> None:
+    class _CountAnalyzer:
+        def __init__(self) -> None:
+            self.faces: list[Face] = []
+            self.calls = 0
+
+        def analyze(self, _frame):
+            self.calls += 1
+            return list(self.faces)
+
+    class _KpsSwapper:
+        def __init__(self) -> None:
+            self.kps: list[np.ndarray] = []
+
+        def swap(self, frame, target_face, source_face, paste_back=True, coverage="full"):
+            self.kps.append(np.asarray(target_face.kps).copy())
+            return frame
+
+    rng = np.random.default_rng(0)
+    frame = rng.integers(0, 255, (160, 220, 3), dtype=np.uint8)
+    kps = np.array([[70, 60], [110, 62], [90, 88], [76, 112], [108, 114]], dtype=np.float32)
+    person = Face(
+        bbox=np.array([55, 40, 130, 140], dtype=np.float32),
+        kps=kps,
+        embedding=np.array([1.0, 0.0, 0.0], dtype=np.float32),
+        det_score=0.99,
+    )
+    analyzer = _CountAnalyzer()
+    swapper = _KpsSwapper()
+    engine = FaceSwapEngine(analyzer=analyzer, swapper=swapper, detect_stride=3)
+    mapping = FaceMapping(source_face=person, reference_face=None)
+    analyzer.faces = [person]
+    engine.process_frame(frame, [mapping])
+    engine.process_frame(np.roll(frame, 6, axis=1), [mapping])
+    assert analyzer.calls == 1
+    assert engine.stats.cached_frames == 1
+    assert engine.stats.detector_frames == 1
+    assert float(engine._cached_faces[0].kps[2, 0]) > float(kps[2, 0]) + 2
+
+
 def test_reset_tracks_requires_a_fresh_lock() -> None:
     reference = _face([1, 0, 0], 20)
     source = _face([0, 1, 0], 0)

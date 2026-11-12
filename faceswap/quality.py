@@ -20,9 +20,10 @@ _SCENE_BREAK = 0.35
 def quality_preset(name: str) -> dict:
     """Knobs for the Quality, Balanced, and Fast buttons.
 
-    Balanced is the default: pixel boost 256, enhancer on, detect every frame.
-    Laptop is the fast option (128, enhancer off, detect every 2nd frame).
-    Quality uses a 512 boost and CodeFormer. Fast matches Laptop.
+    Balanced is the default: one 128px InSwapper pass, enhancer on, and
+    detection every 3rd frame with optical flow in between. A 256 boost is
+    four TensorRT passes and missed the 60 ms budget. Laptop matches that
+    speed path with the enhancer off. Quality is the slow one.
     """
     key = (name or "laptop").strip().lower()
     if key in {"fast", "laptop"}:
@@ -31,6 +32,7 @@ def quality_preset(name: str) -> dict:
             "precise_edges": False,
             "fast_draft_preview": True,
             "detect_every_other": True,
+            "detect_stride": 3,
             "enhance": False,
             "color_match": 60,
             "object_mask": True,
@@ -43,6 +45,7 @@ def quality_preset(name: str) -> dict:
             "precise_edges": True,
             "fast_draft_preview": False,
             "detect_every_other": False,
+            "detect_stride": 1,
             "enhance": True,
             "color_match": 60,
             "object_mask": True,
@@ -50,10 +53,11 @@ def quality_preset(name: str) -> dict:
             "sharpen": 18,
         }
     return {
-        "pixel_boost": 256,
-        "precise_edges": True,
+        "pixel_boost": 128,
+        "precise_edges": False,
         "fast_draft_preview": True,
-        "detect_every_other": False,
+        "detect_every_other": True,
+        "detect_stride": 3,
         "enhance": True,
         "color_match": 60,
         "object_mask": True,

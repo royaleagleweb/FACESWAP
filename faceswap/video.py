@@ -610,10 +610,21 @@ def _pipeline_frames(
     workers[2].join()
     stats = getattr(engine, "stats", None)
     if stats is not None and hasattr(stats, "stage_ms"):
-        for name, seconds in clocks.items():
-            stats.stage_ms[name] = stats.stage_ms.get(name, 0.0) + seconds * 1000.0
+        merge_pipeline_clocks(stats, clocks)
     error = errors[0] if errors else None
     return error, bool(cancelled["value"] and error is None)
+
+
+def merge_pipeline_clocks(stats, clocks: dict) -> None:
+    """Add decode and encode. Do not add the frame clock to ``swap``.
+
+    The frame clock wraps detection and the swap. ``swap`` is already the
+    time inside ``FaceSwapper.swap``. Adding the frame clock again made
+    ``swap`` about 200 ms/frame larger than its sub-stages.
+    """
+    stats.stage_ms["decode"] = stats.stage_ms.get("decode", 0.0) + float(clocks.get("decode", 0.0)) * 1000.0
+    stats.stage_ms["encode"] = stats.stage_ms.get("encode", 0.0) + float(clocks.get("encode", 0.0)) * 1000.0
+    stats.stage_ms["frame_wall"] = stats.stage_ms.get("frame_wall", 0.0) + float(clocks.get("swap", 0.0)) * 1000.0
 
 
 def _run_ffmpeg(cmd: list[str]) -> None:

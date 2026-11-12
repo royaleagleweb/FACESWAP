@@ -19,8 +19,8 @@ python -m videoswa
 there for scripts (`python run.py swap ...`).
 
 The window is a source list on the left, the video in the center, and the
-preset plus face enhancer on the right. **Balanced** is the default: a 256
-pixel boost and the enhancer on the face, with detection every 2nd frame.
+preset plus face enhancer on the right. **Balanced** is the default: one
+128px swap, the enhancer on the face, and detection every 3rd frame.
 **Laptop** is the faster option. Drag and drop works. More options holds the
 mask, trim, and output size.
 
@@ -546,10 +546,10 @@ requirements-windows-directml.txt
   DirectML when that provider is installed, otherwise on CPU. The banner
   names the provider. Install `requirements-windows-directml.txt` for a GPU
   that does not use CUDA. Launch with the project `.venv\Scripts\python.exe`.
-- **The swap is slow.** The window opens on **Laptop**: one 128px swap,
-  enhancer off, detect every 2nd frame, fast preview while you scrub.
-  **Balanced** is 256. **Quality** is the slow one (512, CodeFormer, every
-  frame). The log prints per-stage times (decode, detect, swap, mask,
+- **The swap is slow.** **Laptop** and **Balanced** both use one 128px swap
+  and detect every 3rd frame. Balanced leaves the enhancer on. **Quality**
+  is the slow one (512, CodeFormer, every frame). The log prints per-stage
+  times (decode, detect, swap, mask,
   enhance, encode) and any frame that missed a face. Half resolution is
   still there under Advanced. DirectML is the Windows GPU path when CUDA
   is unhealthy.

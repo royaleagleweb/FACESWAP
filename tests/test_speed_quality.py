@@ -155,6 +155,21 @@ def test_paste_rejects_a_degenerate_matrix() -> None:
     assert np.array_equal(out, frame)
 
 
+def test_pipeline_clock_is_not_added_to_swap() -> None:
+    from faceswap.core import SwapStats
+    from faceswap.video import merge_pipeline_clocks
+
+    stats = SwapStats(frames=2)
+    stats.stage_ms = {"swap": 100.0, "detect": 40.0, "inswapper": 80.0, "gap": 20.0}
+    merge_pipeline_clocks(stats, {"decode": 0.01, "swap": 0.20, "encode": 0.01})
+    assert stats.stage_ms["swap"] == 100.0
+    assert stats.stage_ms["frame_wall"] == 200.0
+    line = stats.stage_line()
+    assert "swap_parts 50.0ms/frame" in line
+    assert "book 30.0ms/frame" in line
+    assert "pipeline 80.0ms/frame" in line
+
+
 def test_laptop_preset_is_the_fast_default() -> None:
     laptop = quality_preset("laptop")
     assert laptop["pixel_boost"] == 128
@@ -173,10 +188,12 @@ def test_quality_presets_cover_fast_balanced_and_quality() -> None:
     assert fast["enhance"] is False
     assert fast["fast_draft_preview"] is True
     assert fast["detect_every_other"] is True
-    assert balanced["pixel_boost"] == 256
-    assert balanced["precise_edges"] is True
+    assert balanced["pixel_boost"] == 128
+    assert balanced["precise_edges"] is False
     assert balanced["fast_draft_preview"] is True
-    assert balanced["detect_every_other"] is False
+    assert balanced["detect_every_other"] is True
+    assert balanced["detect_stride"] == 3
+    assert quality_preset("laptop")["detect_stride"] == 3
     assert quality["pixel_boost"] == 512
     assert quality["precise_edges"] is True
     assert quality["fast_draft_preview"] is False

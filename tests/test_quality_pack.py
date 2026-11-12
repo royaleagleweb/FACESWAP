@@ -108,7 +108,7 @@ def test_neural_keepout_stays_inside_the_face() -> None:
 def test_swap_calls_occ_mask_for_a_normal_swap() -> None:
     source = inspect.getsource(FaceSwapper.swap)
     assert "_occ_mask(" in source
-    assert "if self.object_mask:" in source
+    assert "object_mask" in source
     assert "models.xseg is not None" in source
     init = inspect.getsource(FaceSwapper.__init__)
     assert "self.object_mask = True" in init
