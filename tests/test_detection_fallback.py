@@ -1,0 +1,231 @@
+"""Detection must return a face when the GPU session is blind, and OpenCV stays pinned."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import cv2
+import numpy as np
+
+from faceswap.core import FaceMapping, FaceSwapEngine
+from faceswap.face_analyzer import (
+    Face,
+    FaceAnalyzer,
+    prepare_detection_image,
+    sensitivity_to_thresh,
+)
+from faceswap.video import read_frame_index
+from videoswa.jobs import MIN_ROI_CHANGE, roi_mean_change
+from videoswa.worker import seek_times
+
+REPO = Path(__file__).resolve().parents[1]
+
+
+class _RawFace:
+    def __init__(self) -> None:
+        self.bbox = np.array([10, 10, 80, 100], dtype=np.float32)
+        self.kps = np.array([[20, 30], [60, 30], [40, 50], [25, 70], [55, 70]], dtype=np.float32)
+        self.embedding = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+        self.normed_embedding = self.embedding
+        self.det_score = 0.42
+        self.gender = 1
+        self.age = 30
+
+
+class _App:
+    def __init__(self, hits: bool) -> None:
+        self.hits = hits
+        self.seen = []
+
+    def get(self, image):
+        self.seen.append(image)
+        if image.dtype != np.uint8 or image.ndim != 3 or image.shape[2] != 3:
+            return []
+        if not self.hits:
+            return []
+        return [_RawFace()]
+
+
+def _analyzer(gpu_hits: bool, cpu_hits: bool) -> FaceAnalyzer:
+    analyzer = FaceAnalyzer.__new__(FaceAnalyzer)
+    analyzer.det_size = (640, 640)
+    analyzer.det_thresh = 0.30
+    analyzer._on_cpu = False
+    analyzer._gpu_detector_blind = False
+    analyzer._cpu_app = None
+    analyzer.last_detect_note = ""
+    analyzer.app = _App(gpu_hits)
+    analyzer._cpu_detector = lambda: _install_cpu(analyzer, cpu_hits)
+    return analyzer
+
+
+def _install_cpu(analyzer: FaceAnalyzer, hits: bool):
+    if analyzer._cpu_app is None:
+        analyzer._cpu_app = _App(hits)
+    return analyzer._cpu_app
+
+
+def _synthetic(dtype=np.uint8) -> np.ndarray:
+    image = np.zeros((96, 96, 3), dtype=np.uint8)
+    image[20:80, 30:70] = (40, 80, 160)
+    if dtype == np.uint8:
+        return image
+    return (image.astype(np.float32) / 255.0)
+
+
+def test_requirements_pin_opencv_so_gfpgan_cannot_upgrade_it() -> None:
+    requirements = (REPO / "requirements.txt").read_text(encoding="utf-8")
+    enhance = (REPO / "requirements-enhance.txt").read_text(encoding="utf-8")
+    requirement_deps = "\n".join(line.split("#", 1)[0] for line in requirements.splitlines())
+    assert "opencv-python==4.10.0.84" in requirement_deps
+    assert "opencv-python-headless" not in requirement_deps
+    assert "OpenCV 5.0.0" in requirements
+    assert "opencv-python==4.10.0.84" in enhance
+    assert "gfpgan==1.3.8" in enhance
+
+
+def test_float_and_rgba_frames_still_detect_after_cpu_retry() -> None:
+    analyzer = _analyzer(gpu_hits=False, cpu_hits=True)
+    rgba = np.dstack([_synthetic(), np.full((96, 96), 255, dtype=np.uint8)])
+    for image in (_synthetic(), _synthetic(np.float32), rgba):
+        faces = analyzer.analyze(image)
+        assert len(faces) >= 1
+    assert analyzer._gpu_detector_blind is True
+    assert "CPU" in analyzer.last_detect_note
+    assert all(frame.dtype == np.uint8 and frame.shape[2] == 3 for frame in analyzer._cpu_app.seen)
+
+
+def test_prepare_detection_image_makes_contiguous_uint8_bgr() -> None:
+    prepared = prepare_detection_image(_synthetic(np.float32))
+    assert prepared.dtype == np.uint8
+    assert prepared.flags["C_CONTIGUOUS"]
+    assert prepared.shape[2] == 3
+    assert sensitivity_to_thresh(63) == np.float32(0.298) or abs(sensitivity_to_thresh(63) - 0.30) < 0.01
+
+
+def test_both_detectors_empty_does_not_mark_the_gpu_blind() -> None:
+    analyzer = _analyzer(gpu_hits=False, cpu_hits=False)
+    assert analyzer.analyze(_synthetic()) == []
+    assert analyzer._gpu_detector_blind is False
+
+
+def test_seek_includes_frame_ten_half_second_and_mid() -> None:
+    """Frame 0 can be empty while frame 10 has the only face (VERSA.mp4)."""
+    times = seek_times(0.0, 5.0, fps=30.0)
+    assert times[0] == 0.0
+    assert round(10 / 30.0, 3) in times
+    assert 0.5 in times
+    assert 1.0 in times
+    assert 2.5 in times
+    around = seek_times(10.0, 30.0, fps=30.0)
+    assert around[0] == 10.0
+    assert 10.5 in around and 9.5 in around
+    assert 11.0 in around and 9.0 in around
+    unknown = seek_times(0.0, 0.0)
+    assert unknown[0] == 0.0
+    assert round(10 / 30.0, 3) in unknown
+
+
+def test_frame_ten_is_not_read_as_frame_zero(tmp_path: Path) -> None:
+    path = tmp_path / "versa_like.mp4"
+    writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), 30.0, (32, 24))
+    assert writer.isOpened()
+    for index in range(12):
+        frame = np.zeros((24, 32, 3), dtype=np.uint8)
+        if index == 10:
+            frame[:] = 255
+        writer.write(frame)
+    writer.release()
+    first = read_frame_index(path, 0)
+    tenth = read_frame_index(path, 10)
+    assert float(first.mean()) < 5
+    assert float(tenth.mean()) > 200
+
+
+def test_a_wiped_paste_is_not_counted_as_a_swap() -> None:
+    source = Face(
+        bbox=np.array([0, 0, 10, 10], dtype=np.float32),
+        kps=np.zeros((5, 2), dtype=np.float32),
+        embedding=np.array([1.0, 0.0], dtype=np.float32),
+        det_score=0.9,
+        gender=1,
+    )
+    target = Face(
+        bbox=np.array([4, 4, 36, 36], dtype=np.float32),
+        kps=np.zeros((5, 2), dtype=np.float32),
+        embedding=np.array([1.0, 0.0], dtype=np.float32),
+        det_score=0.9,
+        gender=1,
+    )
+
+    class _Analyzer:
+        def analyze(self, _frame):
+            return [target]
+
+    class _Wiper:
+        def swap(self, frame, target_face, source_face, paste_back=True, coverage="full"):
+            self.paste_wiped = True
+            self.last_paste_note = "The paste mask wiped this swap."
+            return frame
+
+    engine = FaceSwapEngine(analyzer=_Analyzer(), swapper=_Wiper(), similarity_threshold=0.2)
+    mapping = FaceMapping(source_face=source, reference_face=target)
+    frame = np.zeros((48, 48, 3), dtype=np.uint8)
+    assert engine.process_frame(frame, [mapping]).max() == 0
+    assert engine.stats.faces_swapped == 0
+    assert engine.stats.faces_wiped == 1
+
+
+def test_small_face_diff_around_eight_is_a_real_swap() -> None:
+    """VERSA frame 10 changed by about 8 inside the face. That is a swap.
+
+    The full frame stays near zero because the face is small. Only a wiped
+    paste (difference under 1.5) is a failure.
+    """
+    original = np.full((40, 40, 3), 20, dtype=np.uint8)
+    wiped = original.copy()
+    wiped[8:24, 8:24] = 21
+    assert roi_mean_change(original, wiped, [np.array([8, 8, 24, 24])]) < MIN_ROI_CHANGE
+    real = original.copy()
+    real[8:24, 8:24] = 28
+    assert roi_mean_change(original, real, [np.array([8, 8, 24, 24])]) >= MIN_ROI_CHANGE
+    assert MIN_ROI_CHANGE < 8
+
+
+def test_match_gender_blocks_only_when_enabled() -> None:
+    source = Face(
+        bbox=np.array([0, 0, 10, 10], dtype=np.float32),
+        kps=np.zeros((5, 2), dtype=np.float32),
+        embedding=np.array([1.0, 0.0], dtype=np.float32),
+        det_score=0.9,
+        gender=1,
+    )
+    target = Face(
+        bbox=np.array([0, 0, 40, 40], dtype=np.float32),
+        kps=np.zeros((5, 2), dtype=np.float32),
+        embedding=np.array([1.0, 0.0], dtype=np.float32),
+        det_score=0.9,
+        gender=0,
+    )
+
+    class _Analyzer:
+        def analyze(self, _frame):
+            return [target]
+
+    class _Swapper:
+        def swap(self, frame, target_face, source_face, paste_back=True, coverage="full"):
+            frame = frame.copy()
+            frame[:] = 255
+            return frame
+
+    frame = np.zeros((48, 48, 3), dtype=np.uint8)
+    mapping = FaceMapping(source_face=source, reference_face=target)
+    blocked = FaceSwapEngine(analyzer=_Analyzer(), swapper=_Swapper(), similarity_threshold=0.2)
+    blocked.match_gender = True
+    assert blocked.process_frame(frame, [mapping]).max() == 0
+    assert blocked.stats.faces_swapped == 0
+
+    allowed = FaceSwapEngine(analyzer=_Analyzer(), swapper=_Swapper(), similarity_threshold=0.2)
+    assert allowed.match_gender is False
+    assert allowed.process_frame(frame, [mapping]).max() == 255
+    assert len(allowed.last_boxes) == 1

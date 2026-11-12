@@ -1,0 +1,601 @@
+"""Background thread that owns InsightFace sessions.
+
+ONNX Runtime GPU contexts are easiest to reuse on the thread that created
+them, so detection and swapping both run here.
+"""
+
+from __future__ import annotations
+
+import queue
+import threading
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional
+
+import numpy as np
+from PySide6.QtCore import QThread, Signal
+
+from faceswap.core import FaceSwapEngine, SwapStats
+from faceswap.face_analyzer import FaceAnalyzer
+from faceswap.providers import format_providers, provider_status_text, tensorrt_missing_note
+from faceswap.pixel_boost import normalize_pixel_boost
+from faceswap.quality import resolve_quality
+from faceswap.swapper import FaceSwapper
+from faceswap.utils import logger
+from faceswap.video import SwapCancelled, process_video, read_frame_at, read_frame_index, reset_stats, swap_frame
+from videoswa.images import crop_face
+from videoswa.jobs import IMAGE_SUFFIXES, MIN_ROI_CHANGE, SwapRequest, build_mappings, read_image, roi_mean_change
+
+
+def _quality_note(stats: SwapStats) -> str:
+    """Tell the user why a swap still looks like the original, or looks soft."""
+    if getattr(stats, "faces_wiped", 0) and stats.faces_swapped <= 0:
+        return (
+            "The swap was computed, then the paste mask wiped the face back to the original. "
+            "Turn Precise edges off and run Preview again. "
+            "A small face that only shifts the face region by about 8 is a real swap and is kept."
+        )
+    if stats.faces_swapped <= 0:
+        return (
+            "No faces were swapped, so the video still looks like the original. "
+            "Move the ref-frame slider until a face is listed, use a clearer source photo, "
+            "or lower Min face size and the match threshold."
+        )
+    if stats.faces_detected <= 0:
+        return (
+            "No faces were detected. Move the slider, or lower Min face size and Detect sensitivity."
+        )
+    if stats.faces_swapped < 0.7 * stats.faces_detected and stats.faces_unmatched > stats.faces_swapped:
+        return (
+            "Many frames kept the original face. Lower the match threshold, "
+            "or turn off Match gender if the wrong gender tag is blocking the swap. "
+            "Raise the threshold if the wrong person is swapped."
+        )
+    return "Audio is kept when Keep audio is on and FFmpeg can read the file."
+
+
+def seek_times(
+    current_s: float,
+    duration_s: float,
+    fps: float = 30.0,
+    limit: int = 12,
+) -> list[float]:
+    """Timestamps to try when the current sample frame has no face.
+
+    The list always prefers frame +10 after the current frame. VERSA.mp4 is
+    empty on frame 0 and has a face on frame 10. ±0.5s, ±1s, and the middle
+    of the clip are included after that.
+    """
+    rate = max(1.0, float(fps or 30.0))
+    duration = max(0.0, float(duration_s))
+    current = max(0.0, float(current_s))
+    if duration > 0.0:
+        current = min(current, duration)
+    current_frame = int(round(current * rate))
+    max_frame = int(round(duration * rate)) if duration > 0.0 else max(current_frame, 10)
+    half = max(1, int(round(0.5 * rate)))
+    one = max(1, int(round(1.0 * rate)))
+    offsets = (0, 10, 5, 15, -10, -5, half, -half, one, -one, 30, -30, 2, -2)
+    frames: list[int] = []
+    for offset in offsets:
+        index = current_frame + int(offset)
+        if 0 <= index <= max_frame and index not in frames:
+            frames.append(index)
+        if len(frames) >= limit:
+            break
+    if len(frames) < limit and duration > 0.0:
+        mid = int(round((duration * rate) / 2.0))
+        mid = min(max(0, mid), max_frame)
+        if mid not in frames:
+            frames.append(mid)
+    if not frames:
+        frames = [0]
+    return [round(index / rate, 3) for index in frames[:limit]]
+
+
+@dataclass
+class DetectRequest:
+    video_path: Path
+    timestamp_s: float
+    execution: str
+    duration_s: float = 0.0
+    det_size: int = 640
+    det_thresh: float = 0.30
+    auto_seek: bool = True
+    fps: float = 30.0
+
+
+@dataclass
+class SourceCheckRequest:
+    path: Path
+    execution: str
+    det_size: int = 640
+    det_thresh: float = 0.30
+    role: str = "library"
+    crop: Optional[tuple] = None
+
+
+@dataclass
+class PreviewRequest:
+    """One sample frame, using the same mapping settings as a full export."""
+
+    timestamp_s: float
+    swap: SwapRequest
+
+
+@dataclass
+class DetectedPerson:
+    crop_bgr: object
+    face: object
+    index: int
+
+
+class EngineWorker(QThread):
+    detect_ready = Signal(object)
+    detect_failed = Signal(str)
+    preview_ready = Signal(object, object, str, bool)
+    preview_failed = Signal(str)
+    source_ready = Signal(str, bool, str, str)
+    source_choices = Signal(str, object)
+    swap_progress = Signal(int, int)
+    swap_finished = Signal(str, str)
+    swap_failed = Signal(str)
+    swap_cancelled = Signal()
+    status = Signal(str)
+    provider = Signal(str)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._queue: queue.Queue = queue.Queue()
+        self._cancel = threading.Event()
+        self._engine: Optional[FaceSwapEngine] = None
+        self._engine_key: Optional[tuple] = None
+
+    def request_warmup(self, execution: str = "auto") -> None:
+        """Load models once, off the UI thread. Safe to call before the first swap."""
+        self._queue.put(("warmup", execution))
+
+    def request_detect(self, job: DetectRequest) -> None:
+        self._queue.put(("detect", job))
+
+    def request_preview(self, job: PreviewRequest) -> None:
+        self._queue.put(("preview", job))
+
+    def request_source(self, job: SourceCheckRequest) -> None:
+        self._queue.put(("source", job))
+
+    def request_swap(self, job: SwapRequest) -> None:
+        self._cancel.clear()
+        self._queue.put(("swap", job))
+
+    def request_cancel(self) -> None:
+        self._cancel.set()
+
+    def shutdown(self) -> None:
+        self._cancel.set()
+        self._queue.put(None)
+
+    def run(self) -> None:
+        while True:
+            item = self._queue.get()
+            if item is None:
+                return
+            kind, job = item
+            try:
+                if kind == "warmup":
+                    self._warmup(str(job))
+                elif kind == "detect":
+                    self._detect(job)
+                elif kind == "preview":
+                    self._preview(job)
+                elif kind == "source":
+                    self._check_source(job)
+                else:
+                    self._swap(job)
+            except SwapCancelled:
+                self.swap_cancelled.emit()
+            except Exception as exc:
+                logger.exception("Videoswa %s failed", kind)
+                message = str(exc) or exc.__class__.__name__
+                if kind == "detect":
+                    self.detect_failed.emit(message)
+                elif kind == "preview":
+                    self.preview_failed.emit(message)
+                elif kind == "source":
+                    self.source_ready.emit(str(getattr(job, "path", "")), False, message, getattr(job, "role", "library"))
+                else:
+                    self.swap_failed.emit(message)
+
+    def _warmup(self, execution: str) -> None:
+        self.status.emit(
+            "Preparing GPU, first time only. TensorRT can take several minutes. Later runs use the cache."
+        )
+        try:
+            engine = self._engine_for(execution or "auto", enhance=False)
+            self._warm_sessions(engine)
+        except Exception as exc:
+            logger.exception("GPU warmup failed")
+            self.status.emit(f"Models will load on the first swap. {exc}")
+            return
+        self.status.emit("GPU is ready. TensorRT engines are cached. Add a face photo and a video, then press Swap.")
+
+    def _warm_sessions(self, engine: FaceSwapEngine) -> None:
+        """One dummy forward so the first real frame does not compile an engine."""
+        import time
+
+        from faceswap.swapper import warm_models
+
+        warm_models(engine.swapper)
+        setter = getattr(engine.analyzer, "set_detection", None)
+        if not callable(setter):
+            return
+        try:
+            warmer = getattr(engine.analyzer, "warm_size", None)
+            if callable(warmer):
+                det_ms = warmer(320)
+            else:
+                started = time.perf_counter()
+                setter(320)
+                det_ms = (time.perf_counter() - started) * 1000.0
+            logger.info(
+                "detector 320 %s in %.1fs",
+                "cache hit" if det_ms < 8000 else "built",
+                det_ms / 1000.0,
+            )
+            setter(640)
+        except Exception as exc:
+            logger.info("detector 320 warmup skipped: %s", exc)
+
+    def _engine_for(self, execution: str, enhance: bool) -> FaceSwapEngine:
+        if self._engine is not None and self._engine_key == execution:
+            self._bind_cuda_status(self._engine)
+            tip = self._engine.swapper.set_enhance(enhance)
+            if tip:
+                self.status.emit(tip)
+            self._emit_provider(self._engine)
+            return self._engine
+        self.status.emit(
+            "Loading InsightFace models. The first run downloads buffalo_l and inswapper_128."
+        )
+        use_gpu = execution != "cpu"
+        analyzer = FaceAnalyzer(use_gpu=use_gpu, execution=execution)
+        swapper = FaceSwapper(use_gpu=use_gpu, enhance=enhance, execution=execution)
+        logger.info(
+            "Models ready. detector providers=%s inswapper providers=%s",
+            getattr(analyzer, "active_providers", None),
+            getattr(swapper, "active_providers", None),
+        )
+        self._engine = FaceSwapEngine(analyzer=analyzer, swapper=swapper)
+        self._engine_key = execution
+        self._bind_cuda_status(self._engine)
+        self._emit_provider(self._engine)
+        return self._engine
+
+    def _bind_cuda_status(self, engine: FaceSwapEngine) -> None:
+        guard = getattr(engine, "cuda_guard", None)
+        if guard is None:
+            return
+
+        def _report(message: str) -> None:
+            self.status.emit(message)
+            self.provider.emit(message)
+
+        guard.on_fallback = _report
+
+    def _emit_provider(self, engine: FaceSwapEngine) -> None:
+        guard = getattr(engine, "cuda_guard", None)
+        note = getattr(guard, "note", None) if guard is not None else None
+        if note:
+            self.provider.emit(note)
+            self.status.emit(note)
+            return
+        names = getattr(engine.swapper, "active_providers", None) or getattr(engine.swapper, "providers", [])
+        text = provider_status_text(names)
+        mode = getattr(engine.swapper, "execution", "auto")
+        if mode in {"auto", "tensorrt"}:
+            text += tensorrt_missing_note(names)
+        detail = format_providers(getattr(engine.swapper, "providers", []) or [])
+        occlusion = getattr(engine.swapper, "_occlusion", None)
+        if occlusion is not None and getattr(occlusion, "status", ""):
+            text = f"{text} {occlusion.status}"
+        self.provider.emit(text)
+        self.status.emit(f"Models ready. {text} ({detail})" if detail else f"Models ready. {text}")
+
+    def _apply_detector(self, engine: FaceSwapEngine, det_size: int, det_thresh: float) -> None:
+        setter = getattr(engine.analyzer, "set_detection", None)
+        if callable(setter):
+            setter((int(det_size), int(det_size)), float(det_thresh))
+
+    def _detect(self, job: DetectRequest) -> None:
+        engine = self._engine_for(job.execution, enhance=False)
+        self._apply_detector(engine, job.det_size, job.det_thresh)
+        self.status.emit("Detecting faces…")
+        if Path(job.video_path).suffix.lower() in IMAGE_SUFFIXES:
+            frame = read_image(Path(job.video_path))
+            faces = engine.analyzer.analyze(frame)
+            people = [
+                DetectedPerson(crop_bgr=crop_face(frame, face), face=face, index=index)
+                for index, face in enumerate(faces)
+            ]
+            note = "" if people else "No faces in this photo. Drag a box around the face if it is small or turned."
+            self.detect_ready.emit({"people": people, "time_s": 0.0, "note": note, "found": bool(people)})
+            self.status.emit(note or f"Detected {len(people)} face(s).")
+            return
+        fps = max(1.0, float(job.fps or 30.0))
+        times = (
+            seek_times(job.timestamp_s, job.duration_s, fps=fps)
+            if job.auto_seek
+            else [float(job.timestamp_s)]
+        )
+        found_time = float(job.timestamp_s)
+        frame = None
+        faces = []
+        for timestamp in times:
+            index = int(round(float(timestamp) * fps))
+            try:
+                candidate = read_frame_index(Path(job.video_path), index)
+            except Exception:
+                try:
+                    candidate = read_frame_at(Path(job.video_path), timestamp)
+                except Exception:
+                    continue
+            faces = engine.analyzer.analyze(candidate)
+            frame = candidate
+            if faces:
+                found_time = timestamp
+                break
+        people = []
+        if frame is not None:
+            people = [
+                DetectedPerson(crop_bgr=crop_face(frame, face), face=face, index=index)
+                for index, face in enumerate(faces)
+            ]
+        note = getattr(engine.analyzer, "last_detect_note", "") or ""
+        if not people:
+            note = (
+                "No faces on this sample frame. Videoswa also checked nearby frames "
+                "(frame +10, about ±0.5s, ±1s, and the middle of the clip) and still found none. "
+                "Move the ref-frame slider to a moment where the face is visible, "
+                "or lower Min face size and Detect sensitivity."
+            )
+            if "OpenCV" in (getattr(engine.analyzer, "last_detect_note", "") or ""):
+                note = f"{note}\n\n{engine.analyzer.last_detect_note}"
+        elif abs(found_time - float(job.timestamp_s)) > 0.05:
+            frame_no = int(round(found_time * fps))
+            parked = (
+                f"No face on the current sample. Moved the ref-frame slider to "
+                f"frame {frame_no} ({found_time:.2f}s)."
+            )
+            note = f"{note} {parked}".strip()
+        self.detect_ready.emit({
+            "people": people,
+            "time_s": found_time,
+            "note": note,
+            "found": bool(people),
+        })
+        self.status.emit(note or f"Detected {len(people)} face(s).")
+
+    def _check_source(self, job: SourceCheckRequest) -> None:
+        engine = self._engine_for(job.execution, enhance=False)
+        self._apply_detector(engine, job.det_size, job.det_thresh)
+        path = Path(job.path)
+        image = read_image(path)
+        crop = getattr(job, "crop", None)
+        if crop:
+            x1, y1, x2, y2 = [int(v) for v in crop]
+            height, width = image.shape[:2]
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(width, x2), min(height, y2)
+            if x2 - x1 > 8 and y2 - y1 > 8:
+                pad_x = int((x2 - x1) * 0.35)
+                pad_y = int((y2 - y1) * 0.35)
+                image = image[max(0, y1 - pad_y):min(height, y2 + pad_y), max(0, x1 - pad_x):min(width, x2 + pad_x)]
+        finder = getattr(engine.analyzer, "best_source_face", None) or engine.analyzer.best_face
+        face = finder(image)
+        if face is None:
+            note = getattr(engine.analyzer, "last_detect_note", "") or ""
+            self.source_ready.emit(
+                str(path),
+                False,
+                note
+                or (
+                    f"No face found in {path.name}. Videoswa checked rotation and tried "
+                    "the current detector, then one padded retry. "
+                    "Drag a box around the face, or use a clearer photo."
+                ),
+                job.role,
+            )
+            return
+        span = int(max(face.bbox[2] - face.bbox[0], face.bbox[3] - face.bbox[1]))
+        faces = list(getattr(engine.analyzer, "last_source_faces", []) or [])
+        logger.info("source ready %s score=%.3f size=%dpx faces=%d", path.name, float(face.det_score), span, len(faces))
+        self._emit_source_choices(str(path))
+        extra = ""
+        if len(faces) > 1:
+            extra = f" {len(faces)} faces in the photo. Using the strongest. Click a thumbnail to pick another."
+        self.source_ready.emit(
+            str(path),
+            True,
+            f"Source ready: {path.name} (face score {face.det_score:.2f}, about {span}px).{extra}",
+            job.role,
+        )
+
+    def _emit_source_choices(self, path: str) -> None:
+        engine = self._engine
+        if engine is None:
+            return
+        faces = list(getattr(engine.analyzer, "last_source_faces", []) or [])
+        image = getattr(engine.analyzer, "last_source_image", None)
+        payload = []
+        if image is not None:
+            for index, face in enumerate(faces):
+                span = int(max(face.bbox[2] - face.bbox[0], face.bbox[3] - face.bbox[1]))
+                payload.append({
+                    "index": index,
+                    "score": float(face.det_score),
+                    "span": span,
+                    "crop": crop_face(image, face),
+                })
+        self.source_choices.emit(path, payload)
+
+    def _configure(self, engine: FaceSwapEngine, job: SwapRequest, *, preview: bool) -> None:
+        enhance, precise, object_mask = resolve_quality(
+            enhance=job.enhance,
+            precise_edges=job.precise_edges,
+            object_mask=job.object_mask,
+            fast_draft=job.fast_draft_preview,
+            preview=preview,
+        )
+        reset_stats(engine)
+        engine.similarity_threshold = job.similarity
+        engine.coverage = job.coverage
+        engine.min_face_px = int(job.min_face_px)
+        if preview or not job.detect_every_other:
+            engine.detect_stride = 1
+        else:
+            engine.detect_stride = max(1, int(getattr(job, "detect_stride", 3) or 3))
+        engine.rotation.mode = job.rotation_mode
+        engine.rotation.seconds = float(job.rotation_seconds)
+        engine.rotation.sources = [] if job.rotation_mode == "per_person" else self._rotation_faces(engine, job)
+        engine.match_gender = bool(getattr(job, "match_gender", False))
+        swapper = engine.swapper
+        swapper.object_mask = object_mask
+        swapper.precise_edges = precise
+        swapper.allow_restore = enhance
+        swapper.color_match = float(getattr(job, "color_match", 0.60))
+        swapper.sharpen = float(getattr(job, "sharpen", 0.0))
+        swapper.restore_strength = float(getattr(job, "restore_strength", 1.0))
+        swapper.codeformer_fidelity = float(getattr(job, "codeformer_fidelity", 0.5))
+        boost = normalize_pixel_boost(getattr(job, "pixel_boost", 128))
+        if preview and job.fast_draft_preview:
+            boost = 128
+        swapper.pixel_boost = boost
+        swapper.restorer = str(getattr(job, "restorer", "gfpgan") or "gfpgan")
+        swapper.enhance_every = max(1, int(getattr(job, "enhance_every", 1) or 1))
+        swapper.keep_mouth = bool(getattr(job, "keep_mouth", False))
+        swapper.mask_blur = int(getattr(job, "mask_blur", 0) or 0)
+        swapper.mask_padding = int(getattr(job, "mask_padding", 0) or 0)
+        photo_det = int(getattr(job, "det_size", 640))
+        video_det = int(getattr(job, "video_det_size", 0) or 0)
+        if preview or video_det <= 0 or video_det == photo_det:
+            self._apply_detector(engine, photo_det, float(getattr(job, "det_thresh", 0.30)))
+        else:
+            import time
+
+            self.status.emit(
+                "Preparing GPU, first time only. TensorRT can take several minutes. Later runs use the cache."
+            )
+            started = time.perf_counter()
+            self._apply_detector(engine, video_det, float(getattr(job, "det_thresh", 0.30)))
+            elapsed = time.perf_counter() - started
+            logger.info(
+                "video detector %s %s in %.1fs",
+                video_det,
+                "cache hit" if elapsed < 8.0 else "built",
+                elapsed,
+            )
+        if hasattr(swapper, "prepare_restorer"):
+            tip = swapper.prepare_restorer(enhance, swapper.restorer)
+            if tip:
+                self.status.emit(tip)
+        elif enhance and hasattr(swapper, "set_enhance"):
+            tip = swapper.set_enhance(True)
+            if tip:
+                self.status.emit(tip)
+
+    def _rotation_faces(self, engine: FaceSwapEngine, job: SwapRequest):
+        faces = []
+        paths = list(job.rotation_paths)
+        if job.single_source is not None:
+            paths.insert(0, Path(job.single_source))
+        paths.extend(item.source_path for item in job.face_sources)
+        seen: set[str] = set()
+        for path in paths:
+            key = str(Path(path))
+            if key in seen:
+                continue
+            seen.add(key)
+            image = read_image(Path(path))
+            face = engine.analyzer.best_face(image)
+            if face is None:
+                raise ValueError(f"No face found in rotation source '{Path(path).name}'.")
+            faces.append(face)
+        return faces
+
+    def _preview(self, job: PreviewRequest) -> None:
+        """Swap one sample frame and return it. Does not encode a video."""
+        draft = job.swap.fast_draft_preview
+        engine = self._engine_for(job.swap.execution, enhance=False if draft else job.swap.enhance)
+        self._configure(engine, job.swap, preview=True)
+        self.status.emit("Swapping this frame…")
+        mappings = build_mappings(engine, job.swap)
+        frame = read_frame_at(Path(job.swap.video_path), job.timestamp_s)
+        swapped = swap_frame(
+            engine, frame, mappings, scale=job.swap.scale, time_s=job.timestamp_s
+        )
+        change = roi_mean_change(frame, swapped, getattr(engine, "last_boxes", []))
+        wiped = engine.stats.faces_wiped > 0 and engine.stats.faces_swapped == 0
+        unchanged = wiped or engine.stats.faces_swapped == 0 or change < MIN_ROI_CHANGE
+        if wiped or (engine.stats.faces_swapped > 0 and change < MIN_ROI_CHANGE):
+            note = (
+                "The paste mask wiped this swap, so the frame still looks original. "
+                "Turn Precise edges off and preview again. "
+                "A small face that changes by about 8 inside the face box is a real swap and is kept."
+            )
+        elif engine.stats.faces_swapped == 0:
+            note = (
+                "No face was swapped on this frame, so the preview still looks like the original. "
+                "Move the ref-frame slider until a face is listed, use a clearer source photo, "
+                "or lower the match threshold and Min face size."
+            )
+        else:
+            note = (
+                f"Preview ready. The face changed (face-region difference {change:.0f}). "
+                "A small face barely moves the full frame — use Before / after to see it, then press Swap."
+            )
+        self.preview_ready.emit(frame, swapped, note, unchanged)
+
+    def _swap(self, job: SwapRequest) -> None:
+        engine = self._engine_for(job.execution, job.enhance)
+        self._configure(engine, job, preview=False)
+        self.status.emit("Building face mappings…")
+        mappings = build_mappings(engine, job)
+        self.status.emit(f"Swapping {len(mappings)} mapping(s)…")
+
+        def _progress(done: int, total: int) -> None:
+            self.swap_progress.emit(done, total)
+
+        target = Path(job.video_path)
+        if target.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".heic", ".heif"}:
+            from faceswap.video import process_image
+
+            output = process_image(engine, mappings, target, Path(job.output_path))
+        else:
+            output = process_video(
+                engine,
+                mappings,
+                input_path=target,
+                output_path=Path(job.output_path),
+                progress=_progress,
+                keep_audio=job.keep_audio,
+                crf=job.crf,
+                preset=job.preset,
+                cancel_event=self._cancel,
+                scale=job.scale,
+                encoder=getattr(job, "encoder", "auto"),
+                start_s=float(getattr(job, "start_s", 0.0) or 0.0),
+                end_s=float(getattr(job, "end_s", 0.0) or 0.0),
+                output_height=int(getattr(job, "output_height", 0) or 0),
+            )
+        stage_line = getattr(engine.stats, "stage_line", None)
+        if callable(stage_line):
+            self.status.emit("Timings: " + stage_line())
+        stats = engine.stats
+        summary = (
+            f"Frames {stats.frames} · faces detected {stats.faces_detected} · "
+            f"swapped {stats.faces_swapped} · unmatched {stats.faces_unmatched}"
+        )
+        if stats.faces_held:
+            summary += f" · held through {stats.faces_held} softer frame(s)"
+        summary += " " + _quality_note(stats)
+        self.swap_finished.emit(str(output), summary)

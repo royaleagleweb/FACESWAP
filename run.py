@@ -1,4 +1,11 @@
-"""Top-level entry point: `python run.py swap ...` or `python run.py ui`."""
+"""Videoswa entry point.
+
+Open the desktop window:
+    python run.py
+
+Command-line swap:
+    python run.py swap -t input.mp4 --pair alice.jpg=ref_alice.jpg -o out.mp4
+"""
 
 from faceswap.cli import main
 
