@@ -86,22 +86,35 @@ def test_pixel_boost_tile_counts_and_reassembly() -> None:
 
 
 def test_source_rank_prefers_the_clearer_face() -> None:
-    from faceswap.face_analyzer import Face, choose_source_face
+    from faceswap.face_analyzer import Face, FaceAnalyzer, choose_source_face
 
     larger = Face(
         bbox=np.array([0, 0, 136, 136], dtype=np.float32),
         kps=np.zeros((5, 2), dtype=np.float32),
-        embedding=np.ones(4, dtype=np.float32),
+        embedding=np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
         det_score=0.734,
     )
     clearer = Face(
-        bbox=np.array([0, 0, 124, 124], dtype=np.float32),
-        kps=np.zeros((5, 2), dtype=np.float32),
-        embedding=np.ones(4, dtype=np.float32),
+        bbox=np.array([10, 0, 134, 124], dtype=np.float32),
+        kps=np.ones((5, 2), dtype=np.float32),
+        embedding=np.array([0.0, 1.0, 0.0, 0.0], dtype=np.float32),
         det_score=0.865,
     )
-    assert choose_source_face([larger, clearer], None) is clearer
-    assert choose_source_face([larger, clearer], 0) is larger
+    tiny = Face(
+        bbox=np.array([40, 40, 60, 63], dtype=np.float32),
+        kps=np.full((5, 2), 2.0, dtype=np.float32),
+        embedding=np.array([0.0, 0.0, 1.0, 0.0], dtype=np.float32),
+        det_score=0.388,
+    )
+    faces = [larger, clearer, tiny]
+    assert choose_source_face(faces, None) is clearer
+    assert choose_source_face(faces, 0) is larger
+    analyzer = FaceAnalyzer.__new__(FaceAnalyzer)
+    image = np.zeros((32, 32, 3), dtype=np.uint8)
+    picked = analyzer._keep_source_faces(image, faces)
+    assert picked is clearer
+    assert analyzer.last_source_faces[1] is clearer
+    assert len(analyzer.last_source_faces) == 3
 
 
 def test_paste_rejects_a_degenerate_matrix() -> None:

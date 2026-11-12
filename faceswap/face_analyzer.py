@@ -19,9 +19,13 @@ from .providers import (
 from .utils import logger
 
 
-@dataclass
+@dataclass(eq=False)
 class Face:
-    """A detected face with its identity embedding and geometry."""
+    """A detected face with its identity embedding and geometry.
+
+    Equality is identity. The numpy fields cannot be compared with ``==``:
+    that returns an array and raises ``ValueError`` inside ``list.index``.
+    """
     bbox: np.ndarray            # (4,) xyxy
     kps: np.ndarray             # (5, 2) landmarks
     embedding: np.ndarray       # (512,)
@@ -288,8 +292,8 @@ class FaceAnalyzer:
     def _keep_source_faces(self, image: np.ndarray, faces: List[Face]) -> Face:
         self.last_source_faces = list(faces)
         self.last_source_image = image
-        winner = choose_source_face(faces, None)
-        index = faces.index(winner)
+        index = source_choice_index(faces, None)
+        winner = faces[index]
         span = int(max(winner.bbox[2] - winner.bbox[0], winner.bbox[3] - winner.bbox[1]))
         logger.info(
             "source pick %d face(s), default index %d score=%.3f size=%dpx (largest score x size)",
@@ -332,10 +336,17 @@ def source_rank(face: Face) -> float:
     return span * max(float(face.det_score), 0.05)
 
 
-def choose_source_face(faces: List[Face], index: Optional[int]) -> Face:
+def source_choice_index(faces: List[Face], index: Optional[int]) -> int:
+    """Which face to use. Never calls ``list.index``; Face fields are arrays."""
+    if not faces:
+        raise ValueError("No faces to choose from.")
     if index is not None and 0 <= int(index) < len(faces):
-        return faces[int(index)]
-    return max(faces, key=source_rank)
+        return int(index)
+    return max(range(len(faces)), key=lambda item: source_rank(faces[item]))
+
+
+def choose_source_face(faces: List[Face], index: Optional[int]) -> Face:
+    return faces[source_choice_index(faces, index)]
 
 
 def _scale_max_side(image: np.ndarray, max_side: int) -> np.ndarray:
