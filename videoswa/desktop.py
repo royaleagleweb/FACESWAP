@@ -640,7 +640,7 @@ class MainWindow(QMainWindow):
         self.trim_start = QDoubleSpinBox()
         self.trim_end = QDoubleSpinBox()
         for spin in (self.trim_start, self.trim_end):
-            spin.setRange(0, 300)
+            spin.setRange(0, 600)
             spin.setDecimals(1)
             spin.setSuffix(" s")
         self.trim_start.setPrefix("Start ")
@@ -1002,7 +1002,7 @@ class MainWindow(QMainWindow):
         return info
 
     def load_video(self, video: Path) -> VideoInfo:
-        """Probe a video and keep it only when it is within the 5-minute limit."""
+        """Probe a video and keep it only when it is within the 10-minute limit."""
         info = assert_duration_allowed(video)
         self._video = video
         self._info = info

@@ -57,7 +57,7 @@ def test_removed_ui_command_points_at_desktop() -> None:
     assert main(["ui"]) == 2
 
 
-def test_window_rejects_video_over_five_minutes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_window_rejects_video_over_ten_minutes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from PySide6.QtWidgets import QApplication
     from videoswa.desktop import MainWindow
 

@@ -41,7 +41,7 @@ A new clip, in order:
 
 1. **Add face(s)**. JPG, PNG, and HEIC work. A photo with no face is rejected
    and the window tells you to pick a clearer one.
-2. **Open target video**. Anything longer than **5 minutes** is rejected
+2. **Open target video**. Anything longer than **10 minutes** is rejected
    immediately. Videoswa detects faces on that frame and, if the frame is
    empty, samples nearby times and parks the slider on the first face it finds.
 3. The face list fills in on its own (or click **Detect faces**). Side and
@@ -392,7 +392,7 @@ python run.py swap -t party.mp4 --pair alice.jpg=ref_alice.jpg --pair bob.jpg=re
 | `--no-audio` | Drop the original audio track |
 | `--crf 18 --preset medium` | x264 quality and speed |
 
-Videos longer than 5 minutes are rejected here too, before models load.
+Videos longer than 10 minutes are rejected here too, before models load.
 
 ## Face coverage
 
@@ -508,7 +508,7 @@ pytest
 
 The suite covers the TensorRT → CUDA → DirectML → CPU provider order,
 Windows DirectML when `nvinfer` is missing, CUDA conv failures falling back
-to CPU, the object mask (`_occ_mask`) on a normal swap, the 5-minute
+to CPU, the object mask (`_occ_mask`) on a normal swap, the 10-minute
 rejection (no frames swapped), cancel, gender labels, single-face versus
 per-face mapping, multi-face matching, and that the desktop window opens on
 Single face with full beard coverage and the object mask on. It does not
@@ -532,7 +532,7 @@ requirements-windows-directml.txt
 
 ## Troubleshooting
 
-- **Video is too long.** Trim it under 5 minutes. The check uses `ffprobe`
+- **Video is too long.** Trim it under 10 minutes. The check uses `ffprobe`
   when it is installed, otherwise frame count divided by frame rate.
 - **Duration unknown.** Install FFmpeg so `ffprobe` is on PATH, or re-encode
   the file to MP4. The swap will not start without a duration.

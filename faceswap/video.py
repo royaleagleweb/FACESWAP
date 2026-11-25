@@ -20,7 +20,13 @@ from .core import FaceMapping, FaceSwapEngine, SwapStats
 from .utils import OUTPUTS_DIR, TEMP_DIR, logger
 
 # Videoswa refuses anything longer than this before a swap starts.
-MAX_VIDEO_SECONDS = 5 * 60
+MAX_VIDEO_SECONDS = 10 * 60
+# A 10-minute 1080p clip is about 18,000 frames. These queues are the only
+# frames kept in memory. The encoder writes each frame to a temp file and
+# drops it. Do not raise these to hold the whole video.
+PIPELINE_DECODE_DEPTH = 3
+PIPELINE_DETECT_DEPTH = 2
+PIPELINE_ENCODE_DEPTH = 2
 VIDEO_SUFFIXES = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"}
 
 
@@ -38,14 +44,14 @@ class VideoTooLongError(ValueError):
 
 
 class VideoDurationUnknownError(ValueError):
-    """Duration could not be read, so the 5-minute limit could not be applied."""
+    """Duration could not be read, so the 10-minute limit could not be applied."""
 
     def __init__(self, path: Path) -> None:
         self.path = Path(path)
         super().__init__(
             f"Could not determine how long '{self.path.name}' is. "
             "Videoswa will not start a swap without a duration, because videos "
-            "longer than 5 minutes are rejected. Install FFmpeg (ffprobe) and "
+            "longer than 10 minutes are rejected. Install FFmpeg (ffprobe) and "
             "try again, or re-encode the file to MP4."
         )
 
@@ -175,7 +181,7 @@ def assert_duration_allowed(
     if limit_s is None:
         limit_s = MAX_VIDEO_SECONDS
     info = probe(path)
-    # A few milliseconds of container rounding must not reject a 5:00 file.
+    # A few milliseconds of container rounding must not reject a 10:00 file.
     if info.duration_s > limit_s + 0.05:
         raise VideoTooLongError(info.duration_s, limit_s)
     return info
@@ -485,9 +491,9 @@ def _pipeline_frames(
     swaps them. A cancel or a swap error does not leave the final MP4 behind;
     the caller raises before the ffmpeg mux.
     """
-    decode_q: queue.Queue = queue.Queue(maxsize=3)
-    detect_q: queue.Queue = queue.Queue(maxsize=2)
-    encode_q: queue.Queue = queue.Queue(maxsize=2)
+    decode_q: queue.Queue = queue.Queue(maxsize=PIPELINE_DECODE_DEPTH)
+    detect_q: queue.Queue = queue.Queue(maxsize=PIPELINE_DETECT_DEPTH)
+    encode_q: queue.Queue = queue.Queue(maxsize=PIPELINE_ENCODE_DEPTH)
     stop = threading.Event()
     errors: list[BaseException] = []
     cancelled = {"value": False}

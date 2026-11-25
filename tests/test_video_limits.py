@@ -1,4 +1,4 @@
-"""The 5-minute guard runs before any frame is swapped."""
+"""The 10-minute guard runs before any frame is swapped."""
 
 from __future__ import annotations
 
@@ -12,6 +12,9 @@ import pytest
 from faceswap.core import SwapStats
 from faceswap.video import (
     MAX_VIDEO_SECONDS,
+    PIPELINE_DECODE_DEPTH,
+    PIPELINE_DETECT_DEPTH,
+    PIPELINE_ENCODE_DEPTH,
     SwapCancelled,
     VideoTooLongError,
     assert_duration_allowed,
@@ -49,10 +52,10 @@ def test_short_video_is_allowed(tmp_path: Path) -> None:
     assert info.duration_s > 0
 
 
-def test_over_five_minutes_is_rejected_before_swap(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_over_ten_minutes_is_rejected_before_swap(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     path = tmp_path / "long.mp4"
     _write_video(path, frames=4, fps=10)
-    monkeypatch.setattr("faceswap.video._ffprobe_duration", lambda _path: 5 * 60 + 1)
+    monkeypatch.setattr("faceswap.video._ffprobe_duration", lambda _path: float(MAX_VIDEO_SECONDS) + 1)
     engine = _DummyEngine()
     with pytest.raises(VideoTooLongError, match="Nothing was processed"):
         process_video(engine, [], path, output_path=tmp_path / "out.mp4")
@@ -60,7 +63,7 @@ def test_over_five_minutes_is_rejected_before_swap(tmp_path: Path, monkeypatch: 
     assert not (tmp_path / "out.mp4").exists()
 
 
-def test_exactly_five_minutes_is_allowed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_exactly_ten_minutes_is_allowed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     path = tmp_path / "edge.mp4"
     _write_video(path)
     monkeypatch.setattr("faceswap.video._ffprobe_duration", lambda _path: float(MAX_VIDEO_SECONDS))
@@ -100,6 +103,14 @@ def test_cancel_writes_nothing(tmp_path: Path) -> None:
         )
     assert not (tmp_path / "out.mp4").exists()
     assert engine.calls == 1
+
+
+def test_pipeline_queues_hold_a_handful_of_frames() -> None:
+    """A 10-minute 1080p file must not be buffered. Only a few frames are in flight."""
+    assert MAX_VIDEO_SECONDS == 10 * 60
+    assert PIPELINE_DECODE_DEPTH <= 3
+    assert PIPELINE_DETECT_DEPTH <= 2
+    assert PIPELINE_ENCODE_DEPTH <= 2
 
 
 def test_half_resolution_swap_returns_the_original_size() -> None:
