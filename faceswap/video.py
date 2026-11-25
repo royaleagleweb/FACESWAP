@@ -388,6 +388,7 @@ def process_video(
             raise SwapCancelled("Swap cancelled. No output file was written.")
 
         chosen = resolve_encoder(encoder)
+        logger.info("Encoder %s", chosen)
         if keep_audio and info.has_audio and shutil.which("ffmpeg"):
             _mux_audio(
                 tmp_video,

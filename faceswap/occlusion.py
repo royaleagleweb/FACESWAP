@@ -272,6 +272,31 @@ _IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 _IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
 
+def session_masks(session, crops: list[np.ndarray], *, occluder: bool) -> list[Optional[np.ndarray]]:
+    """Run one mask model on several face crops. One batch when the session allows it."""
+    if not crops:
+        return []
+    blobs = [_model_input(session, crop, imagenet=not occluder) for crop in crops]
+    stacked = np.concatenate(blobs, axis=0)
+    name = session.get_inputs()[0].name
+    outputs = None
+    if stacked.shape[0] > 1 and getattr(session, "_videoswa_mask_batch", True):
+        try:
+            outputs = session.run(None, {name: stacked})[0]
+            session._videoswa_mask_batch = True
+        except Exception:
+            session._videoswa_mask_batch = False
+            outputs = None
+    masks: list[Optional[np.ndarray]] = []
+    if outputs is None:
+        for crop in crops:
+            masks.append(_session_mask(session, crop, occluder=occluder))
+        return masks
+    for index in range(outputs.shape[0]):
+        masks.append(_mask_from_output(outputs[index:index + 1], occluder=occluder))
+    return masks
+
+
 def _session_mask(session, crop_bgr: np.ndarray, *, occluder: bool) -> Optional[np.ndarray]:
     try:
         blob = _model_input(session, crop_bgr, imagenet=not occluder)
@@ -280,6 +305,10 @@ def _session_mask(session, crop_bgr: np.ndarray, *, occluder: bool) -> Optional[
     except Exception as exc:
         logger.warning("Occlusion model failed: %s", exc)
         return None
+    return _mask_from_output(output, occluder=occluder)
+
+
+def _mask_from_output(output, *, occluder: bool) -> Optional[np.ndarray]:
     array = np.asarray(output)
     if not occluder and array.ndim == 4 and array.shape[1] >= 19:
         classes = np.argmax(array[0], axis=0).astype(np.int32)

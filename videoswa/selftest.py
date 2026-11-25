@@ -25,6 +25,7 @@ def run_selftest(argv: list[str]) -> int:
     parser.add_argument("photo", type=Path)
     parser.add_argument("video", type=Path)
     parser.add_argument("--frames", type=int, default=30)
+    parser.add_argument("--faces", type=int, default=1, help="Repeat the detected face this many times")
     parser.add_argument("--out", type=Path, default=None)
     args = parser.parse_args(argv)
     out_dir = args.out or (log_file_path().parent / "selftest")
@@ -32,7 +33,14 @@ def run_selftest(argv: list[str]) -> int:
     lines: list[str] = [f"log: {log_file_path()}"]
     ok = True
     try:
-        ok = _run(args.photo, args.video, max(1, int(args.frames)), out_dir, lines) and ok
+        ok = _run(
+            args.photo,
+            args.video,
+            max(1, int(args.frames)),
+            out_dir,
+            lines,
+            faces=max(1, int(args.faces)),
+        ) and ok
     except Exception:
         ok = False
         text = traceback.format_exc()
@@ -46,7 +54,7 @@ def run_selftest(argv: list[str]) -> int:
     return 0 if ok else 1
 
 
-def _run(photo: Path, video: Path, frames: int, out_dir: Path, lines: list[str]) -> bool:
+def _run(photo: Path, video: Path, frames: int, out_dir: Path, lines: list[str], faces: int = 1) -> bool:
     from faceswap.core import FaceSwapEngine
     from faceswap.face_analyzer import FaceAnalyzer
     from faceswap.swapper import FaceSwapper
@@ -130,6 +138,11 @@ def _run(photo: Path, video: Path, frames: int, out_dir: Path, lines: list[str])
         lines.append(f"warmup_det320: skipped ({exc})")
     warmup_ms = (_time.perf_counter() - warm_started) * 1000.0
     lines.append(f"warmup: {warmup_ms:.0f}ms once (InSwapper batch-1 + XSeg + det 320, not in per-frame swap)")
+    if faces > 1:
+        from videoswa.bench import _fan_out_faces
+
+        _fan_out_faces(analyzer, faces)
+        lines.append(f"faces: repeating the detected person {faces} times")
     end_s = 0.0
     if info.fps > 0:
         end_s = min(float(info.duration_s), frames / float(info.fps))
@@ -154,6 +167,11 @@ def _run(photo: Path, video: Path, frames: int, out_dir: Path, lines: list[str])
     if stats.miss_log:
         lines.append("misses: " + " | ".join(stats.miss_log[:8]))
     lines.append(f"mp4: {output}")
+    if faces > 1 and stats.faces_swapped < stats.frames:
+        lines.append(
+            f"swap: FAIL multi-face swapped {stats.faces_swapped} times across {stats.frames} frames"
+        )
+        ok = False
     if stats.faces_swapped <= 0:
         lines.append("swap: FAIL no frame was swapped")
         ok = False

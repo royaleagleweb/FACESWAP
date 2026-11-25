@@ -212,7 +212,7 @@ def test_laptop_preset_is_the_fast_default() -> None:
     assert laptop["enhance"] is False
     assert laptop["detect_every_other"] is True
     assert laptop["fast_draft_preview"] is True
-    assert quality_preset("quality")["pixel_boost"] == 512
+    assert quality_preset("quality")["pixel_boost"] == 256
 
 
 def test_quality_presets_cover_fast_balanced_and_quality() -> None:
@@ -230,7 +230,9 @@ def test_quality_presets_cover_fast_balanced_and_quality() -> None:
     assert balanced["detect_every_other"] is True
     assert balanced["detect_stride"] == 3
     assert quality_preset("laptop")["detect_stride"] == 3
-    assert quality["pixel_boost"] == 512
+    assert quality["pixel_boost"] == 256
+    assert balanced["large_face_px"] == 180
+    assert balanced["skip_tiny_px"] == 40
     assert quality["precise_edges"] is True
     assert quality["fast_draft_preview"] is False
     assert quality["detect_every_other"] is False

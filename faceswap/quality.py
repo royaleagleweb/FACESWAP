@@ -41,7 +41,7 @@ def quality_preset(name: str) -> dict:
         }
     if key == "quality":
         return {
-            "pixel_boost": 512,
+            "pixel_boost": 256,
             "precise_edges": True,
             "fast_draft_preview": False,
             "detect_every_other": False,
@@ -54,11 +54,13 @@ def quality_preset(name: str) -> dict:
         }
     return {
         "pixel_boost": 128,
+        "large_face_px": 180,
         "precise_edges": False,
         "fast_draft_preview": True,
         "detect_every_other": True,
         "detect_stride": 3,
         "enhance": True,
+        "skip_tiny_px": 40,
         "color_match": 60,
         "object_mask": True,
         "restorer": "gfpgan",

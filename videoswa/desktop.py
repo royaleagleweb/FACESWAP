@@ -379,8 +379,14 @@ class MainWindow(QMainWindow):
         self.identity_btn.clicked.connect(self._add_identity_photos)
         form.addWidget(self.identity_btn)
         self.identity_count = QLabel("Identity photos: 0/5")
+        self.identity_slider = QSlider(Qt.Orientation.Horizontal)
+        self.identity_slider.setRange(0, 100)
+        self.identity_slider.setValue(100)
+        self.identity_slider.setToolTip("100 keeps the source identity. Lower mixes back toward the person in the video.")
         self.identity_count.setObjectName("Muted")
         form.addWidget(self.identity_count)
+        form.addWidget(QLabel("Identity strength"))
+        form.addWidget(self.identity_slider)
         gender_row = QHBoxLayout()
         male_btn = QPushButton("Set gender Male")
         female_btn = QPushButton("Set gender Female")
@@ -597,6 +603,7 @@ class MainWindow(QMainWindow):
         self.restorer = QComboBox()
         self.restorer.addItem("GFPGAN", "gfpgan")
         self.restorer.addItem("CodeFormer", "codeformer")
+        self.restorer.addItem("GPEN ONNX if present, else GFPGAN", "gpen")
         self.restorer.setToolTip(
             "CodeFormer downloads codeformer.pth on first use. "
             "Fidelity 0 restores harder. Fidelity 1 stays closer to the swap."
@@ -704,8 +711,11 @@ class MainWindow(QMainWindow):
         self.pixel_boost = QComboBox()
         self.pixel_boost.addItem("128 — one pass", 128)
         self.pixel_boost.addItem("256 — four passes", 256)
+        self.pixel_boost.addItem("384 — nine passes", 384)
         self.pixel_boost.addItem("512 — sharpest", 512)
         self.pixel_boost.setCurrentIndex(0)
+        self._large_face_px = 180
+        self._skip_tiny_px = 40
         self.pixel_boost.setToolTip(
             "InSwapper is 128px. 256 and 512 split the aligned face into 128 tiles, "
             "swap each one, and stitch them. Fast draft preview stays at 128."
@@ -1536,6 +1546,9 @@ class MainWindow(QMainWindow):
             sharpen=self.sharpen_slider.value() / 100.0,
             restore_strength=self.restore_slider.value() / 100.0,
             pixel_boost=int(self.pixel_boost.currentData()),
+            large_face_px=int(getattr(self, "_large_face_px", 0) or 0),
+            skip_tiny_px=int(getattr(self, "_skip_tiny_px", 40) or 0),
+            identity_strength=self.identity_slider.value() / 100.0 if hasattr(self, "identity_slider") else 1.0,
             restorer=str(self.restorer.currentData()),
             codeformer_fidelity=self.fidelity_slider.value() / 100.0,
             enhance_every=int(self.enhance_every.value()) if self.enhance.isChecked() else 1,
@@ -1681,6 +1694,8 @@ class MainWindow(QMainWindow):
         self.object_mask.setChecked(bool(chosen["object_mask"]))
         self._set_combo(self.coverage, "full")
         self._set_combo(self.pixel_boost, int(chosen["pixel_boost"]))
+        self._large_face_px = int(chosen.get("large_face_px", 0) or 0)
+        self._skip_tiny_px = int(chosen.get("skip_tiny_px", 40) or 0)
         self._set_combo(self.restorer, chosen["restorer"])
         self.precise_edges.setChecked(bool(chosen["precise_edges"]))
         self.fast_draft.setChecked(bool(chosen["fast_draft_preview"]))

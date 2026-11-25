@@ -450,6 +450,7 @@ class EngineWorker(QThread):
         engine.similarity_threshold = job.similarity
         engine.coverage = job.coverage
         engine.min_face_px = int(job.min_face_px)
+        engine.skip_tiny_px = int(getattr(job, "skip_tiny_px", 0) or 0)
         if preview or not job.detect_every_other:
             engine.detect_stride = 1
         else:
@@ -470,6 +471,8 @@ class EngineWorker(QThread):
         if preview and job.fast_draft_preview:
             boost = 128
         swapper.pixel_boost = boost
+        swapper.large_face_px = 0 if preview else int(getattr(job, "large_face_px", 0) or 0)
+        swapper.identity_strength = float(getattr(job, "identity_strength", 1.0) or 1.0)
         swapper.restorer = str(getattr(job, "restorer", "gfpgan") or "gfpgan")
         swapper.enhance_every = max(1, int(getattr(job, "enhance_every", 1) or 1))
         swapper.keep_mouth = bool(getattr(job, "keep_mouth", False))

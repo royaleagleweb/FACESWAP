@@ -10,6 +10,8 @@ import time
 import traceback
 from pathlib import Path
 
+import numpy as np
+
 from faceswap.diag import configure_logging, log_file_path
 from faceswap.quality import quality_preset
 from faceswap.video import probe, process_video, reset_stats
@@ -22,20 +24,28 @@ def run_bench(argv: list[str]) -> int:
     parser.add_argument("video", type=Path)
     parser.add_argument("--frames", type=int, default=20)
     parser.add_argument("--presets", default="laptop,balanced")
+    parser.add_argument("--faces", default="1,2,3", help="Comma-separated face counts to time")
     args = parser.parse_args(argv)
     if not args.photo.is_file() or not args.video.is_file():
         print("FAIL missing photo or video")
         return 1
     print("Preparing GPU, first time only. TensorRT can take several minutes. Later runs use the cache.")
     try:
-        return _run(args.photo, args.video, max(5, int(args.frames)), [part.strip() for part in args.presets.split(",") if part.strip()])
+        counts = [max(1, int(part)) for part in args.faces.split(",") if part.strip()]
+        return _run(
+            args.photo,
+            args.video,
+            max(5, int(args.frames)),
+            [part.strip() for part in args.presets.split(",") if part.strip()],
+            counts or [1],
+        )
     except Exception:
         print(traceback.format_exc())
         print("FAIL")
         return 1
 
 
-def _run(photo: Path, video: Path, frames: int, presets: list[str]) -> int:
+def _run(photo: Path, video: Path, frames: int, presets: list[str], counts: list[int]) -> int:
     from faceswap.core import FaceSwapEngine
     from faceswap.face_analyzer import FaceAnalyzer
     from faceswap.swapper import FaceSwapper, warm_models
@@ -62,6 +72,7 @@ def _run(photo: Path, video: Path, frames: int, presets: list[str]) -> int:
     out_dir = log_file_path().parent / "bench"
     out_dir.mkdir(parents=True, exist_ok=True)
     for name in presets:
+      for face_count in counts:
         chosen = quality_preset(name)
         swapper.pixel_boost = int(chosen["pixel_boost"])
         swapper.precise_edges = bool(chosen["precise_edges"])
@@ -85,6 +96,7 @@ def _run(photo: Path, video: Path, frames: int, presets: list[str]) -> int:
             video_det_size=320,
         )
         mappings = build_mappings(engine, request)
+        _fan_out_faces(analyzer, face_count)
         reset_stats(engine)
         started = time.perf_counter()
         process_video(
@@ -102,12 +114,42 @@ def _run(photo: Path, video: Path, frames: int, presets: list[str]) -> int:
         fps = counted / elapsed if elapsed > 0 else 0.0
         pipeline = _pipeline_ms(stats)
         print(
-            f"{name}: {pipeline:.1f} ms/frame pipeline, {1000.0 / pipeline:.1f} fps from stages, "
-            f"{fps:.1f} fps wall, frames={counted} det={stats.detector_frames} tracked={stats.cached_frames}"
+            f"{name} faces={face_count}: {pipeline:.1f} ms/frame pipeline, {1000.0 / pipeline:.1f} fps from stages, "
+            f"{fps:.1f} fps wall, frames={counted} swapped={stats.faces_swapped} "
+            f"det={stats.detector_frames} tracked={stats.cached_frames}"
         )
         print(f"  {stats.stage_line()}")
     print("enhance: off in --bench so GFPGAN is not in the number")
     return 0
+
+
+def _fan_out_faces(analyzer, count: int) -> None:
+    """Repeat the first detected face so a one-person clip times 2 and 3 faces."""
+    if getattr(analyzer, "_videoswa_raw_analyze", None) is None:
+        analyzer._videoswa_raw_analyze = analyzer.analyze
+    raw = analyzer._videoswa_raw_analyze
+
+    def analyze(image):
+        found = list(raw(image) or [])
+        if count <= 1 or not found:
+            return found
+        return _clone_faces(found[0], count, image.shape)
+
+    analyzer.analyze = analyze
+
+
+def _clone_faces(face, count: int, shape) -> list:
+    from dataclasses import replace
+
+    clones = []
+    height, width = shape[:2]
+    for index in range(count):
+        shift = np.array([index * 24.0, 0.0], dtype=np.float32)
+        bbox = np.asarray(face.bbox, dtype=np.float32).copy()
+        bbox[0::2] = np.clip(bbox[0::2] + shift[0], 0, max(1, width - 1))
+        kps = np.asarray(face.kps, dtype=np.float32) + shift
+        clones.append(replace(face, bbox=bbox, kps=kps))
+    return clones
 
 
 def _image(photo: Path):

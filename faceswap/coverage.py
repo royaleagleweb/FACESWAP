@@ -308,6 +308,8 @@ def paste_swapped_face(
     roi = out[y0:y1, x0:x1].astype(np.float32)
     weight = weight[:, :, None]
     warped_f = warped.astype(np.float32)
+    if color_match is not None and float(color_match) > 0.0:
+        warped_f = lab_transfer(warped_f, roi, weight[..., 0], float(color_match))
     if mode == COVERAGE_FULL:
         warped_f = match_edge_color(
             warped_f,
@@ -320,6 +322,31 @@ def paste_swapped_face(
     blended = warped_f * weight + roi * (1.0 - weight)
     out[y0:y1, x0:x1] = np.clip(blended, 0, 255).astype(np.uint8)
     return out
+
+
+def lab_transfer(swapped: np.ndarray, original: np.ndarray, alpha: np.ndarray, amount: float) -> np.ndarray:
+    """Match LAB mean and std of the swapped face to the target skin.
+
+    ``amount`` is 0..1. The feathered mask still blends the seam.
+    """
+    gain = float(np.clip(amount, 0.0, 1.0))
+    if gain <= 0.01:
+        return swapped
+    mask = alpha > 0.55
+    if int(np.count_nonzero(mask)) < 32:
+        return swapped
+    src = np.clip(swapped, 0, 255).astype(np.uint8)
+    dst = np.clip(original, 0, 255).astype(np.uint8)
+    src_lab = cv2.cvtColor(src, cv2.COLOR_BGR2LAB).astype(np.float32)
+    dst_lab = cv2.cvtColor(dst, cv2.COLOR_BGR2LAB).astype(np.float32)
+    for channel in range(3):
+        src_vals = src_lab[:, :, channel][mask]
+        dst_vals = dst_lab[:, :, channel][mask]
+        src_std = float(src_vals.std()) + 1e-3
+        dst_std = float(dst_vals.std()) + 1e-3
+        src_lab[:, :, channel] = (src_lab[:, :, channel] - float(src_vals.mean())) * (dst_std / src_std) + float(dst_vals.mean())
+    transferred = cv2.cvtColor(np.clip(src_lab, 0, 255).astype(np.uint8), cv2.COLOR_LAB2BGR).astype(np.float32)
+    return swapped * (1.0 - gain) + transferred * gain
 
 
 def match_edge_color(

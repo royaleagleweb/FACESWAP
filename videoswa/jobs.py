@@ -58,6 +58,8 @@ class SwapRequest:
     detect_stride: int = 3
     video_det_size: int = 320
     min_face_px: int = 0
+    skip_tiny_px: int = 40
+    identity_strength: float = 1.0
     rotation_mode: str = "per_person"
     rotation_seconds: float = 10.0
     rotation_paths: list[Path] = field(default_factory=list)
@@ -71,6 +73,7 @@ class SwapRequest:
     sharpen: float = 0.12
     restore_strength: float = 0.65
     pixel_boost: int = 128
+    large_face_px: int = 0
     restorer: str = "gfpgan"
     codeformer_fidelity: float = 0.5
     source_face_index: Optional[int] = None

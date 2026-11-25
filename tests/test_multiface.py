@@ -55,6 +55,51 @@ def test_two_references_swap_independently() -> None:
     assert engine.stats.faces_unmatched == 0
 
 
+def test_tiny_extra_face_is_skipped_when_another_person_is_present() -> None:
+    big = _face([1, 0, 0], 0)
+    big.bbox = np.array([0, 0, 90, 110], dtype=np.float32)
+    tiny = _face([0, 1, 0], 120)
+    swapper = _Swapper()
+    engine = FaceSwapEngine(
+        analyzer=_Analyzer([big, tiny]),
+        swapper=swapper,
+        similarity_threshold=0.2,
+    )
+    engine.skip_tiny_px = 40
+    engine.apply_to_all_when_no_reference = True
+    engine.process_frame(
+        np.zeros((160, 200, 3), dtype=np.uint8),
+        [FaceMapping(source_face=_face([0.2, 0.2, 0.2], 0), reference_face=None)],
+    )
+    assert len(swapper.pairs) == 1
+    assert engine.stats.faces_skipped == 1
+    assert engine.stats.faces_swapped == 1
+
+
+def test_identity_strength_mixes_embeddings() -> None:
+    from faceswap.pixel_boost import apply_identity_strength
+
+    source = _face([1, 0, 0], 0)
+    target = _face([0, 1, 0], 0)
+    mixed = apply_identity_strength(source, target, 0.0)
+    assert mixed.normed_embedding[1] > 0.9
+    same = apply_identity_strength(source, target, 1.0)
+    assert same is source
+
+
+def test_face_batch_stays_off_without_tensorrt() -> None:
+    from faceswap.swapper import face_batch_session
+
+    class _Session:
+        def get_providers(self):
+            return ["CPUExecutionProvider"]
+
+    class _Model:
+        session = _Session()
+
+    assert face_batch_session(_Model()) is None
+
+
 def test_unmatched_person_is_left_alone() -> None:
     alice_ref = _face([1, 0, 0], 0)
     alice_src = _face([1, 0, 0], 0)

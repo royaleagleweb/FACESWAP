@@ -144,6 +144,7 @@ class _FaceTrack:
     landmark_filter: Optional[OneEuroFilter] = None
     last_canvas: Optional[np.ndarray] = None
     last_matrix: Optional[np.ndarray] = None
+    track_id: int = 0
 
 
 @dataclass
@@ -162,6 +163,8 @@ class FaceSwapEngine:
     def __post_init__(self) -> None:
         self.cuda_guard = CudaRuntimeGuard()
         self._tracks: List[_FaceTrack] = []
+        self._next_track_id = 1
+        self.skip_tiny_px = 0
         self._cached_faces: List[Face] = []
         self._detect_tick = 0
         self._from_detector = True
@@ -272,6 +275,7 @@ class FaceSwapEngine:
         touched: set[int] = set()
 
         out = frame_bgr
+        pending = []
         for face in faces:
             decision = decisions.get(id(face))
             if decision is None:
@@ -288,26 +292,13 @@ class FaceSwapEngine:
                 self.stats.faces_unmatched += 1
                 self._miss("gender filter blocked this face")
                 continue
-            begin = getattr(self.swapper, "begin_face", None)
-            if callable(begin):
-                begin(id(track))
-            swap_started = time.perf_counter()
-            out = self.swapper.swap(
-                out, target_face=face, source_face=source, coverage=self.coverage
-            )
-            wall_ms = (time.perf_counter() - swap_started) * 1000.0
-            detail = getattr(self.swapper, "stage_ms", {}) or {}
-            for name, ms in detail.items():
-                self.stats.stage_ms[name] = self.stats.stage_ms.get(name, 0.0) + ms
-            warmup = sum(float(ms) for key, ms in detail.items() if str(key).startswith("warmup"))
-            accounted = sum(float(ms) for key, ms in detail.items() if not str(key).startswith("warmup"))
-            gap = max(0.0, wall_ms - warmup - accounted)
-            self.stats.stage_ms["gap"] = self.stats.stage_ms.get("gap", 0.0) + gap
-            # Warm-up is reported once. It is not part of the per-frame swap time.
-            self.stats.stage_ms["swap"] = self.stats.stage_ms.get("swap", 0.0) + max(0.0, wall_ms - warmup)
-            if hasattr(self.swapper, "stage_ms"):
-                self.swapper.stage_ms = {}
-            if getattr(self.swapper, "paste_wiped", False):
+            tiny = int(getattr(self, "skip_tiny_px", 0) or 0)
+            if tiny and len(faces) > 1 and face_span_px(face.bbox) < tiny:
+                self.stats.faces_skipped += 1
+                self._miss("tiny face skipped in a multi-face frame")
+                continue
+            motion = float(getattr(face, "_videoswa_motion", 99.0) or 99.0)
+            if motion < 1.2 and track.last_canvas is not None and not self._from_detector:
                 replay = self._paste_held(out, track, face)
                 if replay is not None:
                     out = replay
@@ -315,20 +306,61 @@ class FaceSwapEngine:
                     self.stats.faces_held += 1
                     self.last_boxes.append(np.asarray(face.bbox, dtype=np.float32).copy())
                     continue
-                self.stats.faces_wiped += 1
-                self._miss("paste mask removed the swap")
-                logger.warning(
-                    getattr(self.swapper, "last_paste_note", "")
-                    or "The paste mask wiped a swapped face."
+            pending.append((face, source, track, held))
+        many = getattr(self.swapper, "swap_many", None)
+        if pending and callable(many) and len(pending) > 1:
+            swap_started = time.perf_counter()
+            out, oks = many(
+                out,
+                [(face, source, id(track)) for face, source, track, _held in pending],
+                coverage=self.coverage,
+            )
+            wall_ms = (time.perf_counter() - swap_started) * 1000.0
+            self._account_swap(wall_ms)
+            for (face, _source, track, held), ok in zip(pending, oks):
+                self._finish_one(out, face, track, held, ok)
+        else:
+            for face, source, track, held in pending:
+                begin = getattr(self.swapper, "begin_face", None)
+                if callable(begin):
+                    begin(id(track))
+                swap_started = time.perf_counter()
+                out = self.swapper.swap(
+                    out, target_face=face, source_face=source, coverage=self.coverage
                 )
-                continue
-            self._remember_swap(track)
-            self.last_boxes.append(np.asarray(face.bbox, dtype=np.float32).copy())
-            self.stats.faces_swapped += 1
-            if held:
-                self.stats.faces_held += 1
+                self._account_swap((time.perf_counter() - swap_started) * 1000.0)
+                self._finish_one(out, face, track, held, not getattr(self.swapper, "paste_wiped", False))
         self._age_tracks(touched)
         return out
+
+    def _account_swap(self, wall_ms: float) -> None:
+        detail = getattr(self.swapper, "stage_ms", {}) or {}
+        for name, ms in detail.items():
+            self.stats.stage_ms[name] = self.stats.stage_ms.get(name, 0.0) + ms
+        warmup = sum(float(ms) for key, ms in detail.items() if str(key).startswith("warmup"))
+        accounted = sum(float(ms) for key, ms in detail.items() if not str(key).startswith("warmup"))
+        gap = max(0.0, wall_ms - warmup - accounted)
+        self.stats.stage_ms["gap"] = self.stats.stage_ms.get("gap", 0.0) + gap
+        self.stats.stage_ms["swap"] = self.stats.stage_ms.get("swap", 0.0) + max(0.0, wall_ms - warmup)
+        if hasattr(self.swapper, "stage_ms"):
+            self.swapper.stage_ms = {}
+
+    def _finish_one(self, frame, face, track, held: bool, ok: bool) -> None:
+        if not ok:
+            replay = self._paste_held(frame, track, face)
+            if replay is not None:
+                self.stats.faces_swapped += 1
+                self.stats.faces_held += 1
+                self.last_boxes.append(np.asarray(face.bbox, dtype=np.float32).copy())
+                return
+            self.stats.faces_wiped += 1
+            self._miss("paste mask removed the swap")
+            return
+        self._remember_swap(track)
+        self.last_boxes.append(np.asarray(face.bbox, dtype=np.float32).copy())
+        self.stats.faces_swapped += 1
+        if held:
+            self.stats.faces_held += 1
 
     def note_frame(self, index: int) -> None:
         self._frame_index = int(index)
@@ -389,7 +421,9 @@ class FaceSwapEngine:
             bbox = np.asarray(face.bbox, dtype=np.float32).copy()
             bbox[0::2] += float(delta[0])
             bbox[1::2] += float(delta[1])
-            moved.append(replace(face, kps=kps.astype(np.float32), bbox=bbox))
+            moved_face = replace(face, kps=kps.astype(np.float32), bbox=bbox)
+            moved_face._videoswa_motion = float(np.median(np.linalg.norm(shift, axis=1)))
+            moved.append(moved_face)
         self._cached_faces = moved
         return moved
 
@@ -495,14 +529,20 @@ class FaceSwapEngine:
         return None
 
     def _best_track(self, face: Face, claimed: set[int]) -> Optional[_FaceTrack]:
+        """Prefer the same person by overlap, and by embedding when the box jumped."""
         best: Optional[_FaceTrack] = None
-        best_iou = _TRACK_IOU
+        best_score = 0.0
+        face_emb = face.normed_embedding
         for track in self._tracks:
             if track.mapping.reference_face is not None and id(track.mapping) in claimed:
                 continue
             overlap = _bbox_iou(track.bbox, face.bbox)
-            if overlap >= best_iou:
-                best_iou = overlap
+            emb = cosine_similarity(track.embedding, face_emb)
+            if overlap < _TRACK_IOU and emb < 0.45:
+                continue
+            score = overlap + 0.35 * emb
+            if score > best_score:
+                best_score = score
                 best = track
         return best
 
@@ -524,7 +564,10 @@ class FaceSwapEngine:
                 embedding=embedding.copy(),
                 source_face=mapping.source_face,
             )
+            best.track_id = self._next_track_id
+            self._next_track_id += 1
             self._tracks.append(best)
+            logger.info("track %s locked to %s", best.track_id, getattr(mapping, "label", "") or "source")
         else:
             best.bbox = np.asarray(face.bbox, dtype=np.float32).copy()
             mixed = _EMA_KEEP * best.embedding + (1.0 - _EMA_KEEP) * embedding
@@ -554,7 +597,11 @@ class FaceSwapEngine:
         bbox[0::2] += float(delta[0])
         bbox[1::2] += float(delta[1])
         track.bbox = bbox.copy()
-        return replace(face, kps=smoothed.astype(np.float32), bbox=bbox)
+        stabilized = replace(face, kps=smoothed.astype(np.float32), bbox=bbox)
+        motion = getattr(face, "_videoswa_motion", None)
+        if motion is not None:
+            stabilized._videoswa_motion = motion
+        return stabilized
 
     def _remember_swap(self, track: _FaceTrack) -> None:
         canvas = getattr(self.swapper, "last_canvas", None)

@@ -15,7 +15,7 @@ import numpy as np
 from .coverage import template_128
 
 MODEL_SIZE = 128
-PIXEL_BOOST_CHOICES = (128, 256, 512)
+PIXEL_BOOST_CHOICES = (128, 256, 384, 512)
 
 
 def normalize_pixel_boost(value: object) -> int:
@@ -101,18 +101,34 @@ def source_latent(model, source_face) -> np.ndarray:
     return np.ascontiguousarray(latent / norm, dtype=np.float32)
 
 
-def cached_source_latent(model, source_face) -> np.ndarray:
+def apply_identity_strength(source_face, target_face, strength: float):
+    """Blend the source embedding toward the target. 1 keeps the source."""
+    from dataclasses import replace
+
+    strength = float(strength)
+    if strength >= 0.999 or target_face is None:
+        return source_face
+    strength = max(0.0, strength)
+    src = np.asarray(source_face.normed_embedding, dtype=np.float32)
+    dst = np.asarray(target_face.normed_embedding, dtype=np.float32)
+    mixed = strength * src + (1.0 - strength) * dst
+    mixed = mixed / (float(np.linalg.norm(mixed)) + 1e-8)
+    return replace(source_face, embedding=np.ascontiguousarray(mixed, dtype=np.float32))
+
+
+def cached_source_latent(model, source_face, target_face=None, strength: float = 1.0) -> np.ndarray:
     """The emap multiply depends only on the source. Do it once per face."""
     cache = getattr(model, "_videoswa_latents", None)
     if cache is None:
         cache = {}
         model._videoswa_latents = cache
-    key = id(source_face)
+    key = (id(source_face), id(target_face), int(round(float(strength) * 100)))
     found = cache.get(key)
     if found is not None:
         return found
-    latent = source_latent(model, source_face)
-    if len(cache) > 16:
+    face = apply_identity_strength(source_face, target_face, strength)
+    latent = source_latent(model, face)
+    if len(cache) > 32:
         cache.clear()
     cache[key] = latent
     return latent

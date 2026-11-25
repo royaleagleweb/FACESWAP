@@ -51,6 +51,11 @@ class FaceSwapper:
         self.precise_edges = False
         self.allow_restore = bool(enhance)
         self.pixel_boost = 128
+        self.large_face_px = 0
+        self.boost_budget_ms = 40.0
+        self.identity_strength = 1.0
+        self._precomputed = None
+        self._gpen = None
         self.restorer = "gfpgan"
         self.codeformer_fidelity = 0.5
         self._codeformer = None
@@ -143,6 +148,16 @@ class FaceSwapper:
             self._enhance_requested = False
             self._enhancer = None
             self._codeformer = None
+            return None
+        if name == "gpen":
+            from .onnx_restore import gpen_session, gpen_status
+
+            self._gpen = gpen_session(self.execution)
+            logger.info(gpen_status(self._gpen))
+            if self._gpen is None:
+                return self.prepare_restorer(enhance, "gfpgan")
+            self._codeformer = None
+            self._enhancer = None
             return None
         if name == "codeformer":
             self._enhancer = None
@@ -248,19 +263,26 @@ class FaceSwapper:
             split_tiles,
         )
 
-        boost = normalize_pixel_boost(getattr(self, "pixel_boost", 128))
-        prep_started = time.perf_counter()
-        latent = cached_source_latent(self.swapper, source_face)
-        crop, matrix = aligned_crop(frame, align_kps, boost)
-        tiles = [crop] if boost <= 128 else split_tiles(crop)
-        self._add_stage("prep", prep_started)
-        infer_started = time.perf_counter()
-
-        def _swap_tile_batch(tiles: list[np.ndarray]) -> list[np.ndarray]:
-            return forward_bgr_tiles(self.swapper, tiles, latent)
-        outputs = _swap_tile_batch(tiles)
-        swapped = outputs[0] if boost <= 128 else join_tiles(outputs, boost)
-        self._add_stage("inswapper", infer_started)
+        precomputed = getattr(self, "_precomputed", None)
+        if precomputed is not None:
+            swapped, matrix, align_kps, yaw = precomputed
+            self._add_stage("inswapper", time.perf_counter())
+        else:
+            boost = self.boost_for_span(face_span_px(target_face.bbox))
+            prep_started = time.perf_counter()
+            latent = cached_source_latent(
+                self.swapper,
+                source_face,
+                target_face,
+                float(getattr(self, "identity_strength", 1.0) or 1.0),
+            )
+            crop, matrix = aligned_crop(frame, align_kps, boost)
+            tiles = [crop] if boost <= 128 else split_tiles(crop)
+            self._add_stage("prep", prep_started)
+            infer_started = time.perf_counter()
+            outputs = forward_bgr_tiles(self.swapper, tiles, latent)
+            swapped = outputs[0] if boost <= 128 else join_tiles(outputs, boost)
+            self._add_stage("inswapper", infer_started)
         swapped = self._restore_before_paste(swapped, target_face)
         if not paste_back:
             return swapped
@@ -285,9 +307,14 @@ class FaceSwapper:
             face_alpha = coverage_alpha(frame.shape[:2], align_kps, mode, yaw=yaw)
             self._add_stage("geom", geom_started)
             xseg_started = time.perf_counter()
-            neural = models.xseg_keepout(frame, matrix, face_alpha) if models.xseg is not None else None
-            if models.xseg is not None:
+            ready = getattr(self, "_batched_neurals", None)
+            if ready:
+                neural = ready.pop(0)
                 self._add_stage("xseg", xseg_started)
+            else:
+                neural = models.xseg_keepout(frame, matrix, face_alpha) if models.xseg is not None else None
+                if models.xseg is not None:
+                    self._add_stage("xseg", xseg_started)
             precise = None
             if self.precise_edges and models.bisenet is not None:
                 precise_started = time.perf_counter()
@@ -354,7 +381,85 @@ class FaceSwapper:
         self.last_canvas = np.asarray(swapped).copy()
         self.last_matrix = np.asarray(matrix, dtype=np.float64).reshape(2, 3).copy()
         self._add_stage("finish", finish_started)
+        self._recent_ms = float(self.stage_ms.get("inswapper", 0.0)) + float(self.stage_ms.get("blend", 0.0))
         return out
+
+    def boost_for_span(self, span: float) -> int:
+        """128 by default. Quality asks for 256. Balanced may use 256 on a large face."""
+        from .pixel_boost import normalize_pixel_boost
+
+        base = normalize_pixel_boost(getattr(self, "pixel_boost", 128))
+        if base > 128:
+            return base
+        limit = float(getattr(self, "large_face_px", 0) or 0)
+        if limit <= 0 or float(span) < limit:
+            return 128
+        budget = float(getattr(self, "boost_budget_ms", 40.0) or 40.0)
+        recent = float(getattr(self, "_recent_ms", 0.0) or 0.0)
+        if recent == 0.0 or recent <= budget:
+            return 256
+        return 128
+
+    def swap_many(self, frame: np.ndarray, pairs: list, coverage: str = DEFAULT_COVERAGE) -> tuple[np.ndarray, list[bool]]:
+        """Swap several faces. Batch the 128px network call when that engine is faster."""
+        if len(pairs) <= 1:
+            target, source = pairs[0][0], pairs[0][1]
+            if len(pairs[0]) > 2:
+                self.begin_face(pairs[0][2])
+            out = self.swap(frame, target, source, coverage=coverage)
+            return out, [not self.paste_wiped]
+        boosts = [self.boost_for_span(face_span_px(item[0].bbox)) for item in pairs]
+        if any(boost != 128 for boost in boosts):
+            return self._swap_many_serial(frame, pairs, coverage)
+        session = face_batch_session(self.swapper)
+        if session is None:
+            return self._swap_many_serial(frame, pairs, coverage)
+        return self._swap_many_batched(frame, pairs, coverage, session)
+
+    def _swap_many_serial(self, frame, pairs, coverage):
+        out = frame
+        oks = []
+        for item in pairs:
+            target, source = item[0], item[1]
+            if len(item) > 2:
+                self.begin_face(item[2])
+            out = self.swap(out, target, source, coverage=coverage)
+            oks.append(not self.paste_wiped)
+        return out, oks
+
+    def _swap_many_batched(self, frame, pairs, coverage, session):
+        from .pixel_boost import aligned_crop, cached_source_latent
+
+        crops = []
+        latents = []
+        matrices = []
+        prepared = []
+        for item in pairs:
+            target, source = item[0], item[1]
+            raw = np.asarray(target.kps, dtype=np.float32)
+            align = repair_landmarks(raw)
+            latent = cached_source_latent(
+                self.swapper, source, target, float(getattr(self, "identity_strength", 1.0) or 1.0)
+            )
+            crop, matrix = aligned_crop(frame, align, 128)
+            crops.append(crop)
+            latents.append(latent)
+            matrices.append(matrix)
+            prepared.append((target, source, align, float(face_yaw(raw)), item[2] if len(item) > 2 else id(target)))
+        images = _forward_with_session(session, self.swapper, crops, latents)
+        self._batched_neurals = _batch_xseg(self, frame, matrices, prepared)
+        out = frame
+        oks = []
+        for image, (target, source, align, yaw, key), matrix in zip(images, prepared, matrices):
+            self.begin_face(key)
+            self._precomputed = (image, matrix, align, yaw)
+            try:
+                out = self.swap(out, target, source, coverage=coverage)
+            finally:
+                self._precomputed = None
+            oks.append(not self.paste_wiped)
+        self._batched_neurals = None
+        return out, oks
 
     def _restore_before_paste(self, canvas: np.ndarray, target_face: Face) -> np.ndarray:
         """Run GFPGAN or CodeFormer on the aligned swap, then paste that result."""
@@ -394,7 +499,15 @@ class FaceSwapper:
         if side < 256:
             view = cv2.resize(canvas, (256, 256), interpolation=cv2.INTER_CUBIC)
         restored = None
-        if getattr(self, "restorer", "gfpgan") == "codeformer" and self._codeformer is not None:
+        if getattr(self, "restorer", "gfpgan") == "gpen" and getattr(self, "_gpen", None) is not None:
+            from .onnx_restore import restore_gpen
+
+            try:
+                restored = restore_gpen(self._gpen, view, float(getattr(self, "restore_strength", 1.0)))
+            except Exception as exc:
+                logger.debug("GPEN failed before paste: %s", exc)
+                restored = None
+        elif getattr(self, "restorer", "gfpgan") == "codeformer" and self._codeformer is not None:
             from .codeformer import restore_bgr
 
             try:
@@ -566,9 +679,10 @@ def _enable_inswapper_batch(model, providers) -> None:
         shape = (
             f"{image_name}:{{n}}x3x128x128,{id_name}:{{n}}x{id_dim}"
         )
+        trt["trt_max_workspace_size"] = 512 * 1024 * 1024
         trt["trt_profile_min_shapes"] = shape.format(n=1)
-        trt["trt_profile_opt_shapes"] = shape.format(n=4)
-        trt["trt_profile_max_shapes"] = shape.format(n=16)
+        trt["trt_profile_opt_shapes"] = shape.format(n=2)
+        trt["trt_profile_max_shapes"] = shape.format(n=4)
         active = list(model.session.get_providers())
         chosen = []
         options = []
@@ -591,14 +705,123 @@ def _enable_inswapper_batch(model, providers) -> None:
             providers=chosen,
             provider_options=options,
         )
-        model.session = session
+        # Do not replace the fast batch-1 session. A batch-4 engine was slower
+        # (64 ms vs ~7 ms) and took minutes to build. Use this one only after
+        # a two-face measurement says it is faster.
+        single = _time_runs(model.session, model, count=2)
+        batched = _time_runs(session, model, count=1, batch=2)
+        decision = cache / "decision.txt"
+        if single <= 0 or batched > single * 0.95:
+            decision.write_text("off")
+            model._videoswa_face_batch = "off"
+            model._videoswa_batch_ready = True
+            logger.info(
+                "InSwapper batch-2 %.1fms vs two single calls %.1fms. Staying on per-face calls.",
+                batched,
+                single,
+            )
+            return
+        decision.write_text("on")
         model._videoswa_batch_ready = True
-        model._videoswa_batch_ok = True
-        logger.info("InSwapper batch engine ready (batch 1–16) providers=%s", session.get_providers())
+        model._videoswa_batch_session = session
+        model._videoswa_face_batch = "on"
+        logger.info(
+            "InSwapper batch-2 %.1fms beats two single calls %.1fms. Multi-face uses batch 1-4.",
+            batched,
+            single,
+        )
     except Exception as exc:
-        model._videoswa_batch_ready = False
-        model._videoswa_batch_ok = False
-        logger.info("InSwapper stays on batch 1 (%s). Tiles run one after another.", exc)
+        model._videoswa_face_batch = "off"
+        model._videoswa_batch_ready = True
+        try:
+            from .utils import MODELS_DIR
+
+            path = MODELS_DIR / "trt_cache" / "inswapper_batch"
+            path.mkdir(parents=True, exist_ok=True)
+            (path / "decision.txt").write_text("off")
+        except Exception:
+            pass
+        logger.info("InSwapper face batch stays off (%s). Faces run one at a time.", exc)
+
+
+def _time_runs(session, model, count: int, batch: int = 1) -> float:
+    import time
+
+    image = np.zeros((batch, 3, 128, 128), dtype=np.float32)
+    latent = np.zeros((batch, 512), dtype=np.float32)
+    feeds = {model.input_names[0]: image, model.input_names[1]: latent}
+    started = time.perf_counter()
+    for _ in range(count):
+        session.run(model.output_names, feeds)
+    return (time.perf_counter() - started) * 1000.0
+
+
+def _forward_with_session(session, model, tiles, latents):
+    import cv2
+
+    from .pixel_boost import _bgr_from_nchw, forward_bgr_tiles
+
+    blobs = [
+        cv2.dnn.blobFromImage(tile, 1.0 / 255.0, (128, 128), (0.0, 0.0, 0.0), swapRB=True)
+        for tile in tiles
+    ]
+    batch = np.concatenate(blobs, axis=0)
+    latent = np.concatenate([np.asarray(item, dtype=np.float32).reshape(1, -1) for item in latents], axis=0)
+    try:
+        pred = session.run(model.output_names, {model.input_names[0]: batch, model.input_names[1]: latent})[0]
+        return [_bgr_from_nchw(pred[index:index + 1]) for index in range(pred.shape[0])]
+    except Exception as exc:
+        logger.info("Face batch run failed (%s). Using per-face calls.", exc)
+        model._videoswa_face_batch = "off"
+        model._videoswa_batch_session = None
+        return [forward_bgr_tiles(model, [tile], one)[0] for tile, one in zip(tiles, latents)]
+
+
+def _batch_xseg(swapper, frame, matrices, prepared):
+    models = swapper.occlusion_models()
+    if getattr(models, "xseg", None) is None:
+        return None
+    from .coverage import coverage_alpha
+    from .occlusion import _input_hw, _warp_crop, session_masks, warp_into_face
+
+    alphas = [coverage_alpha(frame.shape[:2], item[2], "full", yaw=item[3]) for item in prepared]
+    crops = [_warp_crop(frame, matrix, _input_hw(models.xseg)) for matrix in matrices]
+    masks = session_masks(models.xseg, crops, occluder=True)
+    neurals = []
+    for mask, matrix, alpha in zip(masks, matrices, alphas):
+        neurals.append(None if mask is None else warp_into_face(mask, matrix, frame.shape[:2], alpha))
+    return neurals
+
+
+def face_batch_session(model):
+    """Dynamic batch 1-4 session, or None when per-face calls are faster.
+
+    The stock engine stays in place for a single face. This is not built
+    until a frame actually has two faces, and the decision is cached.
+    """
+    if getattr(model, "_videoswa_face_batch", "") == "off":
+        return None
+    ready = getattr(model, "_videoswa_batch_session", None)
+    if ready is not None:
+        return ready
+    providers = []
+    try:
+        providers = list(model.session.get_providers())
+    except Exception:
+        return None
+    if not any("Tensorrt" in name for name in providers):
+        model._videoswa_face_batch = "off"
+        logger.info("InSwapper face batch skipped (no TensorRT). Faces run one at a time.")
+        return None
+    from .utils import MODELS_DIR
+
+    decision = MODELS_DIR / "trt_cache" / "inswapper_batch" / "decision.txt"
+    if decision.is_file() and decision.read_text().strip() == "off":
+        model._videoswa_face_batch = "off"
+        return None
+    logger.info("Preparing multi-face InSwapper, first time only. Batch profile is 1 / 2 / 4.")
+    _enable_inswapper_batch(model, providers)
+    return getattr(model, "_videoswa_batch_session", None)
 
 
 def warm_models(swapper) -> None:
