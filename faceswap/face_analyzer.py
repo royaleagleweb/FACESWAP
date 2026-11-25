@@ -247,11 +247,55 @@ class FaceAnalyzer:
             self.last_detect_note = f"{self.last_detect_note} {note}".strip()
         return faces
 
+    def prepare_attribute_batch(self) -> str:
+        """Probe a batch-2 landmark and recognition run before timed frames.
+
+        Buffalo's 106/68 and recognition models have a dynamic batch size, but
+        TensorRT may have cached a batch-1 engine. The probe happens here, not
+        inside the frame loop. A failure leaves those models on one face at a time.
+        """
+        if getattr(self, "_attribute_batch", "") in {"on", "off"}:
+            return self._attribute_batch
+        app = getattr(self, "app", None)
+        models = getattr(app, "models", None) if app is not None else None
+        if not isinstance(models, dict):
+            self._attribute_batch = "off"
+            return "off"
+        ready: List[str] = []
+        for name, model in models.items():
+            if not _attribute_task(name):
+                continue
+            if not _dynamic_batch(model):
+                setattr(model, "_videoswa_attr_batch", False)
+                continue
+            try:
+                _probe_attribute_batch(model, batch=3)
+                setattr(model, "_videoswa_attr_batch", True)
+                setattr(model, "_videoswa_attr_batch_n", 3)
+                ready.append(str(name))
+            except Exception as exc:
+                setattr(model, "_videoswa_attr_batch", False)
+                logger.info("Attribute batch off for %s: %s", name, exc)
+        self._attribute_batch = "on" if ready else "off"
+        logger.info(
+            "Landmark/recognition batch: %s (%s)",
+            self._attribute_batch,
+            ", ".join(ready) or "none",
+        )
+        return self._attribute_batch
+
     def _raw_get(self, app, image: np.ndarray):
         getter = getattr(app, "get", None)
         if not callable(getter):
             return []
-        return getter(image) or []
+        if getattr(self, "_attribute_batch", "") != "on":
+            return getter(image) or []
+        try:
+            return _faces_with_batched_attributes(app, image)
+        except Exception as exc:
+            self._attribute_batch = "off"
+            logger.info("Batched landmark/recognition failed (%s). Per-face models.", exc)
+            return getter(image) or []
 
     def _faces_from_raw(self, raw) -> List[Face]:
         faces: List[Face] = []
@@ -531,3 +575,137 @@ def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
     a = a / (np.linalg.norm(a) + 1e-8)
     b = b / (np.linalg.norm(b) + 1e-8)
     return float(np.dot(a, b))
+
+
+def _attribute_task(name: str) -> bool:
+    text = str(name)
+    return text == "recognition" or text.startswith("landmark")
+
+
+def _dynamic_batch(model) -> bool:
+    """True when the ONNX batch dimension is not fixed at 1."""
+    session = getattr(model, "session", None)
+    if session is None or not hasattr(session, "get_inputs"):
+        return False
+    try:
+        dim = session.get_inputs()[0].shape[0]
+    except Exception:
+        return False
+    if isinstance(dim, (int, np.integer)):
+        return int(dim) != 1
+    return str(dim) not in {"1"}
+
+
+def _probe_attribute_batch(model, batch: int = 3) -> None:
+    session = model.session
+    shape = list(session.get_inputs()[0].shape)
+    height = int(shape[2]) if isinstance(shape[2], (int, np.integer)) else int(model.input_size[1])
+    width = int(shape[3]) if isinstance(shape[3], (int, np.integer)) else int(model.input_size[0])
+    blob = np.zeros((int(batch), 3, height, width), dtype=np.float32)
+    session.run(None, {session.get_inputs()[0].name: blob})
+
+
+def _faces_with_batched_attributes(app, image: np.ndarray):
+    """One detector pass, then one landmark run and one recognition run for every face."""
+    from insightface.app.common import Face as RawFace
+
+    bboxes, kpss = app.det_model.detect(image, max_num=0, metric="default")
+    if bboxes is None or len(bboxes) == 0:
+        return []
+    faces = []
+    for index in range(bboxes.shape[0]):
+        kps = None if kpss is None else kpss[index]
+        faces.append(RawFace(bbox=bboxes[index, 0:4], kps=kps, det_score=bboxes[index, 4]))
+    if len(faces) == 1:
+        for name, model in app.models.items():
+            if name == "detection":
+                continue
+            model.get(image, faces[0])
+        return faces
+    for name, model in app.models.items():
+        if name == "detection":
+            continue
+        batched = bool(getattr(model, "_videoswa_attr_batch", False))
+        try:
+            if batched and name == "recognition":
+                _batch_recognition(model, image, faces)
+            elif batched and str(name).startswith("landmark"):
+                _batch_landmark(model, image, faces)
+            else:
+                for face in faces:
+                    model.get(image, face)
+        except Exception as exc:
+            probed = int(getattr(model, "_videoswa_attr_batch_n", 0) or 0)
+            if probed and len(faces) == probed:
+                setattr(model, "_videoswa_attr_batch", False)
+                logger.info("Attribute batch failed for %s (%s). Per-face.", name, exc)
+            else:
+                logger.info(
+                    "Attribute batch size %d is not ready for %s (%s). Per-face this frame.",
+                    len(faces),
+                    name,
+                    exc,
+                )
+            for face in faces:
+                model.get(image, face)
+    return faces
+
+
+def _batch_recognition(model, image: np.ndarray, faces) -> None:
+    from insightface.utils import face_align
+
+    size = int(model.input_size[0])
+    crops = [face_align.norm_crop(image, landmark=face.kps, image_size=size) for face in faces]
+    feats = model.get_feat(crops)
+    for face, feat in zip(faces, feats):
+        face.embedding = np.asarray(feat, dtype=np.float32).reshape(-1)
+
+
+def _batch_landmark(model, image: np.ndarray, faces) -> None:
+    from insightface.utils import face_align
+
+    size = int(model.input_size[0])
+    crops = []
+    matrices = []
+    for face in faces:
+        bbox = np.asarray(face.bbox, dtype=np.float32).reshape(-1)
+        width = float(bbox[2] - bbox[0])
+        height = float(bbox[3] - bbox[1])
+        center = ((bbox[2] + bbox[0]) / 2.0, (bbox[3] + bbox[1]) / 2.0)
+        scale = size / (max(width, height) * 1.5)
+        aligned, matrix = face_align.transform(image, center, size, scale, 0)
+        crops.append(aligned)
+        matrices.append(matrix)
+    blob = cv2.dnn.blobFromImages(
+        crops,
+        1.0 / float(model.input_std),
+        (size, size),
+        (float(model.input_mean), float(model.input_mean), float(model.input_mean)),
+        swapRB=True,
+    )
+    name = getattr(model, "input_name", None) or model.session.get_inputs()[0].name
+    outputs = getattr(model, "output_names", None)
+    pred = model.session.run(outputs, {name: blob})[0]
+    for face, one, matrix in zip(faces, pred, matrices):
+        _write_landmark(model, face, np.asarray(one), matrix)
+
+
+def _write_landmark(model, face, pred: np.ndarray, matrix: np.ndarray) -> None:
+    from insightface.utils import face_align
+
+    pred = np.asarray(pred, dtype=np.float32)
+    if pred.shape[0] >= 3000:
+        pred = pred.reshape((-1, 3))
+    else:
+        pred = pred.reshape((-1, 2))
+    count = int(getattr(model, "lmk_num", pred.shape[0]) or pred.shape[0])
+    if count < pred.shape[0]:
+        pred = pred[count * -1:, :]
+    size = int(model.input_size[0])
+    pred[:, 0:2] += 1
+    pred[:, 0:2] *= size // 2
+    if pred.shape[1] == 3:
+        pred[:, 2] *= size // 2
+    pred = face_align.trans_points(pred, cv2.invertAffineTransform(matrix))
+    task = getattr(model, "taskname", "landmark")
+    face[task] = pred

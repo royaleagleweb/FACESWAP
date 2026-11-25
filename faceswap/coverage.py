@@ -186,6 +186,7 @@ def coverage_alpha(
     kps: np.ndarray,
     coverage: str = DEFAULT_COVERAGE,
     yaw: float = 0.0,
+    out: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """Feathered face mask. The rim is soft. Nothing hard is drawn below the chin.
 
@@ -193,7 +194,11 @@ def coverage_alpha(
     margin. A long beard polygon used to paste a hard triangle onto the chest.
     """
     height, width = shape
-    alpha = np.zeros((height, width), dtype=np.float32)
+    if out is not None and getattr(out, "shape", None) is not None and out.shape[:2] == (height, width):
+        alpha = out
+        alpha.fill(0)
+    else:
+        alpha = np.zeros((height, width), dtype=np.float32)
     mode = normalize_coverage(coverage)
     points = _hull_points(kps, yaw=yaw) if mode == COVERAGE_FULL else None
     if points is None:
@@ -275,6 +280,7 @@ def paste_swapped_face(
     color_state: Optional[dict] = None,
     yaw: float = 0.0,
     color_match: Optional[float] = None,
+    inplace: bool = False,
 ) -> np.ndarray:
     """Blend ``swapped_bgr`` (the 128px InSwapper output) onto ``frame_bgr``.
 
@@ -304,7 +310,7 @@ def paste_swapped_face(
         flags=cv2.INTER_LINEAR,
         borderMode=cv2.BORDER_REPLICATE,
     )
-    out = frame_bgr.copy()
+    out = frame_bgr if inplace else frame_bgr.copy()
     roi = out[y0:y1, x0:x1].astype(np.float32)
     weight = weight[:, :, None]
     warped_f = warped.astype(np.float32)

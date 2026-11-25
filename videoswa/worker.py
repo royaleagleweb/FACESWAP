@@ -588,6 +588,11 @@ class EngineWorker(QThread):
             )
             decision = prepare_face_batch(engine.swapper.swapper)
             logger.info("InSwapper batch decision_v2: %s", decision)
+            try:
+                attr = engine.analyzer.prepare_attribute_batch()
+                logger.info("Landmark/recognition batch: %s", attr)
+            except Exception as exc:
+                logger.info("Landmark/recognition batch skipped: %s", exc)
         self.status.emit(f"Swapping {len(mappings)} mapping(s)…")
 
         def _progress(done: int, total: int) -> None:

@@ -243,7 +243,10 @@ class FaceSwapper:
         """
         # InsightFace expects its own Face objects, but the swapper actually only
         # uses .kps and .normed_embedding. We pass a small shim.
-        self.stage_ms = {}
+        if not getattr(self, "_accumulate", False):
+            self.stage_ms = {}
+        prior_inswapper = float(self.stage_ms.get("inswapper", 0.0))
+        prior_blend = float(self.stage_ms.get("blend", 0.0))
         src_shim = _FaceShim(source_face)
         tgt_shim = _FaceShim(target_face)
         # Profile landmarks collapse the far eye. Repair them before InSwapper
@@ -324,9 +327,11 @@ class FaceSwapper:
             self._mask_ticks = ticks
         ticks[cache_key] = int(ticks.get(cache_key, 0)) + 1
         cached = self._mask_cache.get(cache_key)
-        if self.object_mask and cached is not None and (ticks[cache_key] % 3) != 1:
+        if self.object_mask and cached is not None and len(cached) >= 3 and (ticks[cache_key] % 3) != 1:
             reuse_started = time.perf_counter()
-            alpha = _reuse_mask(cached[0], cached[1], align_kps, frame.shape[:2])
+            alpha = _reuse_mask(
+                cached[0], cached[1], cached[2], align_kps, frame.shape[:2], out=self._mask_work(frame.shape[:2])
+            )
             self._add_stage("mask_reuse", reuse_started)
         if self.object_mask and alpha is None:
             load_started = time.perf_counter()
@@ -335,7 +340,9 @@ class FaceSwapper:
                 self._add_stage("warmup_mask", load_started)
                 self._mask_warm = True
             geom_started = time.perf_counter()
-            face_alpha = coverage_alpha(frame.shape[:2], align_kps, mode, yaw=yaw)
+            face_alpha = coverage_alpha(
+                frame.shape[:2], align_kps, mode, yaw=yaw, out=self._mask_work(frame.shape[:2])
+            )
             self._add_stage("geom", geom_started)
             xseg_started = time.perf_counter()
             ready = getattr(self, "_batched_neurals", None)
@@ -371,9 +378,11 @@ class FaceSwapper:
             alpha = self._smooth_alpha(alpha, align_kps)
             self._add_stage("smooth", smooth_started)
             if alpha is not None:
+                x0, y0, x1, y1 = face_roi(align_kps, alpha.shape[:2])
                 self._mask_cache[cache_key] = (
                     np.asarray(align_kps, dtype=np.float32).copy(),
-                    np.asarray(alpha, dtype=np.float32),
+                    np.array(alpha[y0:y1, x0:x1], dtype=np.float32, copy=True),
+                    (int(x0), int(y0)),
                 )
             if alpha is None or float(np.max(alpha)) < 0.05:
                 self._mark_wiped(
@@ -384,6 +393,9 @@ class FaceSwapper:
                 return frame
         previous = self.color_memory.get(self._color_key) if self._color_key is not None else None
         color_state: dict = {}
+        before_box = None
+        if getattr(self, "_inplace", False):
+            before_box = _roi_copy(frame, target_face.bbox)
         blend_started = time.perf_counter()
         out = paste_swapped_face(
             frame,
@@ -396,6 +408,7 @@ class FaceSwapper:
             previous_delta=previous,
             color_state=color_state,
             color_match=getattr(self, "color_match", None),
+            inplace=bool(getattr(self, "_inplace", False)),
         )
         self._add_stage("blend", blend_started)
         if self._color_key is not None and "delta" in color_state:
@@ -406,7 +419,7 @@ class FaceSwapper:
             out = _sharpen_roi(out, target_face.bbox, amount)
             self._add_stage("sharpen", sharp_started)
         finish_started = time.perf_counter()
-        if _box_mean_abs(frame, out, target_face.bbox) < 1.5:
+        if _change_against(frame, out, target_face.bbox, before_box) < 1.5:
             plain = coverage_alpha(frame.shape[:2], align_kps, mode, yaw=yaw)
             rescued = paste_swapped_face(
                 frame,
@@ -417,8 +430,9 @@ class FaceSwapper:
                 yaw=yaw,
                 alpha=plain,
                 color_match=getattr(self, "color_match", None),
+                inplace=bool(getattr(self, "_inplace", False)),
             )
-            if _box_mean_abs(frame, rescued, target_face.bbox) >= 1.5:
+            if _change_against(frame, rescued, target_face.bbox, before_box) >= 1.5:
                 if not getattr(self, "_mask_fallback_logged", False):
                     logger.info(
                         "The object mask hid a finished swap. Using the face outline so the face is kept."
@@ -435,7 +449,10 @@ class FaceSwapper:
         self.last_canvas = np.asarray(swapped).copy()
         self.last_matrix = np.asarray(matrix, dtype=np.float64).reshape(2, 3).copy()
         self._add_stage("finish", finish_started)
-        self._recent_ms = float(self.stage_ms.get("inswapper", 0.0)) + float(self.stage_ms.get("blend", 0.0))
+        self._recent_ms = (
+            float(self.stage_ms.get("inswapper", 0.0)) - prior_inswapper
+            + float(self.stage_ms.get("blend", 0.0)) - prior_blend
+        )
         return out
 
     def _release_vram(self, exc: BaseException) -> None:
@@ -512,15 +529,75 @@ class FaceSwapper:
             self.large_face_px = saved_large
 
     def _swap_many_serial(self, frame, pairs, coverage):
-        out = frame
-        oks = []
-        for item in pairs:
-            target, source = item[0], item[1]
-            if len(item) > 2:
-                self.begin_face(item[2])
-            out = self.swap(out, target, source, coverage=coverage)
-            oks.append(not self.paste_wiped)
-        return out, oks
+        """One frame copy, one XSeg batch, then every face pasted into that copy.
+
+        Each face used to clear the stage clock and copy the whole frame, so
+        the log called the other faces 'gap'.
+        """
+        from .pixel_boost import aligned_crop, cached_source_latent, forward_bgr_tiles
+        from .providers import is_gpu_memory_error
+
+        out = frame.copy()
+        self.stage_ms = {}
+        self._accumulate = True
+        self._inplace = True
+        images = []
+        matrices = []
+        prepared = []
+        try:
+            for item in pairs:
+                target, source = item[0], item[1]
+                key = item[2] if len(item) > 2 else id(target)
+                raw = np.asarray(target.kps, dtype=np.float32)
+                align = repair_landmarks(raw)
+                yaw = float(face_yaw(raw))
+                prep_started = time.perf_counter()
+                latent = cached_source_latent(
+                    self.swapper,
+                    source,
+                    target,
+                    float(getattr(self, "identity_strength", 1.0) or 1.0),
+                )
+                crop, matrix = aligned_crop(frame, align, 128)
+                self._add_stage("prep", prep_started)
+                infer_started = time.perf_counter()
+                try:
+                    outputs = forward_bgr_tiles(self.swapper, [crop], latent)
+                except Exception as exc:
+                    self._add_stage("inswapper", infer_started)
+                    if not is_gpu_memory_error(exc):
+                        raise
+                    self._release_vram(exc)
+                    images.append(None)
+                    matrices.append(None)
+                    prepared.append((target, source, align, yaw, key))
+                    continue
+                self._add_stage("inswapper", infer_started)
+                images.append(self._restore_before_paste(outputs[0], target))
+                matrices.append(matrix)
+                prepared.append((target, source, align, yaw, key))
+            live_matrices = [matrix for matrix in matrices if matrix is not None]
+            live_prepared = [item for item, matrix in zip(prepared, matrices) if matrix is not None]
+            xseg_started = time.perf_counter()
+            self._batched_neurals = _batch_xseg(self, frame, live_matrices, live_prepared)
+            self._add_stage("xseg", xseg_started)
+            oks = []
+            for image, (target, source, align, yaw, key), matrix in zip(images, prepared, matrices):
+                self.begin_face(key)
+                if image is None or matrix is None:
+                    oks.append(False)
+                    continue
+                self._precomputed = (image, matrix, align, yaw)
+                try:
+                    out = self.swap(out, target, source, coverage=coverage)
+                finally:
+                    self._precomputed = None
+                oks.append(not self.paste_wiped)
+            return out, oks
+        finally:
+            self._accumulate = False
+            self._inplace = False
+            self._batched_neurals = None
 
     def _swap_many_batched(self, frame, pairs, coverage, session):
         from .pixel_boost import aligned_crop, cached_source_latent
@@ -541,20 +618,31 @@ class FaceSwapper:
             latents.append(latent)
             matrices.append(matrix)
             prepared.append((target, source, align, float(face_yaw(raw)), item[2] if len(item) > 2 else id(target)))
-        images = _forward_with_session(session, self.swapper, crops, latents)
-        self._batched_neurals = _batch_xseg(self, frame, matrices, prepared)
-        out = frame
-        oks = []
-        for image, (target, source, align, yaw, key), matrix in zip(images, prepared, matrices):
-            self.begin_face(key)
-            self._precomputed = (image, matrix, align, yaw)
-            try:
-                out = self.swap(out, target, source, coverage=coverage)
-            finally:
-                self._precomputed = None
-            oks.append(not self.paste_wiped)
-        self._batched_neurals = None
-        return out, oks
+        self.stage_ms = {}
+        self._accumulate = True
+        self._inplace = True
+        try:
+            infer_started = time.perf_counter()
+            images = _forward_with_session(session, self.swapper, crops, latents)
+            self._add_stage("inswapper", infer_started)
+            xseg_started = time.perf_counter()
+            self._batched_neurals = _batch_xseg(self, frame, matrices, prepared)
+            self._add_stage("xseg", xseg_started)
+            out = frame.copy()
+            oks = []
+            for image, (target, source, align, yaw, key), matrix in zip(images, prepared, matrices):
+                self.begin_face(key)
+                self._precomputed = (image, matrix, align, yaw)
+                try:
+                    out = self.swap(out, target, source, coverage=coverage)
+                finally:
+                    self._precomputed = None
+                oks.append(not self.paste_wiped)
+            return out, oks
+        finally:
+            self._accumulate = False
+            self._inplace = False
+            self._batched_neurals = None
 
     def _restore_before_paste(self, canvas: np.ndarray, target_face: Face) -> np.ndarray:
         """Run GFPGAN or CodeFormer on the aligned swap, then paste that result."""
@@ -686,11 +774,19 @@ class FaceSwapper:
         x0, y0, x1, y1 = face_roi(kps, alpha.shape[:2])
         patch = np.asarray(alpha[y0:y1, x0:x1], dtype=np.float32)
         previous = self._alpha_memory.get(key)
-        prev = previous[y0:y1, x0:x1] if previous is not None and previous.shape == alpha.shape else None
+        prev = previous if isinstance(previous, np.ndarray) and previous.shape == patch.shape else None
         mixed = np.clip(smooth_pair(prev, patch, keep=0.65), 0.0, 1.0).astype(np.float32)
         alpha[y0:y1, x0:x1] = mixed
-        self._alpha_memory[key] = alpha
+        self._alpha_memory[key] = mixed.copy()
         return alpha
+
+    def _mask_work(self, shape: tuple[int, int]) -> np.ndarray:
+        """One reusable full-frame mask. A 1080p float mask is about 8 MB."""
+        buf = getattr(self, "_mask_buffer", None)
+        if buf is None or buf.shape[:2] != shape:
+            buf = np.zeros(shape, dtype=np.float32)
+            self._mask_buffer = buf
+        return buf
 
     def _mark_wiped(self, note: str) -> None:
         self.paste_wiped = True
@@ -709,32 +805,48 @@ class _FaceShim:
         self.det_score = face.det_score
 
 
-def _reuse_mask(old_kps: np.ndarray, alpha: np.ndarray, new_kps: np.ndarray, shape: tuple[int, int]) -> Optional[np.ndarray]:
+def _reuse_mask(
+    old_kps: np.ndarray,
+    patch: np.ndarray,
+    origin: tuple[int, int],
+    new_kps: np.ndarray,
+    shape: tuple[int, int],
+    out: Optional[np.ndarray] = None,
+) -> Optional[np.ndarray]:
     """Move the last paste mask with the landmarks. Skips XSeg on in-between frames."""
-    if alpha.shape[:2] != shape:
-        return None
     import cv2
 
+    if out is None or out.shape[:2] != shape:
+        full = np.zeros(shape, dtype=np.float32)
+    else:
+        full = out
+        full.fill(0)
+    ox, oy = origin
+    ph, pw = patch.shape[:2]
+    y1 = min(shape[0], oy + ph)
+    x1 = min(shape[1], ox + pw)
+    if y1 > oy and x1 > ox:
+        full[oy:y1, ox:x1] = patch[: y1 - oy, : x1 - ox]
     old = np.asarray(old_kps, dtype=np.float32).reshape(-1, 2)
     new = np.asarray(new_kps, dtype=np.float32).reshape(-1, 2)
     forward, _inliers = cv2.estimateAffinePartial2D(old.reshape(-1, 1, 2), new.reshape(-1, 1, 2))
     if forward is None:
         delta = new.mean(axis=0) - old.mean(axis=0)
         forward = np.array([[1.0, 0.0, float(delta[0])], [0.0, 1.0, float(delta[1])]], dtype=np.float32)
-    x0, y0, x1, y1 = face_roi(new, shape)
+    x0, y0, x1b, y1b = face_roi(new, shape)
     shifted = np.asarray(forward, dtype=np.float32).copy()
     shifted[0, 2] -= x0
     shifted[1, 2] -= y0
-    patch = cv2.warpAffine(
-        np.asarray(alpha, dtype=np.float32),
+    warped = cv2.warpAffine(
+        full,
         shifted,
-        (x1 - x0, y1 - y0),
+        (x1b - x0, y1b - y0),
         flags=cv2.INTER_LINEAR,
         borderValue=0,
     )
-    out = np.zeros(shape, dtype=np.float32)
-    out[y0:y1, x0:x1] = patch
-    return out
+    full.fill(0)
+    full[y0:y1b, x0:x1b] = warped
+    return full
 
 
 def _enable_inswapper_batch(model, providers) -> None:
@@ -930,12 +1042,16 @@ def _batch_xseg(swapper, frame, matrices, prepared):
 
     hw = _input_hw(models.xseg)
     aligned = [_scale_matrix(matrix, 128, hw) for matrix in matrices]
-    alphas = [coverage_alpha(frame.shape[:2], item[2], "full", yaw=item[3]) for item in prepared]
     crops = [_warp_crop(frame, matrix, hw) for matrix in aligned]
     masks = session_masks(models.xseg, crops, occluder=True)
+    work = swapper._mask_work(frame.shape[:2])
     neurals = []
-    for mask, matrix, alpha in zip(masks, aligned, alphas):
-        neurals.append(None if mask is None else warp_into_face(mask, matrix, frame.shape[:2], alpha))
+    for mask, matrix, item in zip(masks, aligned, prepared):
+        if mask is None:
+            neurals.append(None)
+            continue
+        alpha = coverage_alpha(frame.shape[:2], item[2], "full", yaw=item[3], out=work)
+        neurals.append(warp_into_face(mask, matrix, frame.shape[:2], alpha, compact=True, kps=item[2]))
     return neurals
 
 
@@ -1104,6 +1220,31 @@ def _gpu_is_tight() -> bool:
     except Exception:
         return False
     return free < 1024 * 1024 * 1024
+
+
+def _roi_copy(frame: np.ndarray, bbox: np.ndarray) -> Optional[np.ndarray]:
+    """Copy one face box so an in-place paste can still see what changed."""
+    height, width = frame.shape[:2]
+    x1, y1, x2, y2 = [int(round(float(v))) for v in np.asarray(bbox).reshape(-1)[:4]]
+    x1, y1 = max(0, x1), max(0, y1)
+    x2, y2 = min(width, x2), min(height, y2)
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return np.array(frame[y1:y2, x1:x2], copy=True)
+
+
+def _change_against(before: np.ndarray, after: np.ndarray, bbox: np.ndarray, box: Optional[np.ndarray]) -> float:
+    """Mean change in the face box. ``box`` is the pre-paste crop when the frame is edited in place."""
+    if box is None:
+        return _box_mean_abs(before, after, bbox)
+    height, width = after.shape[:2]
+    x1, y1, x2, y2 = [int(round(float(v))) for v in np.asarray(bbox).reshape(-1)[:4]]
+    x1, y1 = max(0, x1), max(0, y1)
+    x2, y2 = min(width, x2), min(height, y2)
+    if x2 <= x1 or y2 <= y1 or box.shape[:2] != (y2 - y1, x2 - x1):
+        return _box_mean_abs(before, after, bbox)
+    delta = np.abs(box.astype(np.int16) - after[y1:y2, x1:x2].astype(np.int16))
+    return float(np.mean(delta))
 
 
 def _box_mean_abs(before: np.ndarray, after: np.ndarray, bbox: np.ndarray) -> float:

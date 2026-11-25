@@ -174,7 +174,7 @@ class _GpuRunner:
             )
             self.binding.bind_ortvalue_output(self.output_name, self.output)
         self.session.run_with_iobinding(self.binding)
-        self.binding.synchronize_outputs()
+        # numpy() copies the result back and waits for the device.
         return self.output.numpy()
 
 

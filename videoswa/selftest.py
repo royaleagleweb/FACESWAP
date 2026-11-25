@@ -146,6 +146,11 @@ def _run(photo: Path, video: Path, frames: int, out_dir: Path, lines: list[str],
         lines.append(f"faces: repeating the detected person {faces} times")
         decision = prepare_face_batch(engine.swapper.swapper)
         lines.append(f"inswapper batch decision_v2: {decision} (built before the timed frames)")
+        try:
+            attr = engine.analyzer.prepare_attribute_batch()
+        except Exception as exc:
+            attr = f"skipped ({exc})"
+        lines.append(f"landmark/recognition batch: {attr} (probed before the timed frames)")
     end_s = 0.0
     if info.fps > 0:
         end_s = min(float(info.duration_s), frames / float(info.fps))

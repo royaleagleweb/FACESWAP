@@ -102,6 +102,11 @@ def _run(photo: Path, video: Path, frames: int, presets: list[str], counts: list
 
             decision = prepare_face_batch(swapper.swapper)
             print(f"inswapper batch decision_v2: {decision} (not included in the fps below)")
+            try:
+                attr = engine.analyzer.prepare_attribute_batch()
+            except Exception as exc:
+                attr = f"skipped ({exc})"
+            print(f"landmark/recognition batch: {attr} (not included in the fps below)")
         reset_stats(engine)
         started = time.perf_counter()
         process_video(

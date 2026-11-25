@@ -158,3 +158,52 @@ def test_unmatched_person_is_left_alone() -> None:
     assert len(swapper.pairs) == 1
     assert engine.stats.faces_unmatched == 1
     assert cosine_similarity(alice_ref.normed_embedding, stranger.normed_embedding) < 0.45
+
+
+def test_inplace_paste_reuses_the_frame() -> None:
+    from faceswap.coverage import paste_swapped_face, template_128
+    from faceswap.pixel_boost import frame_to_crop_matrix
+
+    kps = (template_128() - template_128().mean(axis=0)) * 3.0 + np.array([400.0, 300.0])
+    frame = np.full((600, 800, 3), 20, dtype=np.uint8)
+    matrix = frame_to_crop_matrix(kps, 128)
+    swapped = np.full((128, 128, 3), (0, 0, 220), dtype=np.uint8)
+    out = paste_swapped_face(frame, swapped, matrix, kps, "full", color_match=0, inplace=True)
+    assert out is frame
+    assert int(frame[300, 400, 2]) > 100
+
+
+def test_multi_face_path_keeps_one_clock_and_one_copy() -> None:
+    import inspect
+
+    from faceswap.swapper import FaceSwapper
+
+    serial = inspect.getsource(FaceSwapper._swap_many_serial)
+    assert serial.count("frame.copy()") == 1
+    assert "_accumulate = True" in serial
+    assert "_inplace = True" in serial
+    swap = inspect.getsource(FaceSwapper.swap)
+    assert "if not getattr(self, \"_accumulate\", False):" in swap
+
+
+def test_attribute_models_batch_only_when_the_batch_dim_is_open() -> None:
+    from faceswap.face_analyzer import _dynamic_batch
+
+    class _Input:
+        def __init__(self, dim):
+            self.shape = [dim, 3, 192, 192]
+
+    class _Session:
+        def __init__(self, dim):
+            self._dim = dim
+
+        def get_inputs(self):
+            return [_Input(self._dim)]
+
+    class _Model:
+        def __init__(self, dim):
+            self.session = _Session(dim)
+
+    assert _dynamic_batch(_Model(1)) is False
+    assert _dynamic_batch(_Model("None")) is True
+    assert _dynamic_batch(_Model(None)) is True
