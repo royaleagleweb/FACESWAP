@@ -571,12 +571,28 @@ class EngineWorker(QThread):
         self._configure(engine, job, preview=False)
         self.status.emit("Building face mappings…")
         mappings = build_mappings(engine, job)
+        target = Path(job.video_path)
+        face_count = len(mappings)
+        if target.suffix.lower() not in {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".heic", ".heif"}:
+            sample = read_frame_at(target, float(getattr(job, "start_s", 0.0) or 0.0))
+            if sample is not None:
+                try:
+                    face_count = max(face_count, len(engine.analyzer.analyze(sample)))
+                except Exception:
+                    logger.info("Could not count faces before the batch engine decision")
+        if face_count > 1:
+            from faceswap.swapper import prepare_face_batch
+
+            self.status.emit(
+                "Preparing multi-face GPU before the frames. The first time can take several minutes."
+            )
+            decision = prepare_face_batch(engine.swapper.swapper)
+            logger.info("InSwapper batch decision_v2: %s", decision)
         self.status.emit(f"Swapping {len(mappings)} mapping(s)…")
 
         def _progress(done: int, total: int) -> None:
             self.swap_progress.emit(done, total)
 
-        target = Path(job.video_path)
         if target.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".heic", ".heif"}:
             from faceswap.video import process_image
 

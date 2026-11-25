@@ -317,10 +317,14 @@ class FaceSwapper:
         self.last_paste_note = ""
         mode = normalize_coverage(coverage)
         alpha = None
-        self._mask_tick = int(getattr(self, "_mask_tick", 0)) + 1
         cache_key = self._color_key if self._color_key is not None else 0
+        ticks = getattr(self, "_mask_ticks", None)
+        if ticks is None:
+            ticks = {}
+            self._mask_ticks = ticks
+        ticks[cache_key] = int(ticks.get(cache_key, 0)) + 1
         cached = self._mask_cache.get(cache_key)
-        if self.object_mask and cached is not None and (self._mask_tick % 3) != 1:
+        if self.object_mask and cached is not None and (ticks[cache_key] % 3) != 1:
             reuse_started = time.perf_counter()
             alpha = _reuse_mask(cached[0], cached[1], align_kps, frame.shape[:2])
             self._add_stage("mask_reuse", reuse_started)
@@ -478,13 +482,34 @@ class FaceSwapper:
                 self.begin_face(pairs[0][2])
             out = self.swap(frame, target, source, coverage=coverage)
             return out, [not self.paste_wiped]
-        boosts = [self.boost_for_span(face_span_px(item[0].bbox)) for item in pairs]
-        if any(boost != 128 for boost in boosts):
-            return self._swap_many_serial(frame, pairs, coverage)
-        session = face_batch_session(self.swapper)
-        if session is None:
-            return self._swap_many_serial(frame, pairs, coverage)
-        return self._swap_many_batched(frame, pairs, coverage, session)
+        # Several faces at 256 are four passes each and cannot share one batch.
+        saved_boost = self.pixel_boost
+        saved_large = self.large_face_px
+        self.pixel_boost = 128
+        self.large_face_px = 0
+        try:
+            session = face_batch_session(self.swapper)
+            decision = getattr(self.swapper, "_videoswa_face_batch", "")
+            if session is None:
+                if not getattr(self, "_batch_miss_logged", False):
+                    logger.info(
+                        "InSwapper batch path not used for %d faces (decision=%s). Per-face 128px calls.",
+                        len(pairs),
+                        decision or "not ready",
+                    )
+                    self._batch_miss_logged = True
+                return self._swap_many_serial(frame, pairs, coverage)
+            if not getattr(self, "_batch_hit_logged", False):
+                logger.info(
+                    "InSwapper batch path: %d faces in one call (decision=%s).",
+                    len(pairs),
+                    decision or "on",
+                )
+                self._batch_hit_logged = True
+            return self._swap_many_batched(frame, pairs, coverage, session)
+        finally:
+            self.pixel_boost = saved_boost
+            self.large_face_px = saved_large
 
     def _swap_many_serial(self, frame, pairs, coverage):
         out = frame
@@ -753,6 +778,8 @@ def _enable_inswapper_batch(model, providers) -> None:
         trt["trt_profile_min_shapes"] = shape.format(n=1)
         trt["trt_profile_opt_shapes"] = shape.format(n=2)
         trt["trt_profile_max_shapes"] = shape.format(n=3)
+        # Lower than the default 3 so the first build does not occupy the GPU for minutes.
+        trt["trt_builder_optimization_level"] = 1
         active = list(model.session.get_providers())
         chosen = []
         options = []
@@ -899,62 +926,62 @@ def _batch_xseg(swapper, frame, matrices, prepared):
     if getattr(models, "xseg", None) is None:
         return None
     from .coverage import coverage_alpha
-    from .occlusion import _input_hw, _warp_crop, session_masks, warp_into_face
+    from .occlusion import _input_hw, _scale_matrix, _warp_crop, session_masks, warp_into_face
 
+    hw = _input_hw(models.xseg)
+    aligned = [_scale_matrix(matrix, 128, hw) for matrix in matrices]
     alphas = [coverage_alpha(frame.shape[:2], item[2], "full", yaw=item[3]) for item in prepared]
-    crops = [_warp_crop(frame, matrix, _input_hw(models.xseg)) for matrix in matrices]
+    crops = [_warp_crop(frame, matrix, hw) for matrix in aligned]
     masks = session_masks(models.xseg, crops, occluder=True)
     neurals = []
-    for mask, matrix, alpha in zip(masks, matrices, alphas):
+    for mask, matrix, alpha in zip(masks, aligned, alphas):
         neurals.append(None if mask is None else warp_into_face(mask, matrix, frame.shape[:2], alpha))
     return neurals
 
 
 def face_batch_session(model):
-    """Return a ready batch session. Never builds one on the calling thread."""
-    if getattr(model, "_videoswa_face_batch", "") == "off":
+    """Return a ready batch session. Building happens before the frame loop."""
+    if getattr(model, "_videoswa_face_batch", "") != "on":
         return None
-    ready = getattr(model, "_videoswa_batch_session", None)
-    if ready is not None and getattr(model, "_videoswa_face_batch", "") == "on":
-        return ready
-    start_face_batch_build(model)
-    return None
+    return getattr(model, "_videoswa_batch_session", None)
 
 
-def start_face_batch_build(model) -> None:
-    """Build the batch engine on a background thread. Frames keep using batch 1."""
-    import threading
+def prepare_face_batch(model) -> str:
+    """Build or load the batch engine before timed frames.
 
-    state = getattr(model, "_videoswa_face_batch", "")
-    if state in {"off", "building", "on"}:
-        return
-    if getattr(model, "_videoswa_batch_session", None) is not None:
-        return
+    A build during the frame loop stalled detect and decode for seconds per
+    frame. Call this first, then run the video.
+    """
+    if getattr(model, "_videoswa_face_batch", "") == "on" and getattr(model, "_videoswa_batch_session", None) is not None:
+        logger.info("InSwapper batch decision_v2: on (session already loaded)")
+        return "on"
     try:
         providers = list(model.session.get_providers())
     except Exception:
-        return
+        return "off"
     if not any("Tensorrt" in name for name in providers):
         model._videoswa_face_batch = "off"
-        logger.info("InSwapper face batch skipped (no TensorRT). Faces run one at a time.")
-        return
+        logger.info("InSwapper batch decision_v2: off (no TensorRT). Faces run one at a time.")
+        return "off"
     from .utils import MODELS_DIR
 
     decision = MODELS_DIR / "trt_cache" / "inswapper_batch" / "decision_v2.txt"
-    if decision.is_file() and decision.read_text().strip() == "off":
-        model._videoswa_face_batch = "off"
-        return
-    model._videoswa_face_batch = "building"
+    if decision.is_file():
+        saved = decision.read_text().strip()
+        logger.info("InSwapper batch decision_v2: %s", saved or "empty")
+        if saved == "off":
+            model._videoswa_face_batch = "off"
+            return "off"
+    else:
+        logger.info("InSwapper batch decision_v2: missing. Building before the timed frames.")
     logger.info(
-        "Preparing multi-face InSwapper in the background, first time only. "
-        "Profile is batch 1 / 2 / 3. Frames keep running one face at a time."
+        "Preparing multi-face InSwapper before the timed frames. "
+        "Profile is batch 1 / 2 / 3. The frame loop waits until this finishes."
     )
-    threading.Thread(
-        target=_enable_inswapper_batch,
-        args=(model, providers),
-        name="videoswa-batch-build",
-        daemon=True,
-    ).start()
+    _enable_inswapper_batch(model, providers)
+    result = getattr(model, "_videoswa_face_batch", "off")
+    logger.info("InSwapper batch decision_v2 result: %s", result)
+    return result
 
 
 def warm_models(swapper) -> None:

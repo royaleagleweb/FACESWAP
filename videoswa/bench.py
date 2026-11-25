@@ -97,6 +97,11 @@ def _run(photo: Path, video: Path, frames: int, presets: list[str], counts: list
         )
         mappings = build_mappings(engine, request)
         _fan_out_faces(analyzer, face_count)
+        if face_count > 1:
+            from faceswap.swapper import prepare_face_batch
+
+            decision = prepare_face_batch(swapper.swapper)
+            print(f"inswapper batch decision_v2: {decision} (not included in the fps below)")
         reset_stats(engine)
         started = time.perf_counter()
         process_video(

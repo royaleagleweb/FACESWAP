@@ -139,10 +139,13 @@ def _run(photo: Path, video: Path, frames: int, out_dir: Path, lines: list[str],
     warmup_ms = (_time.perf_counter() - warm_started) * 1000.0
     lines.append(f"warmup: {warmup_ms:.0f}ms once (InSwapper batch-1 + XSeg + det 320, not in per-frame swap)")
     if faces > 1:
+        from faceswap.swapper import prepare_face_batch
         from videoswa.bench import _fan_out_faces
 
         _fan_out_faces(analyzer, faces)
         lines.append(f"faces: repeating the detected person {faces} times")
+        decision = prepare_face_batch(engine.swapper.swapper)
+        lines.append(f"inswapper batch decision_v2: {decision} (built before the timed frames)")
     end_s = 0.0
     if info.fps > 0:
         end_s = min(float(info.duration_s), frames / float(info.fps))

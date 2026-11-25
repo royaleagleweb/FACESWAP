@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import queue
 import shutil
 import subprocess
@@ -279,12 +280,106 @@ def resolve_encoder(choice: str = "auto") -> str:
     return "libx264"
 
 
-def _ffmpeg_has_encoder(name: str) -> bool:
-    if not shutil.which("ffmpeg"):
+def ffmpeg_candidates() -> list[str]:
+    """Every ffmpeg we can find. imageio-ffmpeg often has no working NVENC."""
+    found: list[str] = []
+
+    def _add(path: Optional[str]) -> None:
+        if path and path not in found:
+            found.append(path)
+
+    _add(shutil.which("ffmpeg"))
+    try:
+        import imageio_ffmpeg
+
+        _add(imageio_ffmpeg.get_ffmpeg_exe())
+    except Exception:
+        pass
+    if os.name == "nt":
+        try:
+            listed = subprocess.check_output(["where", "ffmpeg"], text=True, timeout=8)
+        except (OSError, subprocess.TimeoutExpired, subprocess.CalledProcessError):
+            listed = ""
+        for line in listed.splitlines():
+            _add(line.strip())
+    return found or ["ffmpeg"]
+
+
+def encoder_probe_command(exe: str, name: str) -> list[str]:
+    """256x256 yuv420p. NVENC rejects frames under about 145px, so 64x64 always fails."""
+    cmd = [
+        exe, "-hide_banner", "-loglevel", "error",
+        "-f", "lavfi", "-i", "color=c=black:s=256x256:r=30,format=yuv420p",
+        "-frames:v", "1",
+        "-pix_fmt", "yuv420p",
+        "-c:v", name,
+    ]
+    if "nvenc" in name:
+        cmd.extend(["-preset", "p4", "-gpu", "0"])
+    else:
+        cmd.extend(["-preset", "ultrafast"])
+    cmd.extend(["-f", "null", "-"])
+    return cmd
+
+
+_FFMPEG_BIN: Optional[str] = None
+
+
+def ffmpeg_exe() -> str:
+    """Prefer a binary that can actually open h264_nvenc. Log the path once."""
+    global _FFMPEG_BIN
+    if _FFMPEG_BIN:
+        return _FFMPEG_BIN
+    candidates = ffmpeg_candidates()
+    logger.info("ffmpeg candidates: %s", candidates)
+    for exe in candidates:
+        if _probe_encoder(exe, "h264_nvenc"):
+            _FFMPEG_BIN = exe
+            logger.info("Using ffmpeg %s (h264_nvenc starts)", exe)
+            return exe
+    _FFMPEG_BIN = candidates[0]
+    logger.info("Using ffmpeg %s (h264_nvenc did not start on any candidate)", _FFMPEG_BIN)
+    return _FFMPEG_BIN
+
+
+_PROBE_CACHE: dict[tuple[str, str], bool] = {}
+
+
+def _probe_encoder(exe: str, name: str) -> bool:
+    key = (exe, name)
+    cached = _PROBE_CACHE.get(key)
+    if cached is not None:
+        return cached
+    cmd = encoder_probe_command(exe, name)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        logger.info("Encoder %s probe failed to run (%s). Command: %s", name, exc, cmd)
         return False
+    if result.returncode == 0:
+        _PROBE_CACHE[key] = True
+        return True
+    stderr = (result.stderr or result.stdout or "").strip()
+    logger.info(
+        "Encoder %s probe failed (exit %s) with %s. Command: %s. stderr: %s",
+        name,
+        result.returncode,
+        exe,
+        " ".join(cmd),
+        stderr or "(empty)",
+    )
+    _PROBE_CACHE[key] = False
+    return False
+
+
+def _ffmpeg_has_encoder(name: str) -> bool:
+    exe = shutil.which("ffmpeg") or (ffmpeg_candidates()[0] if ffmpeg_candidates() != ["ffmpeg"] else None)
+    if exe is None and not shutil.which("ffmpeg"):
+        return False
+    binary = exe or "ffmpeg"
     try:
         result = subprocess.run(
-            ["ffmpeg", "-hide_banner", "-encoders"],
+            [binary, "-hide_banner", "-encoders"],
             capture_output=True,
             text=True,
             timeout=8,
@@ -461,7 +556,7 @@ class _PipeWriter:
         self.width = width
         self.height = height
         cmd = [
-            "ffmpeg", "-y", "-loglevel", "error",
+            ffmpeg_exe(), "-y", "-loglevel", "error",
             "-f", "rawvideo", "-pix_fmt", "bgr24",
             "-s", f"{width}x{height}",
             "-r", f"{float(fps):.6f}",
@@ -498,22 +593,8 @@ def _encoder_runs(name: str) -> bool:
     cached = _ENCODER_RUNS.get(name)
     if cached is not None:
         return cached
-    if not shutil.which("ffmpeg"):
-        _ENCODER_RUNS[name] = False
-        return False
-    try:
-        result = subprocess.run(
-            [
-                "ffmpeg", "-hide_banner", "-loglevel", "error",
-                "-f", "lavfi", "-i", "color=c=black:s=64x64:r=30",
-                "-frames:v", "1", "-c:v", name, "-f", "null", "-",
-            ],
-            capture_output=True,
-            timeout=20,
-        )
-        ok = result.returncode == 0
-    except (OSError, subprocess.TimeoutExpired):
-        ok = False
+    exe = ffmpeg_exe()
+    ok = _probe_encoder(exe, name)
     _ENCODER_RUNS[name] = ok
     return ok
 
@@ -774,7 +855,7 @@ def _mux_audio(
 ) -> None:
     def _cmd(enc: str, audio: str) -> list[str]:
         cmd = [
-            "ffmpeg", "-y", "-loglevel", "error",
+            ffmpeg_exe(), "-y", "-loglevel", "error",
             "-i", str(silent_video),
         ]
         if start_s > 0:
@@ -815,7 +896,7 @@ def _mux_audio(
 def _reencode(src: Path, dest: Path, crf: int, preset: str, encoder: str = "libx264") -> None:
     def _cmd(enc: str) -> list[str]:
         return [
-            "ffmpeg", "-y", "-loglevel", "error",
+            ffmpeg_exe(), "-y", "-loglevel", "error",
             "-i", str(src),
             *_video_encode_args(enc, crf, preset),
             str(dest),

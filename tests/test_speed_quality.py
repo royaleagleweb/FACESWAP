@@ -310,6 +310,16 @@ def test_jaw_boundary_is_feathered() -> None:
     assert int(np.count_nonzero(soft)) > 10
 
 
+def test_nvenc_probe_uses_a_256_frame() -> None:
+    from faceswap.video import encoder_probe_command
+
+    cmd = encoder_probe_command(r"C:\ffmpeg\bin\ffmpeg.exe", "h264_nvenc")
+    assert cmd[0].endswith("ffmpeg.exe")
+    assert any("256x256" in part for part in cmd)
+    assert "yuv420p" in cmd
+    assert "h264_nvenc" in cmd
+
+
 def test_resolve_encoder_prefers_h264_nvenc_then_hevc(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("faceswap.video._ffmpeg_has_encoder", lambda name: name == "h264_nvenc")
     assert resolve_encoder("auto") == "h264_nvenc"
