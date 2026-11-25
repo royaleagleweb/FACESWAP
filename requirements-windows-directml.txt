@@ -1,0 +1,11 @@
+# Windows GPU path when CUDA / TensorRT fail (CUDNN_FE, GRAPH_EXECUTION_FAILED).
+# DirectML does not use the CUDA cuDNN frontend. It cannot be installed next
+# to onnxruntime or onnxruntime-gpu — pick one runtime.
+#
+#   pip uninstall -y onnxruntime onnxruntime-gpu onnxruntime-directml
+#   pip install -r requirements-windows-directml.txt
+#
+# Then open Videoswa and leave execution on Auto, or choose DirectML.
+# 1.22.0 matches the onnxruntime-gpu pin. 1.20.1 is the older DirectML build
+# if 1.22 misbehaves on a particular GPU driver.
+onnxruntime-directml==1.22.0
