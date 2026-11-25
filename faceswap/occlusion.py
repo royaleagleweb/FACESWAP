@@ -194,28 +194,34 @@ class OcclusionModels:
         frame_bgr: np.ndarray,
         matrix: np.ndarray,
         face_alpha: np.ndarray,
+        canvas: int = 128,
     ) -> Optional[np.ndarray]:
         if self.xseg is None:
             return None
-        crop = _warp_crop(frame_bgr, matrix, _input_hw(self.xseg))
+        hw = _input_hw(self.xseg)
+        aligned = _scale_matrix(matrix, int(canvas), hw)
+        crop = _warp_crop(frame_bgr, aligned, hw)
         mask = _session_mask(self.xseg, crop, occluder=True)
         if mask is None:
             return None
-        return warp_into_face(mask, matrix, frame_bgr.shape[:2], face_alpha)
+        return warp_into_face(mask, aligned, frame_bgr.shape[:2], face_alpha)
 
     def bisenet_keep(
         self,
         frame_bgr: np.ndarray,
         matrix: np.ndarray,
         face_alpha: np.ndarray,
+        canvas: int = 512,
     ) -> Optional[np.ndarray]:
         if self.bisenet is None:
             return None
-        crop = _warp_crop(frame_bgr, matrix, _input_hw(self.bisenet))
+        hw = _input_hw(self.bisenet)
+        aligned = _scale_matrix(matrix, int(canvas), hw)
+        crop = _warp_crop(frame_bgr, aligned, hw)
         mask = _session_mask(self.bisenet, crop, occluder=False)
         if mask is None:
             return None
-        return warp_into_face(mask, matrix, frame_bgr.shape[:2], face_alpha)
+        return warp_into_face(mask, aligned, frame_bgr.shape[:2], face_alpha)
 
 
 def _optional_session(path: Optional[Path], execution: str, label: str):
@@ -251,6 +257,21 @@ def _input_hw(session) -> tuple[int, int]:
     height = shape[2] if len(shape) > 2 and isinstance(shape[2], int) else 256
     width = shape[3] if len(shape) > 3 and isinstance(shape[3], int) else 256
     return int(height), int(width)
+
+
+def _scale_matrix(matrix: np.ndarray, canvas: int, hw: tuple[int, int]) -> np.ndarray:
+    """Scale a frame→canvas matrix so the face fills this model's input.
+
+    A 256px pixel-boost matrix used with a smaller mask input only covered
+    the top-left of the face, and the mask came back off the face. The paste
+    then looked unchanged and was thrown away.
+    """
+    mapped = np.asarray(matrix, dtype=np.float64).reshape(2, 3).copy()
+    if canvas <= 0:
+        return mapped
+    mapped[0] *= float(hw[1]) / float(canvas)
+    mapped[1] *= float(hw[0]) / float(canvas)
+    return mapped
 
 
 def _warp_crop(frame_bgr: np.ndarray, matrix: np.ndarray, hw: tuple[int, int]) -> np.ndarray:

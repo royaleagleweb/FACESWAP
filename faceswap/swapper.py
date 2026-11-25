@@ -280,7 +280,34 @@ class FaceSwapper:
             tiles = [crop] if boost <= 128 else split_tiles(crop)
             self._add_stage("prep", prep_started)
             infer_started = time.perf_counter()
-            outputs = forward_bgr_tiles(self.swapper, tiles, latent)
+            try:
+                outputs = forward_bgr_tiles(self.swapper, tiles, latent)
+            except Exception as exc:
+                from .providers import is_gpu_memory_error
+
+                if not is_gpu_memory_error(exc) or boost <= 128:
+                    if is_gpu_memory_error(exc):
+                        self._release_vram(exc)
+                        self._mark_wiped(
+                            "The GPU ran out of memory. Close any other Videoswa window and run again. "
+                            "This frame was left unchanged."
+                        )
+                        return frame
+                    raise
+                self._release_vram(exc)
+                crop, matrix = aligned_crop(frame, align_kps, 128)
+                tiles = [crop]
+                boost = 128
+                try:
+                    outputs = forward_bgr_tiles(self.swapper, tiles, latent)
+                except Exception as again:
+                    if is_gpu_memory_error(again):
+                        self._mark_wiped(
+                            "The GPU ran out of memory. Close any other Videoswa window and run again. "
+                            "This frame was left unchanged."
+                        )
+                        return frame
+                    raise
             swapped = outputs[0] if boost <= 128 else join_tiles(outputs, boost)
             self._add_stage("inswapper", infer_started)
         swapped = self._restore_before_paste(swapped, target_face)
@@ -312,13 +339,17 @@ class FaceSwapper:
                 neural = ready.pop(0)
                 self._add_stage("xseg", xseg_started)
             else:
-                neural = models.xseg_keepout(frame, matrix, face_alpha) if models.xseg is not None else None
+                neural = (
+                    models.xseg_keepout(frame, matrix, face_alpha, canvas=int(swapped.shape[0]))
+                    if models.xseg is not None
+                    else None
+                )
                 if models.xseg is not None:
                     self._add_stage("xseg", xseg_started)
             precise = None
             if self.precise_edges and models.bisenet is not None:
                 precise_started = time.perf_counter()
-                precise = models.bisenet_keep(frame, matrix, face_alpha)
+                precise = models.bisenet_keep(frame, matrix, face_alpha, canvas=int(swapped.shape[0]))
                 self._add_stage("bisenet", precise_started)
             occ_started = time.perf_counter()
             alpha = _occ_mask(
@@ -372,22 +403,61 @@ class FaceSwapper:
             self._add_stage("sharpen", sharp_started)
         finish_started = time.perf_counter()
         if _box_mean_abs(frame, out, target_face.bbox) < 1.5:
-            self._mark_wiped(
-                "The paste mask wiped this swap. The face region did not change. "
-                "Turn Precise edges off and preview again. "
-                "A small face that changes by about 8 is a real swap and is kept."
+            plain = coverage_alpha(frame.shape[:2], align_kps, mode, yaw=yaw)
+            rescued = paste_swapped_face(
+                frame,
+                swapped,
+                matrix,
+                align_kps,
+                coverage=mode,
+                yaw=yaw,
+                alpha=plain,
+                color_match=getattr(self, "color_match", None),
             )
-            return frame
+            if _box_mean_abs(frame, rescued, target_face.bbox) >= 1.5:
+                if not getattr(self, "_mask_fallback_logged", False):
+                    logger.info(
+                        "The object mask hid a finished swap. Using the face outline so the face is kept."
+                    )
+                    self._mask_fallback_logged = True
+                out = rescued
+            else:
+                self._mark_wiped(
+                    "The paste mask wiped this swap. The face region did not change. "
+                    "Turn Precise edges off and preview again. "
+                    "A small face that changes by about 8 is a real swap and is kept."
+                )
+                return frame
         self.last_canvas = np.asarray(swapped).copy()
         self.last_matrix = np.asarray(matrix, dtype=np.float64).reshape(2, 3).copy()
         self._add_stage("finish", finish_started)
         self._recent_ms = float(self.stage_ms.get("inswapper", 0.0)) + float(self.stage_ms.get("blend", 0.0))
         return out
 
+    def _release_vram(self, exc: BaseException) -> None:
+        """Drop the heavy paths after CUDA runs out of memory."""
+        self._vram_low = True
+        self.pixel_boost = 128
+        self.large_face_px = 0
+        model = getattr(self, "swapper", None)
+        if model is not None:
+            model._videoswa_batch_session = None
+            model._videoswa_face_batch = "off"
+            model._videoswa_io = False
+        if not getattr(self, "_vram_logged", False):
+            logger.warning(
+                "GPU ran out of memory (%s). Pixel boost is now 128 and the multi-face "
+                "batch engine is off. Close any other Videoswa window. The video continues.",
+                exc,
+            )
+            self._vram_logged = True
+
     def boost_for_span(self, span: float) -> int:
         """128 by default. Quality asks for 256. Balanced may use 256 on a large face."""
         from .pixel_boost import normalize_pixel_boost
 
+        if getattr(self, "_vram_low", False) or _gpu_is_tight():
+            return 128
         base = normalize_pixel_boost(getattr(self, "pixel_boost", 128))
         if base > 128:
             return base
@@ -682,7 +752,7 @@ def _enable_inswapper_batch(model, providers) -> None:
         trt["trt_max_workspace_size"] = 512 * 1024 * 1024
         trt["trt_profile_min_shapes"] = shape.format(n=1)
         trt["trt_profile_opt_shapes"] = shape.format(n=2)
-        trt["trt_profile_max_shapes"] = shape.format(n=4)
+        trt["trt_profile_max_shapes"] = shape.format(n=3)
         active = list(model.session.get_providers())
         chosen = []
         options = []
@@ -705,30 +775,39 @@ def _enable_inswapper_batch(model, providers) -> None:
             providers=chosen,
             provider_options=options,
         )
-        # Do not replace the fast batch-1 session. A batch-4 engine was slower
-        # (64 ms vs ~7 ms) and took minutes to build. Use this one only after
-        # a two-face measurement says it is faster.
-        single = _time_runs(model.session, model, count=2)
-        batched = _time_runs(session, model, count=1, batch=2)
-        decision = cache / "decision.txt"
-        if single <= 0 or batched > single * 0.95:
+        # Do not replace the fast batch-1 session. Measure only after a quiet
+        # warmup. A busy GPU made two single calls look like 250 ms and the
+        # batch looked like a win.
+        _wait_until_gpu_quiet(model)
+        single = _median_ms(model.session, model, batch=1)
+        batched = _median_ms(session, model, batch=2)
+        choice = batch_decision(single, batched)
+        decision = cache / "decision_v2.txt"
+        model._videoswa_batch_ready = True
+        if choice == "skip":
+            logger.warning(
+                "InSwapper single-call median %.1f ms is too slow to trust "
+                "(a quiet pass on this laptop is under 20 ms). Not saving a batch decision.",
+                single,
+            )
+            model._videoswa_face_batch = "off"
+            return
+        if choice == "off":
             decision.write_text("off")
             model._videoswa_face_batch = "off"
-            model._videoswa_batch_ready = True
             logger.info(
-                "InSwapper batch-2 %.1fms vs two single calls %.1fms. Staying on per-face calls.",
+                "InSwapper batch-2 median %.1f ms vs two singles %.1f ms. Staying on per-face calls.",
                 batched,
-                single,
+                single * 2.0,
             )
             return
         decision.write_text("on")
-        model._videoswa_batch_ready = True
         model._videoswa_batch_session = session
         model._videoswa_face_batch = "on"
         logger.info(
-            "InSwapper batch-2 %.1fms beats two single calls %.1fms. Multi-face uses batch 1-4.",
+            "InSwapper batch-2 median %.1f ms beats two singles %.1f ms. Multi-face uses batch 1-3.",
             batched,
-            single,
+            single * 2.0,
         )
     except Exception as exc:
         model._videoswa_face_batch = "off"
@@ -738,10 +817,48 @@ def _enable_inswapper_batch(model, providers) -> None:
 
             path = MODELS_DIR / "trt_cache" / "inswapper_batch"
             path.mkdir(parents=True, exist_ok=True)
-            (path / "decision.txt").write_text("off")
+            (path / "decision_v2.txt").write_text("off")
         except Exception:
             pass
         logger.info("InSwapper face batch stays off (%s). Faces run one at a time.", exc)
+
+
+def batch_decision(single_ms: float, batch_ms: float) -> str:
+    """Return on, off, or skip.
+
+    skip means the single-call time is far above a normal TensorRT pass, so
+    the GPU was busy and the comparison is not saved.
+    """
+    if single_ms <= 0 or single_ms > 40.0:
+        return "skip"
+    if batch_ms < 0.85 * (single_ms * 2.0):
+        return "on"
+    return "off"
+
+
+def _median_ms(session, model, batch: int, warmup: int = 3, runs: int = 5) -> float:
+    import time
+
+    image = np.zeros((batch, 3, 128, 128), dtype=np.float32)
+    latent = np.zeros((batch, 512), dtype=np.float32)
+    feeds = {model.input_names[0]: image, model.input_names[1]: latent}
+    for _ in range(warmup):
+        session.run(model.output_names, feeds)
+    samples = []
+    for _ in range(runs):
+        started = time.perf_counter()
+        session.run(model.output_names, feeds)
+        samples.append((time.perf_counter() - started) * 1000.0)
+    samples.sort()
+    return float(samples[len(samples) // 2])
+
+
+def _wait_until_gpu_quiet(model, timeout_s: float = 20.0) -> None:
+    import time
+
+    deadline = time.perf_counter() + timeout_s
+    while getattr(model, "_videoswa_busy", False) and time.perf_counter() < deadline:
+        time.sleep(0.05)
 
 
 def _time_runs(session, model, count: int, batch: int = 1) -> float:
@@ -794,34 +911,50 @@ def _batch_xseg(swapper, frame, matrices, prepared):
 
 
 def face_batch_session(model):
-    """Dynamic batch 1-4 session, or None when per-face calls are faster.
-
-    The stock engine stays in place for a single face. This is not built
-    until a frame actually has two faces, and the decision is cached.
-    """
+    """Return a ready batch session. Never builds one on the calling thread."""
     if getattr(model, "_videoswa_face_batch", "") == "off":
         return None
     ready = getattr(model, "_videoswa_batch_session", None)
-    if ready is not None:
+    if ready is not None and getattr(model, "_videoswa_face_batch", "") == "on":
         return ready
-    providers = []
+    start_face_batch_build(model)
+    return None
+
+
+def start_face_batch_build(model) -> None:
+    """Build the batch engine on a background thread. Frames keep using batch 1."""
+    import threading
+
+    state = getattr(model, "_videoswa_face_batch", "")
+    if state in {"off", "building", "on"}:
+        return
+    if getattr(model, "_videoswa_batch_session", None) is not None:
+        return
     try:
         providers = list(model.session.get_providers())
     except Exception:
-        return None
+        return
     if not any("Tensorrt" in name for name in providers):
         model._videoswa_face_batch = "off"
         logger.info("InSwapper face batch skipped (no TensorRT). Faces run one at a time.")
-        return None
+        return
     from .utils import MODELS_DIR
 
-    decision = MODELS_DIR / "trt_cache" / "inswapper_batch" / "decision.txt"
+    decision = MODELS_DIR / "trt_cache" / "inswapper_batch" / "decision_v2.txt"
     if decision.is_file() and decision.read_text().strip() == "off":
         model._videoswa_face_batch = "off"
-        return None
-    logger.info("Preparing multi-face InSwapper, first time only. Batch profile is 1 / 2 / 4.")
-    _enable_inswapper_batch(model, providers)
-    return getattr(model, "_videoswa_batch_session", None)
+        return
+    model._videoswa_face_batch = "building"
+    logger.info(
+        "Preparing multi-face InSwapper in the background, first time only. "
+        "Profile is batch 1 / 2 / 3. Frames keep running one face at a time."
+    )
+    threading.Thread(
+        target=_enable_inswapper_batch,
+        args=(model, providers),
+        name="videoswa-batch-build",
+        daemon=True,
+    ).start()
 
 
 def warm_models(swapper) -> None:
@@ -931,6 +1064,19 @@ def _ensure_gfpgan_weights() -> Path:
     from .utils import ensure_gfpgan
 
     return ensure_gfpgan()
+
+
+def _gpu_is_tight() -> bool:
+    """True when less than 1 GB is free. Pixel boost stays at 128 then."""
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return False
+        free, _total = torch.cuda.mem_get_info()
+    except Exception:
+        return False
+    return free < 1024 * 1024 * 1024
 
 
 def _box_mean_abs(before: np.ndarray, after: np.ndarray, bbox: np.ndarray) -> float:

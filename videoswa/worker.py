@@ -197,6 +197,14 @@ class EngineWorker(QThread):
             except Exception as exc:
                 logger.exception("Videoswa %s failed", kind)
                 message = str(exc) or exc.__class__.__name__
+                from faceswap.providers import is_gpu_memory_error
+
+                if is_gpu_memory_error(exc):
+                    message = (
+                        "The GPU ran out of memory. Close any other Videoswa window and run the swap again. "
+                        "Videoswa stays at 128px, one face at a time. "
+                        + message
+                    )
                 if kind == "detect":
                     self.detect_failed.emit(message)
                 elif kind == "preview":

@@ -75,6 +75,17 @@ def cudnn_frontend_disabled() -> bool:
     return _env_flag("ORT_DISABLE_CUDNN_FRONTEND", True)
 
 
+def is_gpu_memory_error(exc: BaseException) -> bool:
+    """True when CUDA ran out of memory or the device was reset (failure 999)."""
+    text = f"{type(exc).__name__}: {exc}".lower()
+    return (
+        "out of memory" in text
+        or "cuda failure" in text
+        or "cuda_error_illegal_address" in text
+        or is_cuda_runtime_failure(exc)
+    )
+
+
 def is_cuda_runtime_failure(exc: BaseException) -> bool:
     """True when a session already started and a CUDA/cuDNN kernel then failed."""
     text = f"{type(exc).__name__}: {exc}".upper()
@@ -307,14 +318,15 @@ def tensorrt_provider_options(cache_dir: Path) -> dict:
 
     FP16 is on by default because RTX 4070-class GPUs are built for it.
     Set ``VIDEOSWA_TRT_FP16=0`` to build FP32 engines instead. Workspace
-    size is ``VIDEOSWA_TRT_WORKSPACE_MB`` (default 2048).
+    size is ``VIDEOSWA_TRT_WORKSPACE_MB`` (default 768). An 8 GB laptop
+    cannot spare a 2 GB workspace on every session.
     """
     cache_dir.mkdir(parents=True, exist_ok=True)
     try:
-        workspace_mb = int(os.environ.get("VIDEOSWA_TRT_WORKSPACE_MB", "2048"))
+        workspace_mb = int(os.environ.get("VIDEOSWA_TRT_WORKSPACE_MB", "768"))
     except ValueError:
-        workspace_mb = 2048
-    workspace_mb = max(256, workspace_mb)
+        workspace_mb = 768
+    workspace_mb = max(256, min(workspace_mb, 1024))
     return {
         "device_id": _device_id(),
         "trt_max_workspace_size": workspace_mb * 1024 * 1024,
@@ -442,9 +454,15 @@ def cuda_provider_options() -> dict:
     # aggressive conv path this ONNX Runtime build exposes. HEURISTIC is
     # faster when the frontend graph actually runs.
     search = "DEFAULT" if cudnn_frontend_disabled() else "HEURISTIC"
+    try:
+        mem_mb = int(os.environ.get("VIDEOSWA_GPU_MEM_MB", "4096"))
+    except ValueError:
+        mem_mb = 4096
+    mem_mb = max(512, mem_mb)
     return {
         "device_id": _device_id(),
-        "arena_extend_strategy": "kNextPowerOfTwo",
+        "arena_extend_strategy": "kSameAsRequested",
+        "gpu_mem_limit": mem_mb * 1024 * 1024,
         "cudnn_conv_algo_search": search,
         "do_copy_in_default_stream": True,
     }

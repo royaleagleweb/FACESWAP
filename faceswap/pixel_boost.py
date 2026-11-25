@@ -190,7 +190,11 @@ def _run_swap(model, blob: np.ndarray, latent: np.ndarray) -> np.ndarray:
     if runner:
         try:
             return runner.run(blob, latent)
-        except Exception:
+        except Exception as exc:
+            from .providers import is_gpu_memory_error
+
+            if is_gpu_memory_error(exc):
+                raise
             model._videoswa_io = False
     return session.run(
         model.output_names,
@@ -210,6 +214,14 @@ def forward_bgr_tiles(model, tiles: list[np.ndarray], latent: np.ndarray) -> lis
     Tiles are already aligned. This does not warp them again.
     """
     session = model.session
+    model._videoswa_busy = True
+    try:
+        return _forward_bgr_tiles(model, session, tiles, latent)
+    finally:
+        model._videoswa_busy = False
+
+
+def _forward_bgr_tiles(model, session, tiles, latent):
     blobs = [
         cv2.dnn.blobFromImage(
             tile,
@@ -237,7 +249,11 @@ def forward_bgr_tiles(model, tiles: list[np.ndarray], latent: np.ndarray) -> lis
                 {model.input_names[0]: batch, model.input_names[1]: repeated},
             )[0]
             model._videoswa_batch_ok = True
-        except Exception:
+        except Exception as exc:
+            from .providers import is_gpu_memory_error
+
+            if is_gpu_memory_error(exc):
+                raise
             model._videoswa_batch_ok = False
             pred = None
     if pred is None:

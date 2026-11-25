@@ -1,6 +1,7 @@
 """Each detected person keeps their own source identity."""
 
 import numpy as np
+import pytest
 
 from faceswap.core import FaceMapping, FaceSwapEngine
 from faceswap.face_analyzer import Face, cosine_similarity
@@ -85,6 +86,47 @@ def test_identity_strength_mixes_embeddings() -> None:
     assert mixed.normed_embedding[1] > 0.9
     same = apply_identity_strength(source, target, 1.0)
     assert same is source
+
+
+def test_256_paste_changes_the_face_box() -> None:
+    from faceswap.coverage import paste_swapped_face, template_128
+    from faceswap.pixel_boost import frame_to_crop_matrix
+    from faceswap.swapper import _box_mean_abs
+
+    kps = (template_128() - template_128().mean(axis=0)) * 3.0 + np.array([400.0, 300.0])
+    frame = np.full((600, 800, 3), 20, dtype=np.uint8)
+    matrix = frame_to_crop_matrix(kps, 256)
+    swapped = np.full((256, 256, 3), (0, 0, 220), dtype=np.uint8)
+    out = paste_swapped_face(frame, swapped, matrix, kps, "full", color_match=0)
+    bbox = np.array(
+        [
+            float(kps[:, 0].min()) - 8,
+            float(kps[:, 1].min()) - 8,
+            float(kps[:, 0].max()) + 8,
+            float(kps[:, 1].max()) + 8,
+        ],
+        dtype=np.float32,
+    )
+    assert _box_mean_abs(frame, out, bbox) > 1.5
+
+
+def test_mask_matrix_scales_a_256_canvas_into_a_128_input() -> None:
+    from faceswap.occlusion import _scale_matrix
+
+    matrix = np.array([[1.0, 0.0, 10.0], [0.0, 1.0, 20.0]], dtype=np.float64)
+    scaled = _scale_matrix(matrix, 256, (128, 128))
+    assert scaled[0, 2] == pytest.approx(5.0)
+    assert scaled[1, 2] == pytest.approx(10.0)
+
+
+def test_busy_gpu_does_not_count_as_a_batch_win() -> None:
+    from faceswap.swapper import batch_decision
+
+    # The laptop log compared a 27.6 ms batch with a 249.7 ms pair of singles
+    # while another swap was using the GPU. That must not be saved as "on".
+    assert batch_decision(249.7 / 2.0, 27.6) == "skip"
+    assert batch_decision(8.0, 12.0) == "on"
+    assert batch_decision(8.0, 20.0) == "off"
 
 
 def test_face_batch_stays_off_without_tensorrt() -> None:

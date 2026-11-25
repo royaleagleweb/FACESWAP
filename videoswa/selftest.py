@@ -153,7 +153,7 @@ def _run(photo: Path, video: Path, frames: int, out_dir: Path, lines: list[str],
         output_path=out_dir / "selftest.mp4",
         keep_audio=True,
         end_s=end_s,
-        encoder="libx264",
+        encoder="auto",
     )
     stats = engine.stats
     lines.append(

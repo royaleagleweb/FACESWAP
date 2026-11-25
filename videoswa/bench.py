@@ -106,7 +106,7 @@ def _run(photo: Path, video: Path, frames: int, presets: list[str], counts: list
             output_path=out_dir / f"{name}.mp4",
             keep_audio=False,
             end_s=end_s,
-            encoder="libx264",
+            encoder="auto",
         )
         elapsed = time.perf_counter() - started
         stats = engine.stats

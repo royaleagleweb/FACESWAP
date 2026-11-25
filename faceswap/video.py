@@ -352,11 +352,10 @@ def process_video(
     cancelled = False
     with tempfile.TemporaryDirectory(dir=TEMP_DIR) as tmpdir:
         tmp_video = Path(tmpdir) / "swapped_silent.mp4"
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        writer = cv2.VideoWriter(str(tmp_video), fourcc, info.fps, (out_w, out_h))
-        if not writer.isOpened():
-            cap.release()
-            raise RuntimeError("Could not open video writer (mp4v)")
+        chosen = resolve_encoder(encoder)
+        writer = _open_writer(tmp_video, out_w, out_h, info.fps, chosen, crf, preset)
+        logger.info("Encoder %s", getattr(writer, "encoder", "mp4v"))
+        streamed = isinstance(writer, _PipeWriter)
 
         bar = tqdm(
             total=expected or None,
@@ -393,8 +392,7 @@ def process_video(
         if cancelled:
             raise SwapCancelled("Swap cancelled. No output file was written.")
 
-        chosen = resolve_encoder(encoder)
-        logger.info("Encoder %s", chosen)
+        wrote = False
         if keep_audio and info.has_audio and shutil.which("ffmpeg"):
             _mux_audio(
                 tmp_video,
@@ -403,21 +401,26 @@ def process_video(
                 crf=crf,
                 preset=preset,
                 encoder=chosen,
+                copy_video=streamed,
                 copy_audio=start_frame == 0 and end_frame >= expected,
                 start_s=start_frame / fps,
                 duration_s=span / fps if span else None,
             )
+            wrote = True
+        if not wrote:
+            if streamed:
+                shutil.move(str(tmp_video), output_path)
+            elif shutil.which("ffmpeg"):
+                _reencode(tmp_video, output_path, crf=crf, preset=preset, encoder=chosen)
+            else:
+                shutil.copy2(tmp_video, output_path)
+                logger.warning("ffmpeg not found; output will not contain audio and may be mpeg4.")
         stages = getattr(getattr(engine, "stats", None), "stage_line", None)
         if callable(stages):
             logger.info("Stage times: %s", stages())
         misses = getattr(getattr(engine, "stats", None), "miss_log", None)
         if misses:
             logger.info("Missed faces (%s): %s", getattr(engine.stats, "miss_total", len(misses)), "; ".join(misses[:12]))
-        elif shutil.which("ffmpeg"):
-            _reencode(tmp_video, output_path, crf=crf, preset=preset, encoder=chosen)
-        else:
-            shutil.copy2(tmp_video, output_path)
-            logger.warning("ffmpeg not found; output will not contain audio and may be mpeg4.")
 
     logger.info("Wrote %s", output_path)
     logger.info("Stats: %s", engine.stats)
@@ -447,6 +450,92 @@ def swap_frame(
     if swapped.shape[1] != width or swapped.shape[0] != height:
         swapped = cv2.resize(swapped, (width, height), interpolation=cv2.INTER_LINEAR)
     return swapped
+
+
+class _PipeWriter:
+    """Stream BGR frames into ffmpeg so 1080p is encoded once, with NVENC when it exists."""
+
+    def __init__(self, path: Path, width: int, height: int, fps: float, encoder: str, crf: int, preset: str) -> None:
+        self.path = path
+        self.encoder = encoder
+        self.width = width
+        self.height = height
+        cmd = [
+            "ffmpeg", "-y", "-loglevel", "error",
+            "-f", "rawvideo", "-pix_fmt", "bgr24",
+            "-s", f"{width}x{height}",
+            "-r", f"{float(fps):.6f}",
+            "-i", "pipe:0",
+            *_video_encode_args(encoder, crf, preset),
+            "-an",
+            str(path),
+        ]
+        self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+
+    def isOpened(self) -> bool:
+        return self.proc.poll() is None and self.proc.stdin is not None
+
+    def write(self, frame: np.ndarray) -> None:
+        if frame.shape[1] != self.width or frame.shape[0] != self.height:
+            frame = cv2.resize(frame, (self.width, self.height))
+        if self.proc.stdin is None:
+            raise RuntimeError("ffmpeg encoder pipe is closed")
+        self.proc.stdin.write(np.ascontiguousarray(frame).tobytes())
+
+    def release(self) -> None:
+        if self.proc.stdin is not None:
+            self.proc.stdin.close()
+        code = self.proc.wait(timeout=120)
+        if code != 0:
+            raise RuntimeError(f"ffmpeg encoder exited with {code}")
+
+
+_ENCODER_RUNS: dict[str, bool] = {}
+
+
+def _encoder_runs(name: str) -> bool:
+    """True when ffmpeg can actually open the encoder, not merely list it."""
+    cached = _ENCODER_RUNS.get(name)
+    if cached is not None:
+        return cached
+    if not shutil.which("ffmpeg"):
+        _ENCODER_RUNS[name] = False
+        return False
+    try:
+        result = subprocess.run(
+            [
+                "ffmpeg", "-hide_banner", "-loglevel", "error",
+                "-f", "lavfi", "-i", "color=c=black:s=64x64:r=30",
+                "-frames:v", "1", "-c:v", name, "-f", "null", "-",
+            ],
+            capture_output=True,
+            timeout=20,
+        )
+        ok = result.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        ok = False
+    _ENCODER_RUNS[name] = ok
+    return ok
+
+
+def _open_writer(path: Path, width: int, height: int, fps: float, encoder: str, crf: int, preset: str):
+    """Open an ffmpeg pipe. NVENC that only exists on paper falls back to libx264."""
+    chosen = encoder
+    if chosen != "libx264" and not _encoder_runs(chosen):
+        logger.info("Encoder %s is listed but cannot start. Using libx264.", chosen)
+        chosen = "libx264"
+    if shutil.which("ffmpeg") and (chosen == "libx264" or _encoder_runs(chosen)):
+        try:
+            writer = _PipeWriter(path, width, height, fps, chosen, crf, preset)
+            if writer.isOpened():
+                return writer
+        except Exception as exc:
+            logger.info("ffmpeg encoder did not start (%s). Using the OpenCV writer.", exc)
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(str(path), fourcc, fps, (width, height))
+    if not writer.isOpened():
+        raise RuntimeError("Could not open video writer (mp4v)")
+    return writer
 
 
 def _video_encode_args(encoder: str, crf: int, preset: str) -> list[str]:
@@ -678,6 +767,7 @@ def _mux_audio(
     crf: int,
     preset: str,
     encoder: str = "libx264",
+    copy_video: bool = False,
     copy_audio: bool = True,
     start_s: float = 0.0,
     duration_s: Optional[float] = None,
@@ -690,7 +780,10 @@ def _mux_audio(
         if start_s > 0:
             cmd.extend(["-ss", f"{start_s:.3f}"])
         cmd.extend(["-i", str(original), "-map", "0:v:0", "-map", "1:a:0?"])
-        cmd.extend(_video_encode_args(enc, crf, preset))
+        if enc == "copy":
+            cmd.extend(["-c:v", "copy"])
+        else:
+            cmd.extend(_video_encode_args(enc, crf, preset))
         if audio == "copy":
             cmd.extend(["-c:a", "copy"])
         else:
@@ -701,8 +794,9 @@ def _mux_audio(
         return cmd
 
     audio = "copy" if copy_audio else "aac"
+    video_enc = "copy" if copy_video else encoder
     try:
-        _run_ffmpeg(_cmd(encoder, audio))
+        _run_ffmpeg(_cmd(video_enc, audio))
     except subprocess.CalledProcessError:
         if audio == "copy":
             logger.warning("Could not copy the audio track. Re-encoding it to AAC.")
